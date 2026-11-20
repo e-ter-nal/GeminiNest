@@ -1,0 +1,2 @@
+# Offline Unit Test Dependencies
+pytest>=8.0.0

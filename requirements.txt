@@ -1,0 +1,7 @@
+# GeminiNest v1 Minimal Runtime Dependencies (Pure Stdlib First)
+# Note: Antigravity Host-Driven Mode uses zero external LLM SDK / API Key.
+# v2 visual & encrypted cold-backup dependencies will live in requirements-v2.txt on branch feat/v2-visual.
+yt-dlp>=2025.1.0
+httpx>=0.27.0
+python-dotenv>=1.0.1
+winotify>=1.1.0

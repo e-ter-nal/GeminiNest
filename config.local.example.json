@@ -1,0 +1,15 @@
+{
+  "media_preprocess": {
+    "ffmpeg_binary": "<YOUR_FFMPEG_PATH>"
+  },
+  "sync": {
+    "cloud_nest_dir": "<YOUR_GOOGLE_DRIVE_NEST>"
+  },
+  "safety_alignment": {
+    "extra_blacklist": {
+      "tname": [],
+      "tags": [],
+      "title_keywords": []
+    }
+  }
+}

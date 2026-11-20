@@ -1,0 +1,164 @@
+{
+  "project": {
+    "name": "GeminiNest",
+    "version": "1.0.0-mvp",
+    "pipeline_mode": "audio_only"
+  },
+  "model_and_api": {
+    "execution_mode": "antigravity_host",
+    "selector_model": "gemini-3.8-flash",
+    "appreciator_model": "gemini-4-hydrogen",
+    "media_resolution": "medium",
+    "video_processing_mode": "auto",
+    "agentic_threshold_sec": 300,
+    "inline_max_payload_mb": 95,
+    "implicit_cache_min_prefix_tokens": 4096,
+    "skip_on_safety_block": true,
+    "max_api_retries_non_safety": 2
+  },
+  "media_preprocess": {
+    "ffmpeg_binary": "ffmpeg",
+    "segment_duration_sec": 300,
+    "segment_overlap_sec": 5,
+    "extract_fps": 1.0,
+    "video_resolution": "480p",
+    "video_resolution_map": {
+      "low": "480p",
+      "medium": "480p",
+      "high": "720p"
+    },
+    "audio_format": "m4a",
+    "audio_bitrate": "48k",
+    "audio_channels": 1,
+    "enable_sponsorblock": true,
+    "sponsorblock_skip_categories": [
+      "sponsor",
+      "selfpromo",
+      "interaction"
+    ],
+    "burn_temp_after_use": true
+  },
+  "safety_alignment": {
+    "wd_tagger_enabled": false,
+    "wd_tagger_model_path": "data/models/wd-tagger.onnx",
+    "wd_tagger_device": "cpu",
+    "min_general_score": 0.20,
+    "max_sensitive_score": 0.75,
+    "max_unsafe_score": 0.05,
+    "max_blackout_ratio": 0.15,
+    "downgrade_to_audio_on_exceed": true,
+    "blacklist": {
+      "tname": [
+        "宅舞",
+        "时尚",
+        "美妆护肤",
+        "穿搭",
+        "MMD·3D",
+        "舞蹈综合"
+      ],
+      "tags": [
+        "二游",
+        "碧蓝档案",
+        "蔚蓝档案",
+        "Blue Archive",
+        "碧蓝航线",
+        "原神",
+        "崩坏：星穹铁道",
+        "星穹铁道",
+        "星铁",
+        "鸣潮",
+        "绝区零",
+        "明日方舟",
+        "NIKKE",
+        "胜利女神",
+        "尘白禁区",
+        "少女前线",
+        "宅舞",
+        "MMD",
+        "时尚",
+        "美妆",
+        "擦边",
+        "政治",
+        "时政"
+      ],
+      "title_keywords": [
+        "碧蓝档案",
+        "蔚蓝档案",
+        "碧蓝航线",
+        "原神",
+        "星铁",
+        "星穹铁道",
+        "鸣潮",
+        "绝区零",
+        "明日方舟",
+        "NIKKE",
+        "胜利女神",
+        "尘白禁区",
+        "MMD",
+        "宅舞",
+        "泳装",
+        "cosplay",
+        "黑丝",
+        "白丝"
+      ]
+    }
+  },
+  "fetcher": {
+    "use_mcp_readonly": false,
+    "feed_fetch_limit": 30,
+    "curiosity_quota_ratio": 0.30,
+    "hot_comments_limit": 10,
+    "latest_comments_limit": 5,
+    "max_consecutive_412_abort": 2,
+    "request_interval_sec": [2.0, 5.0],
+    "save_dry_run_snapshot": true
+  },
+  "memory": {
+    "db_path": "data/cat_memory.db",
+    "top_k_total": 8,
+    "top_k_global": 3,
+    "top_k_contextual": 5,
+    "bm25_weights": {
+      "title": 3.0,
+      "desc": 1.5,
+      "hot_comments": 1.0,
+      "latest_comments": 0.5
+    },
+    "stability_mapping_days": {
+      "low_1_to_3": 2.0,
+      "mid_4_to_7": 12.0,
+      "high_8_to_10": 60.0
+    },
+    "recall_stability_boost": 0.5
+  },
+  "budget_and_runtime": {
+    "default_window_budget_ratio": 0.35,
+    "startup_popup_timeout_sec": 60,
+    "enable_startup_popup": true,
+    "enable_toast_notification": true,
+    "toast_min_impression_score": 8,
+    "est_5h_window_token_capacity": 1400000,
+    "token_calibration_k": 1.0,
+    "lock_file_path": "data/.cat.lock",
+    "cooldown_hours_on_429": 5
+  },
+  "sync": {
+    "pure_text_only": true,
+    "allowed_sync_extensions": [".md", ".json", ".txt"],
+    "local_export_dir": "data/exports",
+    "cloud_nest_dir": "<YOUR_GOOGLE_DRIVE_NEST>",
+    "active_subdir": "0_active",
+    "yesterday_subdir": "1_yesterday_readonly",
+    "inbox_subdir": "inbox",
+    "inbox_archived_subdir": "inbox_archived",
+    "enable_local_export_git_commit": true,
+    "local_export_git_isolated": true,
+    "v2_cold_backup": {
+      "enabled": false,
+      "schedule": "weekly",
+      "archive_tool": "py7zr",
+      "aes256_header_encryption": true,
+      "staggered_cleanup_weeks": 2
+    }
+  }
+}
