@@ -29,6 +29,7 @@ from gemininest.contracts import (
     BudgetPlan,
     BudgetStatus,
     CommentItem,
+    DiaryEntry,
     FetchBatchResult,
     FilterResult,
     FrameScore,
@@ -58,6 +59,7 @@ from gemininest.fetcher import (
 )
 from gemininest.media_processor import (
     MediaProcessor,
+    burn_run_temp,
     burn_temp,
     burn_temp_dir,
     compute_keep_intervals,
@@ -66,10 +68,16 @@ from gemininest.media_processor import (
     managed_temp_workspace,
     probe_audio_info,
     probe_video_info,
+    read_active_run_ids,
     resolve_target_video_height,
     sweep_stale_temp,
 )
-from gemininest.memory_store import MemoryStore, compute_window_bucket, format_recalled_memories
+from gemininest.memory_store import (
+    DEFAULT_CURIOSITY_MAX_SEARCHES,
+    MemoryStore,
+    compute_window_bucket,
+    format_recalled_memories,
+)
 from gemininest.meta_filter import MetaFilter, filter_video, normalize_text
 from gemininest.safety_gate import (
     BaseSafetyGate,
@@ -86,6 +94,8 @@ from gemininest.sync_manager import (
     PURE_TEXT_EXTENSIONS,
     READONLY_BANNER,
     SyncManager,
+    compute_canonical_patch_hash,
+    compute_canonical_patch_id,
     parse_memory_patch_blocks,
     sync_report_to_dict,
     validate_memory_patch,
@@ -146,7 +156,9 @@ __all__ = [
     "BudgetPlan",
     "BudgetStatus",
     "CommentItem",
+    "DEFAULT_CURIOSITY_MAX_SEARCHES",
     "DEFAULT_LOCAL_PERSONA_PATH",
+    "DiaryEntry",
     "DryRunReport",
     "ErrorCode",
     "FetchBatchResult",
@@ -184,9 +196,12 @@ __all__ = [
     "budget_plan_from_dict",
     "build_budget_plan",
     "build_static_prefix",
+    "burn_run_temp",
     "burn_temp",
     "burn_temp_dir",
     "commit_appreciation_result",
+    "compute_canonical_patch_hash",
+    "compute_canonical_patch_id",
     "compute_keep_intervals",
     "compute_segment_window",
     "compute_window_bucket",
@@ -218,6 +233,7 @@ __all__ = [
     "probe_audio_info",
     "probe_video_info",
     "prompt_startup_budget",
+    "read_active_run_ids",
     "resolve_target_video_height",
     "resolve_video_processing_mode",
     "run_dry_run",

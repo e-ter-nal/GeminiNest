@@ -222,6 +222,7 @@ class SyncConfig:
     enable_local_export_git_commit: bool
     local_export_git_isolated: bool
     v2_cold_backup: V2ColdBackupConfig
+    export_private_thought: bool = True
 
 
 @dataclass(frozen=True)
@@ -476,6 +477,20 @@ class BudgetStatus:
 
 
 @dataclass(frozen=True)
+class DiaryEntry:
+    id: int
+    memory_id: int | None
+    run_id: str
+    bv_id: str
+    title: str
+    impression_score: int
+    public_diary: str
+    private_thought: str
+    pipeline_used: Literal["audio_only", "sanitized_video", "downgraded_audio"]
+    created_at: str
+
+
+@dataclass(frozen=True)
 class WorldbookEntry:
     id: int
     keyword: str
@@ -483,6 +498,8 @@ class WorldbookEntry:
     content: str
     status: Literal["active", "consumed", "archived"]
     updated_at: str
+    last_searched_at: str | None = None
+    search_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -517,6 +534,7 @@ class BudgetLedgerEntry:
     budget_ratio_used: float
     status: Literal["ok", "rate_limited_429", "safety_blocked"]
     created_at: str
+    cache_status: Literal["hit", "miss", "unknown"] = "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -549,3 +567,4 @@ class SyncReport:
     patches_rejected: int
     archived_files: tuple[Path, ...]
     errors: tuple[str, ...]
+    patches_skipped_duplicate: int = 0

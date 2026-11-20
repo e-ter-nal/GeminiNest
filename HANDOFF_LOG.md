@@ -5,14 +5,14 @@
 ---
 
 ## 当前全局状态（Current Snapshot）
-* **当前阶段**：✅ **`v2.0.0` 精简开源版出厂包装完成（待人工核对后推送 GitHub）**（移除一键部署脚本，以 `README.md` 通用部署清单 + AI Agent 接管提示词 + `docs/SETUP_AND_RUNTIME.md` 替代；全仓库隐私与本机路径零残留脱敏；离线单元测试 **134/134 全绿**）
-* **当前分支**：`chore/oss-release`（基于 `main` / `v2.0.0` 切出）
-* **当前激活模式**：`config.json` 默认保持 v1 `audio_only` 与 `wd_tagger_enabled: false`（校准后默认安检阈值 `min_general_score=0.20`、`max_sensitive_score=0.75`、`max_unsafe_score=0.05`）；本机私有 `config.local.json` 可随时热切换启用 `sanitized_video` + `wd_tagger_enabled: true` + `wd_tagger_device: "auto"`（DirectML 优先）
+* **当前阶段**：✅ **外部代码审计 5 项可靠性修复（3×P1 + 2×P2）全部完成并提交至 `main`**（离线单元测试 **149/149 全绿**，零网络、零真实数据触碰；暂未 `git push`）
+* **当前分支**：`main`
+* **当前激活模式**：`config.json` 默认保持 v1 `audio_only` 与 `wd_tagger_enabled: false`（校准后默认安检阈值 `min_general_score=0.20`、`max_sensitive_score=0.75`、`max_unsafe_score=0.05`；`sync.export_private_thought=true`）；本机私有 `config.local.json` 可随时热切换启用 `sanitized_video` + `wd_tagger_enabled: true` + `wd_tagger_device: "auto"`（DirectML 优先）
 * **已落盘与核验基建**：
-  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已全面升级为 v1/v2 自适应通用版与脱敏占位符）
+  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已全面升级为 v1/v2 自适应通用版、脱敏占位符、隔离 `burn-temp --run-id <run_id>` 与无硬编码 `--cache-hit`）
   * `.agent/rules/cat-soul.md`、`config.json`、`.gitignore`（屏蔽 `.env`、`config.local.json`、`.agent/rules/cat-soul.local.md`、`data/models/`、`data/temp/`、`data/exports/` 等）、`.env.example`、`config.local.example.json`、`requirements.txt`、`requirements-v2.txt`、`requirements-dev.txt`、`pyproject.toml`
   * 核心代码模块与脚本：`src/gemininest/{contracts,config,meta_filter,memory_store,fetcher,media_processor,safety_gate,agent_bridge,budget_ui,sync_manager,runner}.py`、`scripts/download_wd_tagger.py`、`scripts/inbox_gdoc_exporter.gs`
-  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,runner,sync_manager}.py`（`pytest` **134/134 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
+  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,runner,sync_manager}.py`（`pytest` **149/149 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
   * 本地私有资产（均被 `.gitignore` 严格忽略）：`config.local.json`、`data/models/model.onnx`（`SmilingWolf/wd-vit-tagger-v3`，361.00 MB）与 `data/models/selected_tags.csv`（10,861 标签）、`data/cat_memory.db`（4 条真实巡逻记忆）、`data/exports/` 内独立隐藏 Git 仓库
   * Anaconda 环境 `gemininest`（Python 3.11.18 + SQLite 3.54.1 FTS5 `trigram` + `yt-dlp`、`httpx`、`python-dotenv`、`winotify`、`pytest`、`Pillow 10.4.0`、`numpy 2.4.6`、`onnxruntime-directml 1.24.4`）
   * Google Drive 云盘目录：`<YOUR_GOOGLE_DRIVE_NEST>\{0_active,1_yesterday_readonly,inbox,inbox_archived}` 均已建齐并通过双端实飞同步验证
@@ -41,6 +41,15 @@
 ---
 
 ## 历史对话交接记录（按时间倒序追加）
+### [Core Reliability Hardening - 外部审计 3×P1 + 2×P2 修复] - 2026-11-20
+* **修复内容（留在 `main` 分支，暂不 `git push`）**：
+  * **P1-1（持久化完整手账）**：在 `memory_store.py` 新增向后兼容平滑迁移逻辑与 `diary_entries` 表（及可重入原子 `transaction()`），`commit-appreciation` 将完整 `public_diary`、`private_thought`、`pipeline_used`、`run_id` 随鉴赏事务原子入库；`sync_manager.py` 导出 `diary_latest.md` 时直接从 SQLite 读取最新完整手账，并按 `config.json` 新增开关 `sync.export_private_thought`（默认 `true`）控制是否渲染 `private_thought`。
+  * **P1-2（跨命令巡逻运行租约与隔离清理）**：复用 `data/run_states/<run_id>.json` 为整轮跨 CLI 巡逻维护带 TTL 的活跃运行租约（`prepare-feed` 创建、`prepare-media`/`commit-appreciation` 续期、`sync --run-id <run_id>` 或 `burn-temp --run-id <run_id> --release-lease` 释放）；`burn-temp --run-id <run_id>` 仅清理当前 `run_id` 目录，启动清扫 `sweep_stale_temp()` 仅回收已过期且不属于任何活跃 `run_id` 的孤儿目录。
+  * **P1-3（补丁幂等账本与同修订防覆写）**：在 `memory_store.py` 新增 `applied_patches` 幂等账本表，`sync_manager.py` 基于规范化内容哈希生成与文件名/格式无关的稳定 `patch_id`，在单一 SQLite 事务内原子完成「判重 → 应用补丁 → 写入账本」，重放补丁幂等跳过并干净归档；`sync_manifest.json` 写入确定性 `content_hash`，`sync_to_cloud()` 轮转 `1_yesterday_readonly/` 前比对现有 `0_active/` 修订标识，同修订连续导出跳过轮转以保护上一版真实历史快照。
+  * **P2-1（Token 预估复用与去硬编码 `--cache-hit`）**：`prepare-media` 将该 BV 的完整 `token_estimate` 与视频元数据写入 `run_states/<run_id>.json`，`commit-appreciation` 优先复用并默认记录 `budget_ledger.cache_status = "unknown"`（兼容显式 `--cache-hit` / `--cache-status`）；更新 `docs/SETUP_AND_RUNTIME.md` 去掉硬编码 `--cache-hit`、阶段 3 改用 `burn-temp --run-id <run_id>` 与 `sync --direction export --run-id <run_id>`，并在 `README.md` 注明实测 Token 数据为「本地公式估算 / 特定环境观测值」。
+  * **P2-2（好奇心词条轮换与自动消费）**：向后兼容迁移 `worldbook` 新增 `last_searched_at` 与 `search_count`，`prepare-feed` 通过 `select_curiosity_keywords()` 优先挑选未搜/最久未搜的活跃词条，拉取成功后调用 `mark_curiosity_searched()` 刷新时间并递增计数，达到 3 次自动标记为 `consumed`。
+* **回归验证**：`<YOUR_CONDA_PYTHON> -m pytest -v` **149 passed**（新增 11 条覆盖全部 5 项修复与老库迁移的离线单元测试，零网络、零真实数据污染）。
+* **提交记录**：`main` 分支提交 `fix(core): persist full diary, harden run lease, idempotent sync and curiosity rotation`。
 ### [OSS Release Packaging - 精简开源版整理（移除一键部署脚本 & 升级 Quickstart Checklist）] - 2026-11-20
 * **精简与文档升级**：
   * 移除一键部署脚本，保留 `scripts/download_wd_tagger.py` 与 `scripts/inbox_gdoc_exporter.gs`，同步将 `docs/SETUP_AND_RUNTIME.md`、`README.md` 与 `HANDOFF_LOG.md` 中的环境初始化改为标准 Conda / pip 手动或 Agent 可执行命令。

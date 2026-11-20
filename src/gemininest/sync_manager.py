@@ -46,6 +46,8 @@ __all__ = [
     "PURE_TEXT_EXTENSIONS",
     "READONLY_BANNER",
     "SyncManager",
+    "compute_canonical_patch_hash",
+    "compute_canonical_patch_id",
     "parse_memory_patch_blocks",
     "sync_report_to_dict",
     "validate_memory_patch",
@@ -167,6 +169,47 @@ def _utc_now_iso() -> str:
 
 def _normalize_policy_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def compute_canonical_patch_hash(op: str, payload: Mapping[str, Any]) -> str:
+    """Compute a deterministic SHA-256 content hash from normalized `(op, payload)`."""
+
+    def _canon(value: Any, *, sort_str_list: bool = False) -> Any:
+        if isinstance(value, str):
+            return " ".join(unicodedata.normalize("NFKC", value).strip().split())
+        if isinstance(value, Mapping):
+            out: dict[str, Any] = {}
+            for k in sorted(value.keys(), key=lambda key: str(key)):
+                ks = str(k)
+                out[ks] = _canon(value[k], sort_str_list=(ks in ("tags", "keywords")))
+            return out
+        if isinstance(value, (list, tuple)):
+            items = [_canon(item) for item in value]
+            if sort_str_list and all(isinstance(item, str) for item in items):
+                return sorted(dict.fromkeys(items))
+            return items
+        if isinstance(value, float):
+            return round(value, 6)
+        return value
+
+    canonical_obj = {
+        "op": _canon(op).lower(),
+        "payload": _canon(payload),
+    }
+    encoded = json.dumps(
+        canonical_obj,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compute_canonical_patch_id(op: str, payload: Mapping[str, Any]) -> tuple[str, str]:
+    """Return `(stable_patch_id, content_hash)` independent of filename or block formatting."""
+    content_hash = compute_canonical_patch_hash(op, payload)
+    safe_op = re.sub(r"[^a-z0-9_]+", "_", op.strip().lower()).strip("_") or "patch"
+    return f"patch_{safe_op}_{content_hash[:16]}", content_hash
 
 
 def _utf8_subprocess_env() -> dict[str, str]:
@@ -593,9 +636,10 @@ def validate_memory_patch(
             "tags": list(tags),
             "bv_id": bv_id,
         }
+        stable_id, _ = compute_canonical_patch_id(typed_op, normalized_payload)
         return (
             MemoryPatch(
-                patch_id=patch_id,
+                patch_id=stable_id,
                 source_file=src,
                 op=typed_op,
                 payload=normalized_payload,
@@ -639,16 +683,18 @@ def validate_memory_patch(
                 f"boost_memory 'importance_delta' must be in (0.0, {_MAX_BOOST_DELTA}], got {delta}.",
             )
 
+        boost_payload = {
+            "memory_id": memory_id,
+            "query": query_str,
+            "importance_delta": delta,
+        }
+        stable_id, _ = compute_canonical_patch_id(typed_op, boost_payload)
         return (
             MemoryPatch(
-                patch_id=patch_id,
+                patch_id=stable_id,
                 source_file=src,
                 op=typed_op,
-                payload={
-                    "memory_id": memory_id,
-                    "query": query_str,
-                    "importance_delta": delta,
-                },
+                payload=boost_payload,
                 validated=True,
                 reject_reason=None,
             ),
@@ -698,12 +744,14 @@ def validate_memory_patch(
                 f"add_curiosity 'reason' exceeds {_MAX_CURIOSITY_REASON_CHARS} chars.",
             )
 
+        curiosity_payload = {"keywords": deduped_kws, "reason": reason}
+        stable_id, _ = compute_canonical_patch_id(typed_op, curiosity_payload)
         return (
             MemoryPatch(
-                patch_id=patch_id,
+                patch_id=stable_id,
                 source_file=src,
                 op=typed_op,
-                payload={"keywords": deduped_kws, "reason": reason},
+                payload=curiosity_payload,
                 validated=True,
                 reject_reason=None,
             ),
@@ -732,16 +780,18 @@ def validate_memory_patch(
     section = str(raw_payload.get("section") or "style_preference").strip()[:60]
     reason = str(raw_payload.get("reason") or "Web chat persona tweak suggestion").strip()[:160]
 
+    tweak_payload = {
+        "suggestion": suggestion_s,
+        "section": section,
+        "reason": reason,
+    }
+    stable_id, _ = compute_canonical_patch_id(typed_op, tweak_payload)
     return (
         MemoryPatch(
-            patch_id=patch_id,
+            patch_id=stable_id,
             source_file=src,
             op=typed_op,
-            payload={
-                "suggestion": suggestion_s,
-                "section": section,
-                "reason": reason,
-            },
+            payload=tweak_payload,
             validated=True,
             reject_reason=None,
         ),
@@ -763,6 +813,7 @@ def sync_report_to_dict(report: SyncReport) -> dict[str, Any]:
         "active_synced_count": report.active_synced_count,
         "patches_applied": report.patches_applied,
         "patches_rejected": report.patches_rejected,
+        "patches_skipped_duplicate": report.patches_skipped_duplicate,
         "archived_files": [str(p) for p in report.archived_files],
         "errors": list(report.errors),
     }
@@ -889,6 +940,31 @@ class SyncManager:
     # Forward Export (SQLite + cat-soul.md -> data/exports/)
     # ------------------------------------------------------------------
 
+    def _resolve_effective_diary_entries(
+        self,
+        store: MemoryStore,
+        diary_entries: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Prefer explicit `diary_entries` if provided; otherwise load persisted entries from SQLite."""
+        if diary_entries:
+            return [dict(entry) for entry in diary_entries]
+        persisted = store.list_recent_diary_entries(limit=10)
+        return [
+            {
+                "id": item.id,
+                "memory_id": item.memory_id,
+                "run_id": item.run_id,
+                "bv_id": item.bv_id,
+                "title": item.title,
+                "impression_score": item.impression_score,
+                "public_diary": item.public_diary,
+                "private_thought": item.private_thought,
+                "pipeline_used": item.pipeline_used,
+                "created_at": item.created_at,
+            }
+            for item in persisted
+        ]
+
     def _compute_data_stamp(
         self,
         store: MemoryStore,
@@ -898,6 +974,8 @@ class SyncManager:
         for rec in store.list_recent_memories(limit=5):
             timestamps.append(rec.created_at)
             timestamps.append(rec.last_recalled_at)
+        for diary in store.list_recent_diary_entries(limit=5):
+            timestamps.append(diary.created_at)
         for wb in store.list_worldbook(status=None):
             timestamps.append(wb.updated_at)
         for hist in store.list_recent_watch_history(limit=5):
@@ -986,6 +1064,7 @@ class SyncManager:
         diary_entries: Sequence[Mapping[str, Any]],
         data_stamp: str,
     ) -> str:
+        effective_entries = self._resolve_effective_diary_entries(store, diary_entries)
         recent_memories = store.list_recent_memories(limit=10)
         recent_history = store.list_recent_watch_history(limit=10)
         curiosity = store.list_worldbook(category="curiosity_queue", status="active")
@@ -998,18 +1077,20 @@ class SyncManager:
             "",
         ]
 
-        if diary_entries:
+        if effective_entries:
             lines.append("## 本轮冲浪日记")
-            for idx, entry in enumerate(diary_entries, start=1):
+            for idx, entry in enumerate(effective_entries, start=1):
                 bv_id = str(entry.get("bv_id") or "")
                 title = str(entry.get("title") or bv_id or f"作品 #{idx}")
                 score = entry.get("impression_score", "-")
+                pipeline_used = str(entry.get("pipeline_used") or "").strip()
                 public_diary = str(entry.get("public_diary") or "").strip()
                 private_thought = str(entry.get("private_thought") or "").strip()
-                lines.append(f"### {idx}. {title} (`{bv_id}` | 印象分: {score})")
+                mode_suffix = f" | {pipeline_used}" if pipeline_used else ""
+                lines.append(f"### {idx}. {title} (`{bv_id}` | 印象分: {score}{mode_suffix})")
                 if public_diary:
                     lines.append(f"**公开手账**：{public_diary}")
-                if private_thought:
+                if self._sync_cfg.export_private_thought and private_thought:
                     lines.append(f"**猫猫碎碎念**：{private_thought}")
                 lines.append("")
 
@@ -1041,11 +1122,25 @@ class SyncManager:
 
         return "\n".join(lines) + "\n"
 
+    def _compute_export_content_hash(
+        self,
+        non_manifest_paths: Sequence[Path],
+        data_stamp: str,
+    ) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(f"revision:{data_stamp}\n".encode("utf-8"))
+        for path in sorted(non_manifest_paths, key=lambda p: p.name.lower()):
+            file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            hasher.update(f"{path.name}:{file_digest}\n".encode("utf-8"))
+        return hasher.hexdigest()
+
     def _render_sync_manifest(
         self,
         store: MemoryStore,
         exported_names: Sequence[str],
         data_stamp: str,
+        *,
+        content_hash: str,
     ) -> str:
         curiosity = store.list_worldbook(category="curiosity_queue", status="active")
         payload = {
@@ -1053,9 +1148,12 @@ class SyncManager:
             "version": self._config.project.version,
             "pipeline_mode": self._config.project.pipeline_mode,
             "pure_text_only": self._sync_cfg.pure_text_only,
+            "export_private_thought": self._sync_cfg.export_private_thought,
             "allowed_sync_extensions": list(self._sync_cfg.allowed_sync_extensions),
             "data_revision": data_stamp,
+            "content_hash": content_hash,
             "memory_count": store.count_memories(),
+            "diary_count": len(store.list_recent_diary_entries(limit=1000)),
             "active_curiosity_keywords": [e.keyword for e in curiosity[:10]],
             "exported_files": list(exported_names),
         }
@@ -1083,16 +1181,20 @@ class SyncManager:
             encoding="utf-8",
         )
 
+        content_paths = [persona_path, memory_path, diary_path]
         exported_paths = [persona_path, memory_path, diary_path, manifest_path]
         if self._persona_tweaks_path.is_file() and self._persona_tweaks_path.parent == self._local_export_dir:
             self.validate_file(self._persona_tweaks_path)
+            content_paths.append(self._persona_tweaks_path)
             exported_paths.append(self._persona_tweaks_path)
 
+        content_hash = self._compute_export_content_hash(content_paths, data_stamp)
         manifest_path.write_text(
             self._render_sync_manifest(
                 store,
                 [p.name for p in exported_paths],
                 data_stamp,
+                content_hash=content_hash,
             ),
             encoding="utf-8",
         )
@@ -1214,15 +1316,72 @@ class SyncManager:
     # Windows-Safe Cloud Drive Rotation & Forward Sync
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _read_manifest_dict(path: Path | None) -> dict[str, Any] | None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            return parsed if isinstance(parsed, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _is_same_published_revision(
+        self,
+        active_existing: Sequence[Path],
+        outbound: Sequence[Path],
+    ) -> bool:
+        """Compare existing `0_active/` manifest/content against incoming `outbound` exports."""
+        if not active_existing or not outbound:
+            return False
+
+        active_by_name = {p.name: p for p in active_existing if p.is_file()}
+        outbound_by_name = {p.name: p for p in outbound if p.is_file()}
+
+        existing_manifest = self._read_manifest_dict(active_by_name.get("sync_manifest.json"))
+        incoming_manifest = self._read_manifest_dict(outbound_by_name.get("sync_manifest.json"))
+
+        if existing_manifest is not None and incoming_manifest is not None:
+            ex_rev = existing_manifest.get("data_revision")
+            in_rev = incoming_manifest.get("data_revision")
+            ex_hash = existing_manifest.get("content_hash")
+            in_hash = incoming_manifest.get("content_hash")
+            if (
+                isinstance(ex_hash, str)
+                and ex_hash
+                and isinstance(in_hash, str)
+                and in_hash
+            ):
+                return ex_hash == in_hash and ex_rev == in_rev
+            if ex_rev is not None and ex_rev == in_rev:
+                non_manifest_names = [n for n in outbound_by_name if n != "sync_manifest.json"]
+                if non_manifest_names and all(
+                    n in active_by_name
+                    and active_by_name[n].read_bytes() == outbound_by_name[n].read_bytes()
+                    for n in non_manifest_names
+                ):
+                    return True
+                return False
+            return False
+
+        if set(active_by_name.keys()) != set(outbound_by_name.keys()):
+            return False
+        return all(
+            active_by_name[name].read_bytes() == outbound_by_name[name].read_bytes()
+            for name in outbound_by_name
+        )
+
     def sync_to_cloud(
         self,
         exported_files: Sequence[Path] | None = None,
     ) -> tuple[bool, int, tuple[str, ...]]:
-        """Rotate `0_active/` -> `1_yesterday_readonly/` and write pure-text exports to `0_active/`.
+        """Rotate `0_active/` -> `1_yesterday_readonly/` on new revisions and sync pure-text exports.
 
         - Always enforces `E8002_SYNC_EXT_VIOLATION` before touching the cloud directory.
         - If cloud drive is unmounted, logs warning and returns `E8001_CLOUD_DRIVE_UNMOUNTED`
           without raising, preserving local exports and isolated Git history.
+        - Skips `0_active/` -> `1_yesterday_readonly/` rotation when publishing the exact same
+          revision/content_hash so `1_yesterday_readonly/` always preserves the previous distinct snapshot.
         """
         # 1. Validate all outbound files strictly against pure-text firewall first
         if exported_files is not None:
@@ -1247,7 +1406,7 @@ class SyncManager:
         self.active_dir.mkdir(parents=True, exist_ok=True)
         self.yesterday_dir.mkdir(parents=True, exist_ok=True)
 
-        # 3. Rotate existing `0_active/` pure-text files -> `1_yesterday_readonly/`
+        # 3. Inspect existing `0_active/` pure-text files
         active_existing: list[Path] = []
         for entry in sorted(self.active_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_file() or _is_ignored_cloud_junk(entry):
@@ -1259,8 +1418,9 @@ class SyncManager:
             self.validate_file(entry)
             active_existing.append(entry)
 
+        same_revision = self._is_same_published_revision(active_existing, outbound)
         yesterday_rotated = False
-        if active_existing:
+        if active_existing and not same_revision:
             # Windows-safe: unlock readonly attributes on ALL existing files in 1_yesterday_readonly/
             _unlock_readonly_tree(self.yesterday_dir)
 
@@ -1285,17 +1445,28 @@ class SyncManager:
                 dest_yesterday.write_text(marked_text, encoding="utf-8")
                 _set_readonly_best_effort(dest_yesterday)
             yesterday_rotated = True
+        elif same_revision:
+            logger.info(
+                "Skipping 0_active/ -> 1_yesterday_readonly/ rotation because export revision is unchanged."
+            )
 
-        # 4. Write today's validated pure-text exports into `0_active/`
+        # 4. Write today's validated pure-text exports into `0_active/` (skipping identical files on same revision)
         active_synced_count = 0
         for src_export in outbound:
             if not src_export.is_file():
                 continue
             self.validate_file(src_export)
             dest_active = self.active_dir / src_export.name
+            new_text = src_export.read_text(encoding="utf-8")
+            if same_revision and dest_active.is_file():
+                try:
+                    if dest_active.read_text(encoding="utf-8") == new_text:
+                        continue
+                except OSError:
+                    pass
             if dest_active.exists():
                 _unlock_readonly_path(dest_active)
-            dest_active.write_text(src_export.read_text(encoding="utf-8"), encoding="utf-8")
+            dest_active.write_text(new_text, encoding="utf-8")
             active_synced_count += 1
 
         return yesterday_rotated, active_synced_count, tuple(errors)
@@ -1330,75 +1501,91 @@ class SyncManager:
         self,
         store: MemoryStore,
         patch: MemoryPatch,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[Literal["applied", "skipped_duplicate", "rejected"], str | None]:
+        """Atomically check idempotency, apply patch op, and record `applied_patches` in one transaction."""
         op = patch.op
         p = patch.payload
+        content_hash = compute_canonical_patch_hash(op, p)
+        needs_persona_review = False
 
-        if op == "add_memory":
-            store.add_memory(
-                source="web_patch",
-                bv_id=p.get("bv_id"),
-                title=p["title"],
-                summary=p["summary"],
-                tags=tuple(p.get("tags", ())),
-                importance=float(p["importance"]),
-            )
-            return True, None
-
-        if op == "boost_memory":
-            memory_id = p.get("memory_id")
-            delta = float(p["importance_delta"])
-            if memory_id is not None:
-                boosted = store.boost_memory(int(memory_id), importance_delta=delta)
-                if boosted is None:
-                    return (
-                        False,
-                        f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] "
-                        f"boost_memory target memory_id={memory_id} does not exist.",
-                    )
-                return True, None
-
-            query = str(p.get("query") or "")
-            matches = store.recall_memories(
-                query,
-                top_k_total=1,
-                top_k_global=0,
-                top_k_contextual=1,
-                mark_recalled=False,
-            )
-            if not matches:
-                return (
-                    False,
-                    f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] "
-                    f"boost_memory query {query!r} matched no existing memory.",
+        with store.transaction():
+            if store.is_patch_applied(patch.patch_id):
+                logger.info(
+                    "Skipping already-applied inbox patch %s (op=%s, file=%s).",
+                    patch.patch_id,
+                    op,
+                    patch.source_file.name,
                 )
-            store.boost_memory(matches[0].record.id, importance_delta=delta)
-            return True, None
+                return "skipped_duplicate", None
 
-        if op == "add_curiosity":
-            for kw in p["keywords"]:
+            if op == "add_memory":
+                store.add_memory(
+                    source="web_patch",
+                    bv_id=p.get("bv_id"),
+                    title=p["title"],
+                    summary=p["summary"],
+                    tags=tuple(p.get("tags", ())),
+                    importance=float(p["importance"]),
+                )
+            elif op == "boost_memory":
+                memory_id = p.get("memory_id")
+                delta = float(p["importance_delta"])
+                if memory_id is not None:
+                    boosted = store.boost_memory(int(memory_id), importance_delta=delta)
+                    if boosted is None:
+                        return (
+                            "rejected",
+                            f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] "
+                            f"boost_memory target memory_id={memory_id} does not exist.",
+                        )
+                else:
+                    query = str(p.get("query") or "")
+                    matches = store.recall_memories(
+                        query,
+                        top_k_total=1,
+                        top_k_global=0,
+                        top_k_contextual=1,
+                        mark_recalled=False,
+                    )
+                    if not matches:
+                        return (
+                            "rejected",
+                            f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] "
+                            f"boost_memory query {query!r} matched no existing memory.",
+                        )
+                    store.boost_memory(matches[0].record.id, importance_delta=delta)
+            elif op == "add_curiosity":
+                for kw in p["keywords"]:
+                    store.upsert_worldbook(
+                        keyword=kw,
+                        category="curiosity_queue",
+                        content=p["reason"],
+                        status="active",
+                    )
+            elif op == "suggest_persona_tweak":
                 store.upsert_worldbook(
-                    keyword=kw,
-                    category="curiosity_queue",
-                    content=p["reason"],
+                    keyword=f"persona_tweak:{patch.patch_id}",
+                    category="preference",
+                    content=p["suggestion"],
                     status="active",
                 )
-            return True, None
+                needs_persona_review = True
+            else:
+                return (
+                    "rejected",
+                    f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] Unsupported op {op!r}.",
+                )
 
-        if op == "suggest_persona_tweak":
-            store.upsert_worldbook(
-                keyword=f"persona_tweak:{patch.patch_id}",
-                category="preference",
-                content=p["suggestion"],
-                status="active",
+            store.record_applied_patch(
+                patch_id=patch.patch_id,
+                op=op,
+                content_hash=content_hash,
+                source_file=patch.source_file.name,
             )
-            self._append_persona_tweak_review(patch)
-            return True, None
 
-        return (
-            False,
-            f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] Unsupported op {op!r}.",
-        )
+        if needs_persona_review:
+            self._append_persona_tweak_review(patch)
+        return "applied", None
 
     def _archive_inbox_file(
         self,
@@ -1469,6 +1656,7 @@ class SyncManager:
 
         patches_applied = 0
         patches_rejected = 0
+        patches_skipped_duplicate = 0
         archived_files: list[Path] = []
         errors: list[str] = []
 
@@ -1513,9 +1701,11 @@ class SyncManager:
                     errors.append(f"{entry.name}: {err_txt}")
                     continue
 
-                applied_ok, apply_err = self._apply_validated_patch(store, patch_obj)
-                if applied_ok:
+                apply_status, apply_err = self._apply_validated_patch(store, patch_obj)
+                if apply_status == "applied":
                     patches_applied += 1
+                elif apply_status == "skipped_duplicate":
+                    patches_skipped_duplicate += 1
                 else:
                     patches_rejected += 1
                     err_txt = apply_err or f"[{ErrorCode.E8004_PATCH_POLICY_REJECTED.value}] Failed to apply patch."
@@ -1534,6 +1724,7 @@ class SyncManager:
             patches_rejected=patches_rejected,
             archived_files=tuple(archived_files),
             errors=tuple(errors),
+            patches_skipped_duplicate=patches_skipped_duplicate,
         )
 
     # ------------------------------------------------------------------
@@ -1600,4 +1791,5 @@ class SyncManager:
             patches_rejected=inbox_report.patches_rejected,
             archived_files=inbox_report.archived_files,
             errors=tuple(merged_errors),
+            patches_skipped_duplicate=inbox_report.patches_skipped_duplicate,
         )

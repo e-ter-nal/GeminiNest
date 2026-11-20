@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -62,11 +63,13 @@ from gemininest.fetcher import BilibiliFetcher, DEFAULT_SNAPSHOTS_DIR, load_snap
 from gemininest.media_processor import (
     DEFAULT_TEMP_ROOT,
     MediaProcessor,
+    burn_run_temp,
     burn_temp,
+    read_active_run_ids,
     sanitize_temp_segment,
     sweep_stale_temp,
 )
-from gemininest.memory_store import MemoryStore
+from gemininest.memory_store import DEFAULT_CURIOSITY_MAX_SEARCHES, MemoryStore
 from gemininest.meta_filter import MetaFilter
 from gemininest.safety_gate import (
     BaseSafetyGate,
@@ -96,14 +99,33 @@ logger = logging.getLogger(__name__)
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
+DEFAULT_RUN_LEASE_TTL_SEC = 7200
+DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC = 7200
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _epoch_to_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _now_epoch() -> float:
     return time.time()
+
+
+def _get_host_session_id() -> str:
+    explicit = (
+        os.environ.get("GEMININEST_HOST_SESSION")
+        or os.environ.get("ANTIGRAVITY_SESSION_ID")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    host = socket.gethostname() or "local"
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return f"{host}:{user}"
 
 
 def _generate_run_id(prefix: str = "run") -> str:
@@ -112,8 +134,22 @@ def _generate_run_id(prefix: str = "run") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Run State Persistence & 4-Mode Budget Enforcement Helpers
+# Run State Persistence, Active Run Leases & 4-Mode Budget Enforcement Helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_run_states_dir(
+    cfg: AppConfig,
+    *,
+    db_path: str | Path | None,
+    temp_root: Path,
+) -> Path:
+    raw_db = str(db_path) if db_path is not None else cfg.memory.db_path
+    if raw_db and raw_db != ":memory:":
+        base_dir = Path(raw_db).parent
+    else:
+        base_dir = temp_root.parent
+    return base_dir / "run_states"
 
 
 def _resolve_run_state_path(
@@ -124,12 +160,7 @@ def _resolve_run_state_path(
     run_id: str,
 ) -> Path:
     safe_run_id = sanitize_temp_segment(run_id, field_name="run_id")
-    raw_db = str(db_path) if db_path is not None else cfg.memory.db_path
-    if raw_db and raw_db != ":memory:":
-        base_dir = Path(raw_db).parent
-    else:
-        base_dir = temp_root.parent
-    return base_dir / "run_states" / f"{safe_run_id}.json"
+    return _resolve_run_states_dir(cfg, db_path=db_path, temp_root=temp_root) / f"{safe_run_id}.json"
 
 
 def _save_run_state(path: Path, state: Mapping[str, Any]) -> Path:
@@ -148,24 +179,169 @@ def _load_run_state(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _build_active_lease_fields(
+    *,
+    ttl_sec: int = DEFAULT_RUN_LEASE_TTL_SEC,
+    now_epoch: float | None = None,
+    host_session: str | None = None,
+) -> dict[str, Any]:
+    eff_now = _now_epoch() if now_epoch is None else float(now_epoch)
+    eff_ttl = max(60, int(ttl_sec))
+    expires_epoch = round(eff_now + eff_ttl, 3)
+    return {
+        "status": "active",
+        "host_session": host_session or _get_host_session_id(),
+        "lease_ttl_sec": eff_ttl,
+        "lease_updated_epoch": round(eff_now, 3),
+        "lease_expires_epoch": expires_epoch,
+        "lease_expires_at": _epoch_to_iso(expires_epoch),
+    }
+
+
+def _release_run_lease(
+    path: Path,
+    *,
+    reason: str = "completed",
+    now_epoch: float | None = None,
+) -> bool:
+    state = _load_run_state(path)
+    if state is None:
+        return False
+    if str(state.get("status") or "").lower() != "active":
+        return False
+    eff_now = _now_epoch() if now_epoch is None else float(now_epoch)
+    now_iso = _epoch_to_iso(eff_now)
+    state["status"] = "released"
+    state["released_at"] = now_iso
+    state["release_reason"] = reason
+    state["updated_at"] = now_iso
+    state["lease_updated_epoch"] = round(eff_now, 3)
+    state["lease_expires_epoch"] = 0.0
+    state["lease_expires_at"] = now_iso
+    try:
+        _save_run_state(path, state)
+        return True
+    except OSError as exc:
+        logger.warning("Failed to release run lease %s: %s", path, exc)
+        return False
+
+
+def _release_matching_active_leases(
+    run_states_dir: Path,
+    *,
+    run_id: str | None = None,
+    reason: str = "sync_completed",
+    now_epoch: float | None = None,
+) -> list[str]:
+    released: list[str] = []
+    if run_id is not None and run_id.strip():
+        safe_id = sanitize_temp_segment(run_id, field_name="run_id")
+        target = run_states_dir / f"{safe_id}.json"
+        if _release_run_lease(target, reason=reason, now_epoch=now_epoch):
+            released.append(safe_id)
+        return released
+
+    if not run_states_dir.exists() or not run_states_dir.is_dir():
+        return released
+
+    eff_now = _now_epoch() if now_epoch is None else float(now_epoch)
+    active_files: list[tuple[str, Path, dict[str, Any]]] = []
+    for state_file in sorted(run_states_dir.glob("*.json")):
+        state = _load_run_state(state_file)
+        if state is None:
+            continue
+        if str(state.get("status") or "").lower() != "active":
+            continue
+        expires = state.get("lease_expires_epoch")
+        if isinstance(expires, (int, float)) and not isinstance(expires, bool) and float(expires) > eff_now:
+            rid = str(state.get("run_id") or state_file.stem)
+            active_files.append((rid, state_file, state))
+
+    # Without explicit --run-id, only release when unambiguous (single active lease or matching explicit session).
+    explicit_session = (
+        os.environ.get("GEMININEST_HOST_SESSION")
+        or os.environ.get("ANTIGRAVITY_SESSION_ID")
+        or ""
+    ).strip()
+    if explicit_session:
+        for rid, sf, st in active_files:
+            if str(st.get("host_session") or "") == explicit_session:
+                if _release_run_lease(sf, reason=reason, now_epoch=eff_now):
+                    released.append(rid)
+    elif len(active_files) == 1:
+        rid, sf, _st = active_files[0]
+        if _release_run_lease(sf, reason=reason, now_epoch=eff_now):
+            released.append(rid)
+
+    return released
+
+
+def _token_estimate_from_dict(raw: Any) -> TokenEstimate | None:
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return TokenEstimate(
+            est_static_prefix_tokens=int(raw["est_static_prefix_tokens"]),
+            est_dynamic_text_tokens=int(raw["est_dynamic_text_tokens"]),
+            est_audio_tokens=int(raw["est_audio_tokens"]),
+            est_video_tokens=int(raw["est_video_tokens"]),
+            est_total_tokens=int(raw["est_total_tokens"]),
+            meets_implicit_cache_threshold=bool(raw["meets_implicit_cache_threshold"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _record_run_state_bv(
     path: Path,
     *,
     bv_id: str,
     field: Literal["prepared_bvs", "committed_bvs"],
+    run_id: str | None = None,
+    bv_estimate: Mapping[str, Any] | None = None,
+    create_if_missing: bool = False,
 ) -> None:
     state = _load_run_state(path)
     if state is None:
-        return
+        if not create_if_missing:
+            return
+        eff_now = _now_epoch()
+        now_iso = _epoch_to_iso(eff_now)
+        state = {
+            "run_id": run_id or path.stem,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "prepared_bvs": [],
+            "committed_bvs": [],
+            "bv_estimates": {},
+            **_build_active_lease_fields(now_epoch=eff_now),
+        }
+
     existing = list(state.get(field) or [])
     if bv_id not in existing:
         existing.append(bv_id)
-        state[field] = existing
-        state["updated_at"] = _utc_now_iso()
-        try:
-            _save_run_state(path, state)
-        except OSError as exc:
-            logger.warning("Failed to update run state %s: %s", path, exc)
+    state[field] = existing
+
+    if bv_estimate is not None:
+        estimates = dict(state.get("bv_estimates") or {})
+        estimates[bv_id] = dict(bv_estimate)
+        state["bv_estimates"] = estimates
+
+    eff_now = _now_epoch()
+    state["updated_at"] = _epoch_to_iso(eff_now)
+    if str(state.get("status") or "active").lower() == "active":
+        ttl = int(state.get("lease_ttl_sec") or DEFAULT_RUN_LEASE_TTL_SEC)
+        state.update(
+            _build_active_lease_fields(
+                ttl_sec=ttl,
+                now_epoch=eff_now,
+                host_session=str(state.get("host_session") or "") or None,
+            )
+        )
+    try:
+        _save_run_state(path, state)
+    except OSError as exc:
+        logger.warning("Failed to update run state %s: %s", path, exc)
 
 
 def _effective_budget_plan(
@@ -943,12 +1119,19 @@ def commit_appreciation_result(
     token_estimate: TokenEstimate | None = None,
     effective_duration_sec: float = 0.0,
     frame_count: int = 0,
-    cache_hit: bool = True,
+    cache_hit: bool = False,
+    cache_status: Literal["hit", "miss", "unknown"] | None = None,
     headless: bool = False,
     notifier_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate host appreciation output, persist memory/history/ledger, and ALWAYS burn temp dir."""
+    """Validate host appreciation output, persist memory/diary/history/ledger atomically, and ALWAYS burn temp dir."""
     burned = False
+    eff_cache_status: Literal["hit", "miss", "unknown"] = (
+        cache_status
+        if cache_status is not None
+        else ("hit" if cache_hit else "unknown")
+    )
+    eff_cache_hit = eff_cache_status == "hit"
     try:
         try:
             response = bridge.parse_appreciation_response(
@@ -963,27 +1146,29 @@ def commit_appreciation_result(
                     token_estimate=token_estimate,
                 )
             elif exc.error_code == ErrorCode.E6001_HOST_SAFETY_BLOCKED:
-                store.upsert_watch_history(
-                    bv_id=bv_id,
-                    title=video_title or bv_id,
-                    duration_sec=video_duration_sec,
-                    status="filtered_safety",
-                    last_position_sec=0,
-                    prev_recap="E6001 safety blocked",
-                    pipeline_used=pipeline_used,
-                )
-                eff_est = token_estimate or bridge.estimate_tokens(
-                    dynamic_text="",
-                    audio_duration_sec=effective_duration_sec,
-                    frame_count=frame_count,
-                )
-                bridge.record_token_usage(
-                    store,
-                    run_id=run_id,
-                    token_estimate=eff_est,
-                    cache_hit=cache_hit,
-                    status="safety_blocked",
-                )
+                with store.transaction():
+                    store.upsert_watch_history(
+                        bv_id=bv_id,
+                        title=video_title or bv_id,
+                        duration_sec=video_duration_sec,
+                        status="filtered_safety",
+                        last_position_sec=0,
+                        prev_recap="E6001 safety blocked",
+                        pipeline_used=pipeline_used,
+                    )
+                    eff_est = token_estimate or bridge.estimate_tokens(
+                        dynamic_text="",
+                        audio_duration_sec=effective_duration_sec,
+                        frame_count=frame_count,
+                    )
+                    bridge.record_token_usage(
+                        store,
+                        run_id=run_id,
+                        token_estimate=eff_est,
+                        cache_hit=eff_cache_hit,
+                        cache_status=eff_cache_status,
+                        status="safety_blocked",
+                    )
             raise
 
         eff_est = token_estimate or bridge.estimate_tokens(
@@ -993,22 +1178,24 @@ def commit_appreciation_result(
         )
 
         if response.safety_blocked:
-            store.upsert_watch_history(
-                bv_id=bv_id,
-                title=video_title or bv_id,
-                duration_sec=video_duration_sec,
-                status="filtered_safety",
-                last_position_sec=0,
-                prev_recap=f"safety_blocked: {response.block_reason or 'SAFETY'}"[:50],
-                pipeline_used=pipeline_used,
-            )
-            ledger_entry = bridge.record_token_usage(
-                store,
-                run_id=run_id,
-                token_estimate=eff_est,
-                cache_hit=cache_hit,
-                status="safety_blocked",
-            )
+            with store.transaction():
+                store.upsert_watch_history(
+                    bv_id=bv_id,
+                    title=video_title or bv_id,
+                    duration_sec=video_duration_sec,
+                    status="filtered_safety",
+                    last_position_sec=0,
+                    prev_recap=f"safety_blocked: {response.block_reason or 'SAFETY'}"[:50],
+                    pipeline_used=pipeline_used,
+                )
+                ledger_entry = bridge.record_token_usage(
+                    store,
+                    run_id=run_id,
+                    token_estimate=eff_est,
+                    cache_hit=eff_cache_hit,
+                    cache_status=eff_cache_status,
+                    status="safety_blocked",
+                )
             return {
                 "ok": True,
                 "status": "safety_blocked",
@@ -1016,50 +1203,62 @@ def commit_appreciation_result(
                 "bv_id": bv_id,
                 "block_reason": response.block_reason,
                 "tokens_recorded": ledger_entry.total_est_tokens,
+                "cache_status": ledger_entry.cache_status,
                 "toast_sent": False,
             }
-
-        mem_record = store.add_memory(
-            bv_id=bv_id,
-            source="bili_watch",
-            title=video_title or bv_id,
-            summary=response.memory_summary,
-            tags=video_tags,
-            importance=float(response.impression_score),
-            desc=video_desc or response.public_diary,
-            hot_comments=hot_comments,
-            latest_comments=latest_comments,
-        )
 
         watch_status: Literal["completed", "in_progress"] = (
             "in_progress" if response.continue_watching else "completed"
         )
-        store.upsert_watch_history(
-            bv_id=bv_id,
-            title=video_title or bv_id,
-            duration_sec=video_duration_sec,
-            status=watch_status,
-            last_position_sec=int(round(effective_duration_sec)) if response.continue_watching else video_duration_sec,
-            prev_recap=response.recap_50chars,
-            pipeline_used=pipeline_used,
-        )
-
         safe_curiosity = _filter_curiosity_keywords(response.next_curiosity_keywords, meta_filter)
-        for kw in safe_curiosity:
-            store.upsert_worldbook(
-                keyword=kw,
-                category="curiosity_queue",
-                content=f"Derived from {bv_id} ({video_title or bv_id})",
-                status="active",
-            )
 
-        ledger_entry = bridge.record_token_usage(
-            store,
-            run_id=run_id,
-            token_estimate=eff_est,
-            cache_hit=cache_hit,
-            status="ok",
-        )
+        # Single atomic SQLite transaction: memories + memory_fts + diary_entries + watch_history + worldbook + budget_ledger
+        with store.transaction():
+            mem_record = store.add_memory(
+                bv_id=bv_id,
+                source="bili_watch",
+                title=video_title or bv_id,
+                summary=response.memory_summary,
+                tags=video_tags,
+                importance=float(response.impression_score),
+                desc=video_desc or response.public_diary,
+                hot_comments=hot_comments,
+                latest_comments=latest_comments,
+            )
+            diary_record = store.add_diary_entry(
+                memory_id=mem_record.id,
+                run_id=run_id,
+                bv_id=bv_id,
+                title=video_title or bv_id,
+                impression_score=response.impression_score,
+                public_diary=response.public_diary,
+                private_thought=response.private_thought,
+                pipeline_used=pipeline_used,
+            )
+            store.upsert_watch_history(
+                bv_id=bv_id,
+                title=video_title or bv_id,
+                duration_sec=video_duration_sec,
+                status=watch_status,
+                last_position_sec=int(round(effective_duration_sec)) if response.continue_watching else video_duration_sec,
+                prev_recap=response.recap_50chars,
+                pipeline_used=pipeline_used,
+            )
+            for kw in safe_curiosity:
+                store.upsert_worldbook(
+                    keyword=kw,
+                    category="curiosity_queue",
+                    content=f"Derived from {bv_id} ({video_title or bv_id})",
+                    status="active",
+                )
+            ledger_entry = bridge.record_token_usage(
+                store,
+                run_id=run_id,
+                token_estimate=eff_est,
+                cache_hit=eff_cache_hit,
+                cache_status=eff_cache_status,
+                status="ok",
+            )
 
         toast_sent = notify_high_score_video(
             config,
@@ -1076,10 +1275,12 @@ def commit_appreciation_result(
             "status": "committed",
             "bv_id": bv_id,
             "memory_id": mem_record.id,
+            "diary_id": diary_record.id,
             "impression_score": response.impression_score,
             "watch_status": watch_status,
             "curiosity_enqueued": list(safe_curiosity),
             "tokens_recorded": ledger_entry.total_est_tokens,
+            "cache_status": ledger_entry.cache_status,
             "toast_sent": toast_sent,
             "public_diary": response.public_diary,
             "private_thought": response.private_thought,
@@ -1199,10 +1400,11 @@ def run_dry_run(
     eff_run_id = sanitize_temp_segment(run_id or _generate_run_id("dryrun"), field_name="run_id")
     eff_temp_root = Path(temp_root)
     eff_lock_path = Path(lock_file_path or eff_cfg.budget_and_runtime.lock_file_path)
+    run_states_dir = _resolve_run_states_dir(eff_cfg, db_path=db_path, temp_root=eff_temp_root)
 
     with PidLockFile(eff_lock_path, run_id=eff_run_id, pid_checker=pid_checker):
-        # Startup safety net sweep
-        sweep_stale_temp(eff_temp_root)
+        # Startup safety net sweep (protects any active run leases)
+        sweep_stale_temp(eff_temp_root, run_states_dir=run_states_dir)
 
         store = MemoryStore.from_config(eff_cfg, db_path=db_path)
         meta_filter = MetaFilter(eff_cfg)
@@ -1374,8 +1576,8 @@ def run_dry_run(
                 )
 
             # 4. Recall Top-8 memories & build cerebellum SelectionPacket
-            curiosity_entries = store.list_worldbook(category="curiosity_queue", status="active")
-            active_curiosity = tuple(e.keyword for e in curiosity_entries[:4])
+            curiosity_entries = store.select_curiosity_keywords(limit=4)
+            active_curiosity = tuple(e.keyword for e in curiosity_entries)
             batch_query = [c.title for c in fresh_candidates[:5]] + list(active_curiosity)
             recalled_for_menu = store.recall_memories(batch_query, mark_recalled=True)
 
@@ -1568,16 +1770,13 @@ def run_dry_run(
                     if synthetic_src_dir is not None:
                         burn_temp(synthetic_src_dir, temp_root=eff_temp_root)
 
-            # Step 6: Pure-text export + isolated Git commit + mock cloud rotation & sync
+            # Step 6: Pure-text export (reads persisted full diary entries from SQLite) + isolated Git + cloud sync
             sync_exported_count = 0
             sync_active_count = 0
             sync_yesterday_rotated = False
             sync_git_hash: str | None = None
             if sync_manager is not None:
-                export_report = sync_manager.export_and_sync_to_cloud(
-                    store,
-                    diary_entries=diary_entries,
-                )
+                export_report = sync_manager.export_and_sync_to_cloud(store)
                 sync_exported_count = len(export_report.exported_files)
                 sync_active_count = export_report.active_synced_count
                 sync_yesterday_rotated = export_report.yesterday_rotated
@@ -1614,8 +1813,9 @@ def run_dry_run(
             )
         finally:
             store.close()
-            # Shutdown safety net sweep: guarantee zero residual temp directories
-            sweep_stale_temp(eff_temp_root)
+            # Shutdown safety net sweep: burn our own run dir & sweep expired/unleased temp dirs
+            burn_run_temp(eff_temp_root, eff_run_id)
+            sweep_stale_temp(eff_temp_root, run_states_dir=run_states_dir)
             if auto_sync_sandbox is not None:
                 _rmtree_readonly_safe(auto_sync_sandbox)
 
@@ -1699,9 +1899,17 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
     eff_run_id = sanitize_temp_segment(args.run_id or _generate_run_id("host"), field_name="run_id")
     eff_temp_root = Path(args.temp_root)
     eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
+    run_states_dir = _resolve_run_states_dir(cfg, db_path=args.db, temp_root=eff_temp_root)
+    lease_ttl_sec = int(getattr(args, "lease_ttl_sec", DEFAULT_RUN_LEASE_TTL_SEC) or DEFAULT_RUN_LEASE_TTL_SEC)
 
     with PidLockFile(eff_lock_path, run_id=eff_run_id):
-        sweep_stale_temp(eff_temp_root)
+        # Safe startup sweep: ONLY reclaim expired/released or old orphan temp dirs not belonging to active runs.
+        sweep_stale_temp(
+            eff_temp_root,
+            max_age_sec=DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC,
+            now_ts=_now_epoch(),
+            run_states_dir=run_states_dir,
+        )
         with MemoryStore.from_config(cfg, db_path=args.db) as store:
             default_status = store.get_budget_status()
             decision = _resolve_cli_budget_decision(args, budget_status=default_status)
@@ -1750,137 +1958,162 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                 temp_root=eff_temp_root,
                 run_id=eff_run_id,
             )
+            now_epoch = _now_epoch()
+            now_iso = _epoch_to_iso(now_epoch)
+            lease_fields = _build_active_lease_fields(
+                ttl_sec=lease_ttl_sec,
+                now_epoch=now_epoch,
+            )
             _save_run_state(
                 run_state_path,
                 {
                     "run_id": eff_run_id,
-                    "created_at": _utc_now_iso(),
-                    "updated_at": _utc_now_iso(),
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    **lease_fields,
                     "budget_plan": asdict(plan),
                     "decision": asdict(decision),
                     "prepared_bvs": [],
                     "committed_bvs": [],
+                    "bv_estimates": {},
                 },
             )
 
-            # Step 1: Absorb reverse [MEMORY_PATCH] files from inbox/ before querying curiosity & memories.
-            # In offline mode, only touch cloud inbox when `--cloud-dir` is explicitly provided so
-            # offline tests never touch the user's real cloud drive or real data/exports/.
-            inbox_sync_dict: dict[str, Any] | None = None
-            skip_inbox = bool(getattr(args, "skip_inbox", False))
-            explicit_cloud_dir = getattr(args, "cloud_dir", None)
-            explicit_export_dir = getattr(args, "export_dir", None)
-            if not skip_inbox and (not offline or explicit_cloud_dir is not None):
-                temp_export_sandbox: Path | None = None
-                try:
-                    eff_export_dir: Path | str | None = explicit_export_dir
-                    if eff_export_dir is None and offline:
-                        temp_export_sandbox = Path(
-                            tempfile.mkdtemp(prefix=f"gemininest_feed_export_{eff_run_id}_")
-                        )
-                        eff_export_dir = temp_export_sandbox / "exports"
-                    sync_mgr = SyncManager(
-                        cfg,
-                        persona_path=args.persona,
-                        local_export_dir=eff_export_dir,
-                        cloud_nest_dir=explicit_cloud_dir,
-                    )
-                    inbox_report = sync_mgr.absorb_inbox_patches(store)
-                    inbox_sync_dict = sync_report_to_dict(inbox_report)
-                finally:
-                    if temp_export_sandbox is not None:
-                        _rmtree_readonly_safe(temp_export_sandbox)
-
-            curiosity_entries = store.list_worldbook(category="curiosity_queue", status="active")
-            active_curiosity = tuple(e.keyword for e in curiosity_entries[:4])
-            snapshot_used: str | None = None
-
-            if args.snapshot:
-                candidates, _details, _meta = load_snapshot(args.snapshot)
-                snapshot_used = str(args.snapshot)
-            elif args.offline:
-                latest = _find_latest_snapshot(DEFAULT_SNAPSHOTS_DIR)
-                if latest is not None:
-                    candidates, _details, _meta = load_snapshot(latest)
-                    snapshot_used = str(latest)
-                else:
-                    candidates, _details = build_default_dry_run_snapshot()
-            else:
-                with BilibiliFetcher(cfg, secrets) as fetcher:
+            try:
+                # Step 1: Absorb reverse [MEMORY_PATCH] files from inbox/ before querying curiosity & memories.
+                # In offline mode, only touch cloud inbox when `--cloud-dir` is explicitly provided so
+                # offline tests never touch the user's real cloud drive or real data/exports/.
+                inbox_sync_dict: dict[str, Any] | None = None
+                skip_inbox = bool(getattr(args, "skip_inbox", False))
+                explicit_cloud_dir = getattr(args, "cloud_dir", None)
+                explicit_export_dir = getattr(args, "export_dir", None)
+                if not skip_inbox and (not offline or explicit_cloud_dir is not None):
+                    temp_export_sandbox: Path | None = None
                     try:
-                        batch = fetcher.fetch_batch(
-                            curiosity_keywords=active_curiosity,
-                            run_id=eff_run_id,
-                            verify_heartbeat=True,
+                        eff_export_dir: Path | str | None = explicit_export_dir
+                        if eff_export_dir is None and offline:
+                            temp_export_sandbox = Path(
+                                tempfile.mkdtemp(prefix=f"gemininest_feed_export_{eff_run_id}_")
+                            )
+                            eff_export_dir = temp_export_sandbox / "exports"
+                        sync_mgr = SyncManager(
+                            cfg,
+                            persona_path=args.persona,
+                            local_export_dir=eff_export_dir,
+                            cloud_nest_dir=explicit_cloud_dir,
                         )
-                    except GeminiNestError as exc:
-                        if exc.error_code == ErrorCode.E2001_BILI_AUTH_EXPIRED:
-                            notify_auth_expired(cfg, detail=exc.message, headless=args.headless)
-                        raise
-                    if batch.aborted:
-                        raise GeminiNestError(
-                            batch.error_code or ErrorCode.E2002_BILI_RATE_LIMIT_412,
-                            f"Bilibili fetch aborted locally (consecutive_412={batch.consecutive_412}).",
-                        )
-                    candidates = batch.candidates
-                    snapshot_used = str(batch.snapshot_path) if batch.snapshot_path else None
+                        inbox_report = sync_mgr.absorb_inbox_patches(store)
+                        inbox_sync_dict = sync_report_to_dict(inbox_report)
+                    finally:
+                        if temp_export_sandbox is not None:
+                            _rmtree_readonly_safe(temp_export_sandbox)
 
-            meta_filter = MetaFilter(cfg)
-            candidates_by_id = {c.bv_id: c for c in candidates}
-            allowed_candidates, rejected_results = meta_filter.partition(candidates)
-            for rej in rejected_results:
-                meta = candidates_by_id[rej.bv_id]
-                store.upsert_watch_history(
-                    bv_id=meta.bv_id,
-                    title=meta.title,
-                    duration_sec=meta.duration_sec,
-                    status="filtered_blacklist",
-                    last_position_sec=0,
-                    prev_recap=rej.reason[:50],
-                    pipeline_used="audio_only",
+                curiosity_entries = store.select_curiosity_keywords(limit=4)
+                active_curiosity = tuple(e.keyword for e in curiosity_entries)
+                snapshot_used: str | None = None
+
+                if args.snapshot:
+                    candidates, _details, _meta = load_snapshot(args.snapshot)
+                    snapshot_used = str(args.snapshot)
+                elif args.offline:
+                    latest = _find_latest_snapshot(DEFAULT_SNAPSHOTS_DIR)
+                    if latest is not None:
+                        candidates, _details, _meta = load_snapshot(latest)
+                        snapshot_used = str(latest)
+                    else:
+                        candidates, _details = build_default_dry_run_snapshot()
+                else:
+                    with BilibiliFetcher(cfg, secrets) as fetcher:
+                        try:
+                            batch = fetcher.fetch_batch(
+                                curiosity_keywords=active_curiosity,
+                                run_id=eff_run_id,
+                                verify_heartbeat=True,
+                            )
+                        except GeminiNestError as exc:
+                            if exc.error_code == ErrorCode.E2001_BILI_AUTH_EXPIRED:
+                                notify_auth_expired(cfg, detail=exc.message, headless=args.headless)
+                            raise
+                        if batch.aborted:
+                            raise GeminiNestError(
+                                batch.error_code or ErrorCode.E2002_BILI_RATE_LIMIT_412,
+                                f"Bilibili fetch aborted locally (consecutive_412={batch.consecutive_412}).",
+                            )
+                        candidates = batch.candidates
+                        snapshot_used = str(batch.snapshot_path) if batch.snapshot_path else None
+
+                # Rotate & track curiosity usage only after feed fetch succeeded
+                curiosity_updated = store.mark_curiosity_searched(
+                    active_curiosity,
+                    now=_epoch_to_iso(_now_epoch()),
+                    max_searches=DEFAULT_CURIOSITY_MAX_SEARCHES,
                 )
+                curiosity_consumed = [
+                    entry.keyword for entry in curiosity_updated if entry.status == "consumed"
+                ]
 
-            fresh = [
-                c
-                for c in allowed_candidates
-                if (h := store.get_watch_history(c.bv_id)) is None
-                or h.status not in ("completed", "filtered_blacklist", "filtered_safety")
-            ]
+                meta_filter = MetaFilter(cfg)
+                candidates_by_id = {c.bv_id: c for c in candidates}
+                allowed_candidates, rejected_results = meta_filter.partition(candidates)
+                for rej in rejected_results:
+                    meta = candidates_by_id[rej.bv_id]
+                    store.upsert_watch_history(
+                        bv_id=meta.bv_id,
+                        title=meta.title,
+                        duration_sec=meta.duration_sec,
+                        status="filtered_blacklist",
+                        last_position_sec=0,
+                        prev_recap=rej.reason[:50],
+                        pipeline_used="audio_only",
+                    )
 
-            recalled = store.recall_memories(
-                [c.title for c in fresh[:5]] + list(active_curiosity),
-                mark_recalled=True,
-            )
-            bridge = AgentBridge(cfg, persona_path=args.persona)
-            eff_max_select = (
-                max(1, min(10, int(plan.max_videos)))
-                if plan.max_videos is not None
-                else args.max_select
-            )
-            packet = bridge.build_selection_packet(
-                run_id=eff_run_id,
-                candidates=fresh,
-                recalled_memories=recalled,
-                active_curiosity_keywords=active_curiosity,
-                max_select=eff_max_select,
-            )
-            _emit_json(
-                {
-                    "ok": True,
-                    "run_id": eff_run_id,
-                    "snapshot_path": snapshot_used,
-                    "candidates_total": len(candidates),
-                    "filtered_blacklist_count": len(rejected_results),
-                    "decision": asdict(decision),
-                    "budget_plan": asdict(plan),
-                    "run_state_path": str(run_state_path),
-                    "budget_status": asdict(budget_status),
-                    "inbox_sync": inbox_sync_dict,
-                    "packet": selection_packet_to_dict(packet),
-                },
-                output_path=args.output,
-            )
-            return 0
+                fresh = [
+                    c
+                    for c in allowed_candidates
+                    if (h := store.get_watch_history(c.bv_id)) is None
+                    or h.status not in ("completed", "filtered_blacklist", "filtered_safety")
+                ]
+
+                recalled = store.recall_memories(
+                    [c.title for c in fresh[:5]] + list(active_curiosity),
+                    mark_recalled=True,
+                )
+                bridge = AgentBridge(cfg, persona_path=args.persona)
+                eff_max_select = (
+                    max(1, min(10, int(plan.max_videos)))
+                    if plan.max_videos is not None
+                    else args.max_select
+                )
+                packet = bridge.build_selection_packet(
+                    run_id=eff_run_id,
+                    candidates=fresh,
+                    recalled_memories=recalled,
+                    active_curiosity_keywords=active_curiosity,
+                    max_select=eff_max_select,
+                )
+                _emit_json(
+                    {
+                        "ok": True,
+                        "run_id": eff_run_id,
+                        "snapshot_path": snapshot_used,
+                        "candidates_total": len(candidates),
+                        "filtered_blacklist_count": len(rejected_results),
+                        "decision": asdict(decision),
+                        "budget_plan": asdict(plan),
+                        "run_state_path": str(run_state_path),
+                        "run_lease": lease_fields,
+                        "budget_status": asdict(budget_status),
+                        "curiosity_selected": list(active_curiosity),
+                        "curiosity_consumed": curiosity_consumed,
+                        "inbox_sync": inbox_sync_dict,
+                        "packet": selection_packet_to_dict(packet),
+                    },
+                    output_path=args.output,
+                )
+                return 0
+            except Exception:
+                _release_run_lease(run_state_path, reason="prepare_feed_failed")
+                raise
 
 
 def _cmd_prepare_media(args: argparse.Namespace) -> int:
@@ -2133,7 +2366,28 @@ def _cmd_prepare_media(args: argparse.Namespace) -> int:
             output_payload["downgraded_to_audio"] = True
             output_payload["error_code"] = ErrorCode.E5001_SAFETY_GATE_DOWNGRADED.value
 
-        _record_run_state_bv(run_state_path, bv_id=safe_bv, field="prepared_bvs")
+        bv_estimate_record = {
+            "bv_id": safe_bv,
+            "title": detail.meta.title,
+            "duration_sec": detail.meta.duration_sec,
+            "tags": list(detail.meta.tags),
+            "desc": detail.meta.desc,
+            "hot_comments": [c.content for c in detail.hot_comments],
+            "latest_comments": [c.content for c in detail.latest_comments],
+            "pipeline_used": prepared.mode,
+            "effective_duration_sec": prepared.effective_duration_sec,
+            "frame_count": prepared.frame_count,
+            "token_estimate": asdict(packet.token_estimate),
+            "updated_at": _utc_now_iso(),
+        }
+        _record_run_state_bv(
+            run_state_path,
+            bv_id=safe_bv,
+            field="prepared_bvs",
+            run_id=safe_run_id,
+            bv_estimate=bv_estimate_record,
+            create_if_missing=True,
+        )
         _emit_json(output_payload, output_path=args.output)
         return 0
 
@@ -2158,13 +2412,62 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
     else:
         raw_response = sys.stdin.read()
 
-    tags = tuple(t.strip() for t in (args.tags or "").split(",") if t.strip())
+    run_state = _load_run_state(run_state_path)
+    bv_estimates = (run_state or {}).get("bv_estimates")
+    cached_bv: Mapping[str, Any] = (
+        bv_estimates.get(safe_bv)
+        if isinstance(bv_estimates, Mapping) and isinstance(bv_estimates.get(safe_bv), Mapping)
+        else {}
+    )
+    persisted_token_est = _token_estimate_from_dict(cached_bv.get("token_estimate"))
+
+    cli_tags = tuple(t.strip() for t in (args.tags or "").split(",") if t.strip())
+    cached_tags = tuple(
+        str(t).strip() for t in (cached_bv.get("tags") or ()) if str(t).strip()
+    )
+    eff_tags = cli_tags if cli_tags else cached_tags
+
+    eff_title = (args.title or "").strip() or str(cached_bv.get("title") or "").strip() or safe_bv
+    eff_duration_sec = (
+        int(args.duration_sec)
+        if int(args.duration_sec or 0) > 0
+        else int(cached_bv.get("duration_sec") or 0)
+    )
+    eff_effective_duration = (
+        float(args.effective_duration_sec)
+        if float(args.effective_duration_sec or 0.0) > 0.0
+        else float(cached_bv.get("effective_duration_sec") or 0.0)
+    )
+    eff_frame_count = (
+        int(args.frame_count)
+        if int(args.frame_count or 0) > 0
+        else int(cached_bv.get("frame_count") or 0)
+    )
+    raw_pipeline = (
+        getattr(args, "pipeline_used", None)
+        or cached_bv.get("pipeline_used")
+        or cfg.project.pipeline_mode
+    )
+    pipeline_used: Literal["audio_only", "sanitized_video", "downgraded_audio"] = (
+        raw_pipeline
+        if raw_pipeline in ("audio_only", "sanitized_video", "downgraded_audio")
+        else cfg.project.pipeline_mode
+    )
+    eff_desc = str(cached_bv.get("desc") or "")
+    eff_hot_comments = tuple(str(c) for c in (cached_bv.get("hot_comments") or ()) if str(c).strip())
+    eff_latest_comments = tuple(str(c) for c in (cached_bv.get("latest_comments") or ()) if str(c).strip())
+
+    # Cache status defaults to "unknown" unless explicitly indicated via --cache-hit or --cache-status
+    raw_cache_status = getattr(args, "cache_status", None)
+    if bool(args.cache_hit):
+        eff_cache_status: Literal["hit", "miss", "unknown"] = "hit"
+    elif raw_cache_status in ("hit", "miss", "unknown"):
+        eff_cache_status = raw_cache_status
+    else:
+        eff_cache_status = "unknown"
+
     bridge = AgentBridge(cfg, persona_path=args.persona)
     meta_filter = MetaFilter(cfg)
-    pipeline_used: Literal["audio_only", "sanitized_video", "downgraded_audio"] = (
-        getattr(args, "pipeline_used", None) or cfg.project.pipeline_mode
-    )
-    frame_count = int(getattr(args, "frame_count", 0) or 0)
 
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         outcome = commit_appreciation_result(
@@ -2176,16 +2479,22 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
             run_id=safe_run_id,
             bv_id=safe_bv,
             raw_response=raw_response,
-            video_title=args.title or safe_bv,
-            video_duration_sec=int(args.duration_sec or 0),
-            video_tags=tags,
+            video_title=eff_title,
+            video_duration_sec=eff_duration_sec,
+            video_tags=eff_tags,
+            video_desc=eff_desc,
+            hot_comments=eff_hot_comments,
+            latest_comments=eff_latest_comments,
             pipeline_used=pipeline_used,
-            effective_duration_sec=float(args.effective_duration_sec or 0.0),
-            frame_count=frame_count,
-            cache_hit=bool(args.cache_hit),
+            token_estimate=persisted_token_est,
+            effective_duration_sec=eff_effective_duration,
+            frame_count=eff_frame_count,
+            cache_hit=(eff_cache_status == "hit"),
+            cache_status=eff_cache_status,
             headless=args.headless,
         )
-        _record_run_state_bv(run_state_path, bv_id=safe_bv, field="committed_bvs")
+        outcome["token_estimate_reused"] = persisted_token_est is not None
+        _record_run_state_bv(run_state_path, bv_id=safe_bv, field="committed_bvs", run_id=safe_run_id)
         _emit_json(outcome, output_path=args.output)
         return 0
 
@@ -2204,23 +2513,48 @@ def _cmd_burn_temp(args: argparse.Namespace) -> int:
         )
         return 0
 
-    if not args.run_id or not args.bv:
+    raw_run_id = getattr(args, "run_id", None)
+    if not raw_run_id:
         raise GeminiNestError(
             ErrorCode.E1001_CONFIG_INVALID,
-            "burn-temp requires either `--all` or both `--run-id` and `--bv`.",
+            "burn-temp requires `--all` or `--run-id` (with optional `--bv`).",
         )
 
-    safe_run = sanitize_temp_segment(args.run_id, field_name="run_id")
-    safe_bv = sanitize_temp_segment(args.bv, field_name="bv_id")
-    target_dir = eff_temp_root / safe_run / safe_bv
-    removed_flag = burn_temp(target_dir, temp_root=eff_temp_root)
+    safe_run = sanitize_temp_segment(raw_run_id, field_name="run_id")
+    if args.bv:
+        safe_bv = sanitize_temp_segment(args.bv, field_name="bv_id")
+        target_dir = eff_temp_root / safe_run / safe_bv
+        removed_flag = burn_temp(target_dir, temp_root=eff_temp_root)
+        _emit_json(
+            {
+                "ok": True,
+                "mode": "single_bv",
+                "run_id": safe_run,
+                "bv_id": safe_bv,
+                "removed": removed_flag,
+            }
+        )
+        return 0
+
+    removed_flag = burn_run_temp(eff_temp_root, safe_run)
+    lease_released = False
+    if bool(getattr(args, "release_lease", False)):
+        cfg, _secrets = _load_config_from_args(args, offline=True)
+        run_state_path = _resolve_run_state_path(
+            cfg,
+            db_path=args.db,
+            temp_root=eff_temp_root,
+            run_id=safe_run,
+        )
+        lease_released = _release_run_lease(run_state_path, reason="burn_temp_release")
+
     _emit_json(
         {
             "ok": True,
-            "mode": "single_bv",
+            "mode": "run_id",
             "run_id": safe_run,
-            "bv_id": safe_bv,
             "removed": removed_flag,
+            "lease_released": lease_released,
         }
     )
     return 0
@@ -2297,10 +2631,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_sync(args: argparse.Namespace) -> int:
     cfg, _secrets = _load_config_from_args(args, offline=True)
     eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
+    eff_temp_root = Path(args.temp_root)
     direction: Literal["both", "inbox", "export"] = getattr(args, "direction", "both")
     enable_git = False if getattr(args, "no_git", False) else None
     export_dir = getattr(args, "export_dir", None)
     cloud_dir = getattr(args, "cloud_dir", None)
+    raw_run_id = getattr(args, "run_id", None)
+    run_states_dir = _resolve_run_states_dir(cfg, db_path=args.db, temp_root=eff_temp_root)
 
     with PidLockFile(eff_lock_path, run_id=_generate_run_id("sync")):
         with MemoryStore.from_config(cfg, db_path=args.db) as store:
@@ -2323,10 +2660,19 @@ def _cmd_sync(args: argparse.Namespace) -> int:
                     enable_git_commit=enable_git,
                 )
 
+    released_leases: list[str] = []
+    if direction in ("export", "both") or (raw_run_id is not None and str(raw_run_id).strip()):
+        released_leases = _release_matching_active_leases(
+            run_states_dir,
+            run_id=raw_run_id,
+            reason="sync_completed",
+        )
+
     _emit_json(
         {
             "ok": True,
             "direction": direction,
+            "released_run_leases": released_leases,
             "report": sync_report_to_dict(report),
         },
         output_path=getattr(args, "output", None),
@@ -2395,6 +2741,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("--reserve-ratio", type=float, default=None, help="Explicit reserve_ratio budget (0.0-1.0); skips popup")
     p_feed.add_argument("--max-minutes", type=float, default=None, help="Explicit max_minutes duration cap (>0); skips popup")
     p_feed.add_argument("--max-select", type=int, default=5)
+    p_feed.add_argument("--lease-ttl-sec", type=int, default=DEFAULT_RUN_LEASE_TTL_SEC)
     p_feed.add_argument("--export-dir", default=argparse.SUPPRESS)
     p_feed.add_argument("--cloud-dir", default=argparse.SUPPRESS)
     p_feed.add_argument("--skip-inbox", action="store_true")
@@ -2437,16 +2784,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p_commit.add_argument("--tags", default="")
     p_commit.add_argument("--cache-hit", action="store_true")
+    p_commit.add_argument(
+        "--cache-status",
+        choices=("unknown", "hit", "miss"),
+        default=None,
+        help="Explicit cache status override (default: unknown unless --cache-hit is set)",
+    )
     p_commit.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
     p_commit.add_argument("--output", default=argparse.SUPPRESS)
 
     p_burn = subparsers.add_parser(
         "burn-temp",
-        help="Burn a specific BV temp directory or sweep all stale temporary directories",
+        help="Burn a specific run_id/BV temp directory or sweep all stale temporary directories",
     )
     p_burn.add_argument("--run-id", default=argparse.SUPPRESS)
     p_burn.add_argument("--bv", default=None)
     p_burn.add_argument("--all", action="store_true")
+    p_burn.add_argument(
+        "--release-lease",
+        action="store_true",
+        help="Also release the active run lease for --run-id",
+    )
 
     p_run = subparsers.add_parser("run", help="Run orchestration state machine (supports --dry-run)")
     p_run.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
@@ -2476,6 +2834,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="both",
         help="Sync direction: both (Step 1 + Step 6), inbox (Step 1 only), or export (Step 6 only)",
     )
+    p_sync.add_argument("--run-id", default=argparse.SUPPRESS, help="Release active run lease for run_id after sync")
     p_sync.add_argument("--export-dir", default=argparse.SUPPRESS)
     p_sync.add_argument("--cloud-dir", default=argparse.SUPPRESS)
     p_sync.add_argument("--no-git", action="store_true", help="Skip isolated data/exports Git commit")

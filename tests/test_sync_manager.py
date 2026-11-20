@@ -495,3 +495,197 @@ def test_parse_and_validate_patch_helpers_unit_edge_cases(tmp_path: Path) -> Non
     )
     assert patch is not None and patch.validated is False
     assert err is not None and ErrorCode.E8004_PATCH_POLICY_REJECTED.value in err
+
+
+def test_diary_latest_reads_persisted_full_diary_and_honors_export_private_thought(
+    tmp_path: Path,
+) -> None:
+    export_dir = tmp_path / "exports_diary"
+    cloud_dir = _setup_mock_cloud(tmp_path / "cloud_diary")
+    cfg = _make_sync_cfg(tmp_path, cloud_dir=cloud_dir, export_dir=export_dir)
+
+    full_diary_text = (
+        "今天在纯音频巡逻里意外挖到一条极其惊艳的复古软驱交响乐音MAD！前奏用 56K 拨号握手杂音铺底，"
+        "进入主歌后三台软盘步进电机精准卡在低音提琴声部，高潮段落层次分明，完全不是 80 字摘要能装下的完整手账。"
+    )
+    private_thought_text = "私密碎碎念_SECRET_CAT_THOUGHT_999：软驱拉出低音那拍耳朵直接融化了。"
+
+    with MemoryStore.from_config(cfg) as store:
+        mem = store.add_memory(
+            bv_id="BV1diaryfull1",
+            title="复古软驱交响乐",
+            summary="简短80字摘要",
+            importance=9.0,
+            tags=("音MAD",),
+            created_at="2026-11-20T10:00:00Z",
+        )
+        store.add_diary_entry(
+            memory_id=mem.id,
+            run_id="run_diary_01",
+            bv_id="BV1diaryfull1",
+            title="复古软驱交响乐",
+            impression_score=9,
+            public_diary=full_diary_text,
+            private_thought=private_thought_text,
+            pipeline_used="sanitized_video",
+            created_at="2026-11-20T10:00:00Z",
+        )
+
+        # 1. Default export_private_thought=True renders full public_diary AND private_thought from SQLite
+        mgr_on = SyncManager(cfg, persona_path=REPO_PERSONA_PATH, probe_retries=1, probe_retry_delay_sec=0.0)
+        mgr_on.export_local_views(store)  # Notice: NO in-memory diary_entries passed!
+        diary_on = (export_dir / "diary_latest.md").read_text(encoding="utf-8")
+        assert full_diary_text in diary_on
+        assert private_thought_text in diary_on
+        assert "sanitized_video" in diary_on
+
+        # 2. export_private_thought=False keeps full public_diary but hides private_thought
+        cfg_off = replace(cfg, sync=replace(cfg.sync, export_private_thought=False))
+        mgr_off = SyncManager(cfg_off, persona_path=REPO_PERSONA_PATH, probe_retries=1, probe_retry_delay_sec=0.0)
+        mgr_off.export_local_views(store)
+        diary_off = (export_dir / "diary_latest.md").read_text(encoding="utf-8")
+        assert full_diary_text in diary_off
+        assert private_thought_text not in diary_off
+        assert "**猫猫碎碎念**" not in diary_off
+
+
+def test_inbox_patch_idempotency_prevents_duplicate_memories_and_double_boost(tmp_path: Path) -> None:
+    export_dir = tmp_path / "exports_idem"
+    cloud_dir = _setup_mock_cloud(tmp_path / "cloud_idem")
+    cfg = _make_sync_cfg(tmp_path, cloud_dir=cloud_dir, export_dir=export_dir)
+    mgr = SyncManager(cfg, persona_path=REPO_PERSONA_PATH, probe_retries=1, probe_retry_delay_sec=0.0)
+
+    first_patch_file = cloud_dir / "inbox" / "patch_original.txt"
+    first_patch_file.write_text(
+        """
+[MEMORY_PATCH]
+op: add_memory
+title: 幂等测试新记忆
+summary: 这条记忆即使被重复投入 inbox 多次也只能入库一次。
+tags: 幂等测试, 复古硬件
+importance: 7.5
+[/MEMORY_PATCH]
+
+[MEMORY_PATCH]
+op: boost_memory
+query: 基础记忆目标
+importance_delta: 1.5
+[/MEMORY_PATCH]
+
+[MEMORY_PATCH]
+op: add_curiosity
+keywords: ["步进电机奏乐", "磁带机拆解"]
+reason: 验证重复投入不报错且幂等跳过
+[/MEMORY_PATCH]
+""",
+        encoding="utf-8",
+    )
+
+    with MemoryStore.from_config(cfg) as store:
+        base_mem = store.add_memory(
+            title="基础记忆目标",
+            summary="用来测试 boost_memory 绝不二次加分。",
+            importance=6.0,
+            tags=("基础记忆目标",),
+        )
+
+        r1 = mgr.absorb_inbox_patches(store)
+        assert r1.patches_applied == 3
+        assert r1.patches_rejected == 0
+        assert r1.patches_skipped_duplicate == 0
+        assert r1.errors == ()
+        assert store.count_memories() == 2
+        boosted_once = store.get_memory(base_mem.id)
+        assert boosted_once is not None
+        assert boosted_once.importance == pytest.approx(7.5)
+        assert boosted_once.recall_count == 1
+        assert len(store.list_applied_patches()) == 3
+
+        # Re-drop the EXACT SAME logical patches under a DIFFERENT filename & JSON formatting
+        replay_patch_file = cloud_dir / "inbox" / "patch_replayed_copy.md"
+        replay_patch_file.write_text(
+            """
+[MEMORY_PATCH]
+{"importance": 7.5, "tags": ["复古硬件", "幂等测试"], "summary": "这条记忆即使被重复投入 inbox 多次也只能入库一次。", "title": "幂等测试新记忆", "op": "add_memory"}
+[/MEMORY_PATCH]
+
+[MEMORY_PATCH]
+{"importance_delta": 1.5, "query": "基础记忆目标", "op": "boost_memory"}
+[/MEMORY_PATCH]
+
+[MEMORY_PATCH]
+{"reason": "验证重复投入不报错且幂等跳过", "keywords": ["磁带机拆解", "步进电机奏乐"], "op": "add_curiosity"}
+[/MEMORY_PATCH]
+""",
+            encoding="utf-8",
+        )
+
+        r2 = mgr.absorb_inbox_patches(store)
+        assert r2.patches_applied == 0
+        assert r2.patches_rejected == 0
+        assert r2.patches_skipped_duplicate == 3
+        assert r2.errors == ()
+        # Duplicate file was cleanly archived without a *_rejected.txt log
+        assert not replay_patch_file.exists()
+        assert (cloud_dir / "inbox_archived" / "patch_replayed_copy.md").is_file()
+        assert not (cloud_dir / "inbox_archived" / "patch_replayed_copy_rejected.txt").exists()
+
+        # No duplicate memory created and NO second boost applied!
+        assert store.count_memories() == 2
+        boosted_after_replay = store.get_memory(base_mem.id)
+        assert boosted_after_replay is not None
+        assert boosted_after_replay.importance == pytest.approx(7.5)
+        assert boosted_after_replay.recall_count == 1
+
+
+def test_same_revision_repeated_sync_does_not_overwrite_yesterday_readonly(tmp_path: Path) -> None:
+    export_dir = tmp_path / "exports_rev"
+    cloud_dir = _setup_mock_cloud(tmp_path / "cloud_rev")
+    cfg = _make_sync_cfg(tmp_path, cloud_dir=cloud_dir, export_dir=export_dir)
+    mgr = SyncManager(cfg, persona_path=REPO_PERSONA_PATH, probe_retries=1, probe_retry_delay_sec=0.0)
+
+    with MemoryStore.from_config(cfg) as store:
+        # Revision 1
+        store.add_memory(
+            title="Day1 历史版本",
+            summary="REVISION_ONE_MARKER",
+            importance=8.0,
+            created_at="2026-11-18T10:00:00Z",
+        )
+        r1 = mgr.export_and_sync_to_cloud(store)
+        assert r1.yesterday_rotated is False
+
+        # Revision 2 -> rotates Revision 1 into 1_yesterday_readonly/
+        store.add_memory(
+            title="Day2 当前版本",
+            summary="REVISION_TWO_MARKER",
+            importance=8.0,
+            created_at="2026-11-19T10:00:00Z",
+        )
+        r2 = mgr.export_and_sync_to_cloud(store)
+        assert r2.yesterday_rotated is True
+        y_diary = cloud_dir / "1_yesterday_readonly" / "diary_latest.md"
+        assert "REVISION_ONE_MARKER" in y_diary.read_text(encoding="utf-8")
+        assert "REVISION_TWO_MARKER" not in y_diary.read_text(encoding="utf-8")
+
+        # Repeated sync of IDENTICAL Revision 2 -> MUST NOT rotate or overwrite 1_yesterday_readonly/!
+        r3 = mgr.export_and_sync_to_cloud(store)
+        assert r3.yesterday_rotated is False
+        assert r3.export_git_commit_hash is None
+        assert r3.active_synced_count == 0
+        y_text_after_repeat = y_diary.read_text(encoding="utf-8")
+        assert "REVISION_ONE_MARKER" in y_text_after_repeat
+        assert "REVISION_TWO_MARKER" not in y_text_after_repeat
+
+        # Genuine Revision 3 -> now rotates Revision 2 into 1_yesterday_readonly/
+        store.add_memory(
+            title="Day3 全新修订",
+            summary="REVISION_THREE_MARKER",
+            importance=9.0,
+            created_at="2026-11-20T10:00:00Z",
+        )
+        r4 = mgr.export_and_sync_to_cloud(store)
+        assert r4.yesterday_rotated is True
+        y_text_day3 = y_diary.read_text(encoding="utf-8")
+        assert "REVISION_TWO_MARKER" in y_text_day3
+        assert "REVISION_THREE_MARKER" not in y_text_day3

@@ -30,7 +30,7 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -53,6 +53,7 @@ __all__ = [
     "AudioDownloader",
     "MediaProcessor",
     "VideoDownloader",
+    "burn_run_temp",
     "burn_temp",
     "burn_temp_dir",
     "compute_keep_intervals",
@@ -61,6 +62,7 @@ __all__ = [
     "managed_temp_workspace",
     "probe_audio_info",
     "probe_video_info",
+    "read_active_run_ids",
     "resolve_target_video_height",
     "sanitize_temp_segment",
     "sweep_stale_temp",
@@ -541,27 +543,108 @@ def burn_temp(
 burn_temp_dir = burn_temp
 
 
+def burn_run_temp(
+    temp_root: Path | str,
+    run_id: str,
+) -> bool:
+    """Physically delete ONLY the temporary directory belonging to `run_id` (`<temp_root>/<run_id>/`)."""
+    safe_run = sanitize_temp_segment(run_id, field_name="run_id")
+    target = Path(temp_root) / safe_run
+    return burn_temp(target)
+
+
+def _inspect_run_state_leases(
+    run_states_dir: Path | str | None,
+    *,
+    now_ts: float,
+) -> tuple[set[str], set[str]]:
+    """Inspect `run_states/*.json` leases and return `(active_run_ids, inactive_or_expired_run_ids)`."""
+    active: set[str] = set()
+    inactive: set[str] = set()
+    if run_states_dir is None:
+        return active, inactive
+
+    states_path = Path(run_states_dir)
+    if not states_path.exists() or not states_path.is_dir():
+        return active, inactive
+
+    for state_file in sorted(states_path.glob("*.json")):
+        if not state_file.is_file():
+            continue
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        run_id = str(data.get("run_id") or state_file.stem).strip()
+        if not run_id:
+            continue
+
+        status = str(data.get("status") or "active").strip().lower()
+        lease_obj = data.get("lease") if isinstance(data.get("lease"), dict) else {}
+        expires_raw = data.get("lease_expires_epoch")
+        if expires_raw is None and isinstance(lease_obj, dict):
+            expires_raw = lease_obj.get("expires_epoch")
+
+        is_active = False
+        if status == "active" and isinstance(expires_raw, (int, float)) and not isinstance(expires_raw, bool):
+            is_active = float(expires_raw) > now_ts
+
+        if is_active:
+            active.add(run_id)
+            active.add(state_file.stem)
+        else:
+            inactive.add(run_id)
+            inactive.add(state_file.stem)
+
+    return active, inactive
+
+
+def read_active_run_ids(
+    run_states_dir: Path | str,
+    *,
+    now_ts: float | None = None,
+) -> frozenset[str]:
+    """Return all currently active (non-expired) `run_id` leases found in `run_states_dir`."""
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    active, _inactive = _inspect_run_state_leases(run_states_dir, now_ts=current_ts)
+    return frozenset(active)
+
+
 def sweep_stale_temp(
     temp_root: Path | str = DEFAULT_TEMP_ROOT,
     *,
     max_age_sec: float | None = None,
     now_ts: float | None = None,
+    active_run_ids: Collection[str] | None = None,
+    run_states_dir: Path | str | None = None,
 ) -> tuple[Path, ...]:
-    """Sweep leftover temporary media directories/files under `temp_root`.
+    """Sweep expired orphan temporary directories under `temp_root` without touching active runs.
 
-    Called on startup and shutdown to guarantee zero residual temporary media
-    after unexpected crashes or interrupted Antigravity host turns.
+    Protection rules:
+    - Any directory matching `active_run_ids` or an active (non-expired) lease in `run_states_dir`
+      is NEVER deleted, even if its mtime is older than `max_age_sec`.
+    - Any directory whose `run_states/<run_id>.json` lease is explicitly released/expired is
+      eligible for immediate reclamation.
+    - Unleased orphan directories are reclaimed when `max_age_sec is None` or `age >= max_age_sec`.
     """
     root = Path(temp_root)
     if not root.exists() or not root.is_dir():
         return ()
 
     current_ts = time.time() if now_ts is None else float(now_ts)
+    protected_ids: set[str] = {str(rid).strip() for rid in (active_run_ids or ()) if str(rid).strip()}
+    leased_active, leased_inactive = _inspect_run_state_leases(run_states_dir, now_ts=current_ts)
+    protected_ids |= leased_active
+
     removed: list[Path] = []
     for entry in sorted(root.iterdir()):
         if entry.name == ".gitkeep":
             continue
-        if max_age_sec is not None:
+        if entry.name in protected_ids:
+            continue
+        if entry.name not in leased_inactive and max_age_sec is not None:
             try:
                 age_sec = current_ts - entry.stat().st_mtime
             except OSError:
@@ -790,11 +873,28 @@ class MediaProcessor:
         """Delete `temp_root/<run_id>/<bv_id>/` and clean empty parent run dir."""
         return burn_temp(self.get_temp_dir(run_id, bv_id), temp_root=self._temp_root)
 
+    def burn_run_temp(self, run_id: str) -> bool:
+        """Delete ONLY `temp_root/<run_id>/`."""
+        return burn_run_temp(self._temp_root, run_id)
+
     burn_temp_dir = burn_temp
 
-    def sweep_stale_temp(self, *, max_age_sec: float | None = None) -> tuple[Path, ...]:
-        """Sweep all stale temporary directories under this processor's `temp_root`."""
-        return sweep_stale_temp(self._temp_root, max_age_sec=max_age_sec)
+    def sweep_stale_temp(
+        self,
+        *,
+        max_age_sec: float | None = None,
+        now_ts: float | None = None,
+        active_run_ids: Collection[str] | None = None,
+        run_states_dir: Path | str | None = None,
+    ) -> tuple[Path, ...]:
+        """Sweep expired orphan temporary directories under this processor's `temp_root`."""
+        return sweep_stale_temp(
+            self._temp_root,
+            max_age_sec=max_age_sec,
+            now_ts=now_ts,
+            active_run_ids=active_run_ids,
+            run_states_dir=run_states_dir,
+        )
 
     def _transcode_audio(
         self,

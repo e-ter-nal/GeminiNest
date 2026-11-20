@@ -1162,3 +1162,349 @@ def test_dry_run_stops_gracefully_on_max_minutes_deadline(tmp_path: Path) -> Non
     assert len(report.appreciated_bvs) == 1
     assert report.stopped_reason == "budget_limit_reached"
     assert report.temp_residual_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Audit Reliability Fixes Regression Suite (P1-1, P1-2, P1-3, P2-1, P2-2)
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_commit_appreciation_then_sync_persists_full_diary_and_reuses_estimate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify real separate CLI calls: prepare-feed -> prepare-media -> commit-appreciation -> sync."""
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snapshots")
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg_path = tmp_path / "local.json"
+    local_cfg_path.write_text(
+        json.dumps({"media_preprocess": {"ffmpeg_binary": ffmpeg_bin}}),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "standalone_diary.db"
+    temp_root = tmp_path / "temp_diary"
+    lock_path = tmp_path / "diary.lock"
+    export_dir = tmp_path / "exports_diary"
+    cloud_dir = tmp_path / "cloud_diary"
+    for sub in ("0_active", "1_yesterday_readonly", "inbox", "inbox_archived"):
+        (cloud_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg_path),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+        "--export-dir",
+        str(export_dir),
+        "--cloud-dir",
+        str(cloud_dir),
+    ]
+
+    # 1. prepare-feed creates active lease
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", "run_full_diary"]) == 0
+    feed_out = json.loads(capsys.readouterr().out)
+    run_state_path = Path(feed_out["run_state_path"])
+    assert run_state_path.is_file()
+    state_after_feed = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert state_after_feed["status"] == "active"
+    assert state_after_feed["lease_expires_epoch"] > state_after_feed["lease_updated_epoch"]
+
+    # 2. prepare-media persists full token_estimate & metadata into run_states/<run_id>.json
+    wav_path = synthesize_offline_wav(ffmpeg_bin, tmp_path / "full_src.wav", duration_sec=3.0)
+    assert (
+        main(
+            [
+                *common,
+                "prepare-media",
+                "--offline",
+                "--run-id",
+                "run_full_diary",
+                "--bv",
+                "BV1drygem001",
+                "--source-audio",
+                str(wav_path),
+            ]
+        )
+        == 0
+    )
+    media_out = json.loads(capsys.readouterr().out)
+    expected_est = media_out["packet"]["token_estimate"]
+    state_after_media = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert "BV1drygem001" in state_after_media["bv_estimates"]
+    assert state_after_media["bv_estimates"]["BV1drygem001"]["token_estimate"] == expected_est
+
+    # 3. Standalone commit-appreciation WITHOUT --cache-hit or redundant metadata flags
+    full_public_diary = (
+        "独立进程 commit-appreciation 持久化的完整长手账正文：今天在 B 站偶遇一条把 56K 拨号握手声、"
+        "老式软盘驱动器步进马达嗡鸣和清脆机械键盘声精密编排成交响乐变奏的神级音 MAD。"
+        "即使之后在完全独立的命令行进程里运行 sync，diary_latest.md 也必须完整呈现这段正文而非截断摘要。"
+    )
+    private_thought = "电子小猫暗自决定把这首硬件交响乐设为年度私藏循环单曲。"
+    resp_file = tmp_path / "app_resp.json"
+    resp_file.write_text(
+        json.dumps(
+            {
+                "bv_id": "BV1drygem001",
+                "public_diary": full_public_diary,
+                "private_thought": private_thought,
+                "impression_score": 9,
+                "memory_summary": "80字短摘要：硬件采样音MAD佳作。",
+                "continue_watching": False,
+                "recap_50chars": "硬件采样音MAD佳作，已听完。",
+                "next_curiosity_keywords": ["步进电机奏乐"],
+                "safety_blocked": False,
+                "block_reason": None,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                *common,
+                "commit-appreciation",
+                "--run-id",
+                "run_full_diary",
+                "--bv",
+                "BV1drygem001",
+                "--response-file",
+                str(resp_file),
+                "--headless",
+            ]
+        )
+        == 0
+    )
+    commit_out = json.loads(capsys.readouterr().out)
+    assert commit_out["ok"] is True
+    assert commit_out["token_estimate_reused"] is True
+    assert commit_out["cache_status"] == "unknown"
+    assert commit_out["tokens_recorded"] == expected_est["est_total_tokens"]
+    assert commit_out["diary_id"] >= 1
+
+    # Verify SQLite persisted full diary & cache_status="unknown" + reused title/tags
+    cfg_check = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg_path)
+    with MemoryStore.from_config(cfg_check, db_path=db_path) as store:
+        diaries = store.list_recent_diary_entries(limit=5)
+        assert len(diaries) == 1
+        assert diaries[0].public_diary == full_public_diary
+        assert diaries[0].private_thought == private_thought
+        assert diaries[0].run_id == "run_full_diary"
+        assert diaries[0].pipeline_used == "audio_only"
+        assert "56K" in diaries[0].title  # Reused from prepare-media run_state!
+        ledger = store.list_budget_entries()
+        assert len(ledger) == 1
+        assert ledger[0].cache_status == "unknown"
+        assert ledger[0].est_cached_tokens == 0
+
+    # 4. Standalone sync --direction export --run-id run_full_diary -> exports full public_diary & releases lease!
+    assert main([*common, "sync", "--direction", "export", "--run-id", "run_full_diary"]) == 0
+    sync_out = json.loads(capsys.readouterr().out)
+    assert sync_out["ok"] is True
+    assert sync_out["released_run_leases"] == ["run_full_diary"]
+
+    active_diary_md = (cloud_dir / "0_active" / "diary_latest.md").read_text(encoding="utf-8")
+    assert full_public_diary in active_diary_md
+    assert private_thought in active_diary_md
+
+    state_after_sync = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert state_after_sync["status"] == "released"
+
+
+def test_dual_run_id_concurrent_burn_temp_and_startup_sweep_isolation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify burn-temp --run-id A and startup sweep_stale_temp never delete active run B's media."""
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snapshots")
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg_path = tmp_path / "local.json"
+    local_cfg_path.write_text(
+        json.dumps({"media_preprocess": {"ffmpeg_binary": ffmpeg_bin}}),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "concurrent.db"
+    temp_root = tmp_path / "concurrent_temp"
+    lock_path = tmp_path / "concurrent.lock"
+    wav_path = synthesize_offline_wav(ffmpeg_bin, tmp_path / "conc_src.wav", duration_sec=3.0)
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg_path),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+    ]
+
+    # Start Run A and Run B concurrently
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", "run_A"]) == 0
+    capsys.readouterr()
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", "run_B"]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                *common,
+                "prepare-media",
+                "--offline",
+                "--run-id",
+                "run_A",
+                "--bv",
+                "BV1drygem001",
+                "--source-audio",
+                str(wav_path),
+            ]
+        )
+        == 0
+    )
+    media_a = Path(json.loads(capsys.readouterr().out)["prepared_media"]["payload_path"])
+    assert (
+        main(
+            [
+                *common,
+                "prepare-media",
+                "--offline",
+                "--run-id",
+                "run_B",
+                "--bv",
+                "BV1drydiy002",
+                "--source-audio",
+                str(wav_path),
+            ]
+        )
+        == 0
+    )
+    media_b = Path(json.loads(capsys.readouterr().out)["prepared_media"]["payload_path"])
+    assert media_a.is_file() and media_b.is_file()
+
+    # 1. Stage 3 burn-temp --run-id run_A deletes ONLY run_A, keeping active run_B intact
+    assert main([*common, "burn-temp", "--run-id", "run_A", "--release-lease"]) == 0
+    burn_out = json.loads(capsys.readouterr().out)
+    assert burn_out["mode"] == "run_id"
+    assert burn_out["removed"] is True
+    assert burn_out["lease_released"] is True
+    assert not (temp_root / "run_A").exists()
+    assert media_b.is_file()
+
+    # 2. Seed an expired Run D and trigger another prepare-feed (startup sweep_stale_temp)
+    run_states_dir = db_path.parent / "run_states"
+    expired_dir = temp_root / "run_D_expired" / "BV1dead"
+    expired_dir.mkdir(parents=True, exist_ok=True)
+    (expired_dir / "audio.m4a").write_bytes(b"expired")
+    (run_states_dir / "run_D_expired.json").write_text(
+        json.dumps({"run_id": "run_D_expired", "status": "active", "lease_expires_epoch": 1.0}),
+        encoding="utf-8",
+    )
+
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", "run_C"]) == 0
+    capsys.readouterr()
+
+    # Expired run_D was swept, while active run_B's prepared media is STILL untouched!
+    assert not (temp_root / "run_D_expired").exists()
+    assert media_b.is_file()
+
+    # Cleanup run_B
+    assert main([*common, "burn-temp", "--run-id", "run_B", "--release-lease"]) == 0
+    capsys.readouterr()
+    assert not (temp_root / "run_B").exists()
+
+
+def test_prepare_feed_curiosity_rotation_and_auto_consumption_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify repeated prepare-feed pulls rotate curiosity keywords and auto-consume after 3 searches."""
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snapshots")
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg_path = tmp_path / "local.json"
+    local_cfg_path.write_text(
+        json.dumps({"media_preprocess": {"ffmpeg_binary": ffmpeg_bin}}),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "curiosity_rot.db"
+    temp_root = tmp_path / "curiosity_temp"
+    lock_path = tmp_path / "curiosity.lock"
+
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg_path)
+    with MemoryStore.from_config(cfg, db_path=db_path) as store:
+        for idx, kw in enumerate(("主题A", "主题B", "主题C", "主题D", "主题E")):
+            store.upsert_worldbook(
+                keyword=kw,
+                category="curiosity_queue",
+                content=f"探索 {kw}",
+                status="active",
+                now=f"2026-11-20T00:0{idx}:00Z",
+            )
+
+    fake_clock = [1_700_100_000.0]
+    monkeypatch.setattr("gemininest.runner._now_epoch", lambda: fake_clock[0])
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg_path),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+    ]
+
+    rounds: list[dict[str, Any]] = []
+    for step in range(1, 6):
+        fake_clock[0] += 600.0
+        assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", f"rot_run_{step}"]) == 0
+        rounds.append(json.loads(capsys.readouterr().out))
+
+    # Round 1 picks first 4 never-searched keywords: A, B, C, D
+    assert rounds[0]["curiosity_selected"] == ["主题A", "主题B", "主题C", "主题D"]
+    assert rounds[0]["curiosity_consumed"] == []
+
+    # Round 2 MUST prioritize never-searched 主题E first, then oldest searched A, B, C
+    assert rounds[1]["curiosity_selected"] == ["主题E", "主题A", "主题B", "主题C"]
+    assert rounds[1]["curiosity_consumed"] == []
+
+    # Round 3 picks oldest searched D (count=1), E (count=1), then A & B (hitting count=3 -> consumed!)
+    assert rounds[2]["curiosity_selected"] == ["主题D", "主题E", "主题A", "主题B"]
+    assert set(rounds[2]["curiosity_consumed"]) == {"主题A", "主题B"}
+
+    # Round 4 picks remaining active C, D, E -> all 3 hit count=3 and become consumed!
+    assert rounds[3]["curiosity_selected"] == ["主题C", "主题D", "主题E"]
+    assert set(rounds[3]["curiosity_consumed"]) == {"主题C", "主题D", "主题E"}
+
+    # Round 5: all 5 have been naturally consumed
+    assert rounds[4]["curiosity_selected"] == []
+    with MemoryStore.from_config(cfg, db_path=db_path) as store:
+        assert store.list_worldbook(category="curiosity_queue", status="active") == ()
+        consumed = store.list_worldbook(category="curiosity_queue", status="consumed")
+        assert len(consumed) == 5
+        assert all(e.search_count == 3 and e.last_searched_at is not None for e in consumed)

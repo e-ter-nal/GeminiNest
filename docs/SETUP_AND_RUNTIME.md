@@ -120,7 +120,7 @@ Copy-Item config.local.example.json config.local.json
 ### 3.1 调度窗口与 4 选 1 预算控制（GUI 弹窗 + CLI 双支持）
 
 * **推荐调度窗口**：每天设置 **2 个独立 5 小时额度窗口**（例如 `11:30` 与 `20:30`），初期标定前 3 天观察 `budget_ledger` 消耗后，可在 `config.local.json` 中微调 `token_calibration_k`。
-* **防撞车锁**：`runner.py` 内置 `.cat.lock` 存活 PID 校验锁，防止电脑合盖休眠后系统补发任务导致并发撞车；崩溃残留的死 PID 锁会自动回收。
+* **防撞车锁与跨命令运行租约**：`runner.py` 内置 `.cat.lock` 存活 PID 校验锁，防止单命令并发撞车；同时利用 `data/run_states/<run_id>.json` 为整轮跨 CLI 巡逻维护带 TTL 的**活跃运行租约**（`prepare-feed` 创建、`prepare-media`/`commit-appreciation` 续期、`sync --run-id <run_id>` 释放），启动清扫 `sweep_stale_temp()` 仅回收已过期且不属于任何活跃 `run_id` 的孤儿目录，杜绝并发巡逻互删媒体。
 * **4 选 1 互斥预算控制模式（默认 `use_ratio = 0.35`）**：
   * `use_ratio`（`--budget-ratio 0.35`）：按本次 5h 窗口算力用量百分比控制；
   * `max_videos`（`--max-videos 3`）：按本轮最多观看视频个数控制；
@@ -153,7 +153,7 @@ Copy-Item config.local.example.json config.local.json
 请严格使用 Python 解释器 `<YOUR_CONDA_PYTHON>`（设置环境变量 `PYTHONPATH=src`），按以下三阶段协议顺序执行，严禁跳过安全校验或残留临时媒体文件：
 
 【阶段 1：吸收反向补丁 + 预算确认 + 准备今日菜单（小脑选片）】
-1. 执行命令（默认不带 `--headless`，交互桌面自动弹出 60 秒 4 选 1 预算确认窗；锁屏/隔离桌面自动静默回退默认配置不卡死；也可按需显式追加 `--budget-ratio 0.35` / `--max-videos 3` / `--reserve-ratio 0.40` / `--max-minutes 15` 四选一参数跳过弹窗直接生效；同时自动完成 `.cat.lock` 锁校验、残留临时目录清扫、Step 1 吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心拉取、黑名单硬过滤、Top-8 记忆召回及 `budget_plan` 状态落盘）：
+1. 执行命令（默认不带 `--headless`，交互桌面自动弹出 60 秒 4 选 1 预算确认窗；锁屏/隔离桌面自动静默回退默认配置不卡死；也可按需显式追加 `--budget-ratio 0.35` / `--max-videos 3` / `--reserve-ratio 0.40` / `--max-minutes 15` 四选一参数跳过弹窗直接生效；同时自动完成 `.cat.lock` 锁校验、仅回收过期孤儿目录的安全清扫、Step 1 幂等吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心轮换拉取、黑名单硬过滤、Top-8 记忆召回，并在 `data/run_states/<run_id>.json` 落盘 `budget_plan` 与活跃运行租约）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-feed --max-select 4`
 2. 解析标准输出的 JSON：
    - 若出现 `stopped_reason`（如 `rest_today` / `cooldown_or_budget_exhausted`）或错误码 `E2001_BILI_AUTH_EXPIRED` / `E2002_BILI_RATE_LIMIT_412` / `E7002_LOCKFILE_CONFLICT`，立即停止本轮巡逻并简短汇报原因，严禁继续拉取或重试。
@@ -161,23 +161,23 @@ Copy-Item config.local.example.json config.local.json
 
 【阶段 2：逐条制备媒体 -> 原生 `read_file` 鉴赏 -> 提交回写并物理焚毁】
 对每个选中的 `bv_id` 顺序执行：
-1. 调用媒体制备命令（程序自动先校验 `budget_plan` 是否已达 `max_videos`、超过 `deadline_epoch` 或窗口额度耗尽，再按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
+1. 调用媒体制备命令（程序自动先校验 `budget_plan` 是否已达 `max_videos`、超过 `deadline_epoch` 或窗口额度耗尽，再按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；同时自动将该 BV 的完整 Token 预估明细与元数据写入 `data/run_states/<run_id>.json` 供提交阶段复用；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-media --run-id <run_id> --bv <bv_id>`
    - **若返回 `stopped_reason: "budget_limit_reached"`**（达到观看个数上限、超过玩耍时长截止时间或窗口预算耗尽），**立即优雅中止阶段 2 循环，跳过剩余 BV 直接进入阶段 3 收尾同步**。
    - 若返回 `E3001_BLACKLIST_REJECTED`、`E4001_FFMPEG_FAILED` 或 `E4002_PAYLOAD_TOO_LARGE`，跳过该 BV 继续下一条。
 2. 读取返回 JSON 中的 `prepared_media.payload_path`、`prepared_media.mode`、`prepared_media.frame_count` 与 `prepared_media.effective_duration_sec`，调用 Antigravity 原生工具 `read_file(Path="<prepared_media.payload_path>")` 加载本地净版媒体（`.m4a` 或 `.mp4`），并结合 `packet.static_prefix_prompt` 与 `packet.dynamic_context_prompt` 进行沉浸鉴赏：
    - **当 `prepared_media.mode` 为 `audio_only` 或 `downgraded_audio` 时（最高红线：纯听觉诚实）**：只根据标题、简介、字幕、热评与真实听到的声音（BGM、节奏、语气、音效）写手账，**严禁捏造未提供的具体视觉画面细节**。
    - **当 `prepared_media.mode` 为 `sanitized_video` 时（净版音画鉴赏）**：结合真实看到的画面细节与听到的音轨撰写手账；若遇到安检门替换的纯黑帧，请将其视为正常跳过片段自然忽略，不做无意义揣测或展开。
-3. 严格按照 `AppreciationResponse` JSON Schema 将你的鉴赏结果写入临时 JSON 文件（如 `data/temp/<run_id>/<bv_id>_resp.json`），立即调用提交与焚毁命令（透传实际帧数与管线模式以精确记账；保留高分 Toast 通知）：
-   `<YOUR_CONDA_PYTHON> -m gemininest.runner commit-appreciation --run-id <run_id> --bv <bv_id> --response-file <resp_json_path> --title "<title>" --duration-sec <sec> --effective-duration-sec <eff_sec> --frame-count <frame_count> --pipeline-used <mode> --tags "<comma_tags>" --cache-hit`
+3. 严格按照 `AppreciationResponse` JSON Schema 将你的鉴赏结果写入临时 JSON 文件（如 `data/temp/<run_id>/<bv_id>_resp.json`），立即调用提交与焚毁命令（自动复用 `prepare-media` 写入 `run_states/<run_id>.json` 的 Token 预估与视频元数据，将完整 `public_diary` 与 `private_thought` 随鉴赏事务持久化入库，默认将缓存状态记为 `unknown` 不再硬编码 `--cache-hit`；保留高分 Toast 通知）：
+   `<YOUR_CONDA_PYTHON> -m gemininest.runner commit-appreciation --run-id <run_id> --bv <bv_id> --response-file <resp_json_path>`
    - 若鉴赏过程触发 `SAFETY` / `PROHIBITED_CONTENT`，严禁重试：将 `safety_blocked: true, block_reason: "SAFETY"` 提交给 `commit-appreciation`，或立即执行 `<YOUR_CONDA_PYTHON> -m gemininest.runner burn-temp --run-id <run_id> --bv <bv_id>` 物理焚毁临时媒体后直接跳过该 BV。
    - 若出现 429 限流，立即中止本轮剩余 BV。
 
-【阶段 3：兜底清扫、纯文本正向导出与云盘轮转同步】
-1. 所有选中视频处理完毕后，执行兜底临时目录清扫与正向云盘同步：
-   `<YOUR_CONDA_PYTHON> -m gemininest.runner burn-temp --all`
-   `<YOUR_CONDA_PYTHON> -m gemininest.runner sync --direction export`
-2. 简要汇总本轮结果：吸收的 `inbox` 补丁数、黑名单过滤条数、每条鉴赏成功的 BV / 实际执行模式（含 v2 安检推理设备、抹黑帧数或 `E5001` 降级说明）/ 印象分、新增好奇心词条、云盘同步与独立导出 Git 提交状态（如遇 `E8001_CLOUD_DRIVE_UNMOUNTED` 提示本地导出与 Git 已安全保留）。
+【阶段 3：本轮隔离清扫、纯文本正向导出与云盘轮转同步】
+1. 所有选中视频处理完毕后，仅清理当前 `run_id` 的临时目录，并执行正向云盘同步（直接从 SQLite 导出完整 `public_diary`，按 `sync.export_private_thought` 控制是否渲染 `private_thought`，同修订跳过 `1_yesterday_readonly/` 轮转并释放本轮运行租约）：
+   `<YOUR_CONDA_PYTHON> -m gemininest.runner burn-temp --run-id <run_id>`
+   `<YOUR_CONDA_PYTHON> -m gemininest.runner sync --direction export --run-id <run_id>`
+2. 简要汇总本轮结果：吸收/幂等跳过的 `inbox` 补丁数、黑名单过滤条数、每条鉴赏成功的 BV / 实际执行模式（含 v2 安检推理设备、抹黑帧数或 `E5001` 降级说明）/ 印象分、新增与轮换消费的好奇心词条、云盘同步与独立导出 Git 提交状态（如遇 `E8001_CLOUD_DRIVE_UNMOUNTED` 提示本地导出与 Git 已安全保留）。
 ```
 
 ---

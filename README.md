@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/badge/version-v2.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB.svg)](#user--ai-agent-通用快速部署清单quickstart-checklist)
-[![Tests](https://img.shields.io/badge/pytest-134%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-134-条单元测试)
+[![Tests](https://img.shields.io/badge/pytest-149%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-149-条单元测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -43,7 +43,7 @@
 | **感知载体** | 元数据 + 字幕 + 精选评论 + **`48kbps` 单声道 `m4a`**（SponsorBlock 自动去广告） | 元数据 + 字幕 + 精选评论 + **480p 1fps 严格帧一致净版 MP4**（含 `48kbps` 单声道音轨） |
 | **本地安检引擎** | `PassthroughSafetyGate`（零视觉依赖、零视觉合规风险） | **`wd-tagger` ONNX**（`SmilingWolf/wd-vit-tagger-v3`），支持 `DirectML`（Windows 通用 GPU）/ `CUDA` / `CPU` 自动路由 |
 | **安全兜底机制** | 严守**纯听觉诚实红线**（禁止脑补未提供的画面细节） | 三重阈值（`general ≥ 0.20`、`sensitive ≤ 0.75`、`unsafe ≤ 0.05`）→ 违规帧原地**外科手术抹黑 `(0,0,0)`** → 抹黑率 `> 15%` 触发 **Early-Exit 提前熔断**并自动降级为 `downgraded_audio`（`E5001`） |
-| **实测体积与 Token 消耗** | 110s 视频 → **`680 KB` `m4a`**，约 25 Tok/s（总计 `3,264 Tokens`） | 133s（132 帧）视频 → **`2.73 MB` 净版 MP4**（`2,858,964` 字节），约 70 Tok/帧 + 25 Tok/s（总计 `13,040 Tokens`） |
+| **实测体积与估算 Token** | 110s 视频 → **`680 KB` `m4a`**；按 25 Tok/s 估算总计 `3,264 Tokens`（**本地公式估算 / 特定环境观测值**，非服务端官方计费遥测） | 133s（132 帧）视频 → **`2.73 MB` 净版 MP4**（`2,858,964` 字节）；按 70 Tok/帧 + 25 Tok/s 估算总计 `13,040 Tokens`（**本地公式估算 / 特定环境观测值**，非服务端官方计费遥测） |
 | **实测管线耗时** | 秒级完成 FFmpeg 抽音与空降裁剪 | **Windows DirectML GPU 端到端 `21.77 s`**（下载 `2.51 s` + 抽帧 `5.61 s` + 132 帧推理 `12.43 s` + 重封 `0.67 s`）；单帧热态推理 **`51.75 ms`**（较 CPU `360.76 ms` 提速 **7.0×**，端到端较 CPU `291.15 s` 提速 **13.4×**） |
 
 ### 热插拔切换方式
@@ -95,9 +95,9 @@ flowchart TD
     end
 
     subgraph Step3["阶段 3：纯文本云盘正反向闭环 (sync)"]
-        P --> Q["burn-temp --all 兜底清扫 (残留归零)"]
-        Q --> R["导出纯文本至 data/exports/ & 独立隐藏 Git 自动留痕"]
-        R --> S["扩展名白名单校验 (.md/.json/.txt) -> 轮转 1_yesterday_readonly/ & 刷新 0_active/"]
+        P --> Q["burn-temp --run-id <run_id> 隔离清扫 (当前轮次残留归零)"]
+        Q --> R["从 SQLite 导出完整手账至 data/exports/ & 独立隐藏 Git 自动留痕"]
+        R --> S["扩展名白名单校验 (.md/.json/.txt) -> 新修订轮转 1_yesterday_readonly/ & 刷新 0_active/"]
         S --> T["Gemini Web (Gem + Scheduled Actions) 读取 0_active/ 延续记忆"]
         T -. "Export to Docs -> Apps Script (.gdoc -> .txt)" .-> B
     end
@@ -142,7 +142,7 @@ GeminiNest/
 │   ├── budget_ui.py                  # 60s 非抢占 tkinter 预算小窗（含 TclError 兜底）+ Windows Toast
 │   ├── sync_manager.py               # 纯文本扩展名防火墙 + exports 独立隐藏 Git + 轮转 + inbox 补丁吸收
 │   └── runner.py                     # .cat.lock PID 锁、宿主驱动 CLI 子命令与 --dry-run 离线回放
-└── tests/                            # 134 条全离线单元测试（零网络、零真实数据触碰）
+└── tests/                            # 149 条全离线单元测试（零网络、零真实数据触碰）
 ```
 
 ### 2. `.gitignore` 严格屏蔽的本地私有文件（严禁提交至 Git）
@@ -167,7 +167,7 @@ GeminiNest/
 
 如果你正在使用 Google Antigravity、Cursor、Claude Code 等 Coding Agent，克隆仓库后可直接把下面这段话发给它：
 
-> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 134/134 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
+> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 149/149 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
 
 ---
 
@@ -235,7 +235,7 @@ Copy-Item config.local.example.json config.local.json
   - 若需启用 v2 视觉安检，按上方「热插拔切换方式」补充 `pipeline_mode: "sanitized_video"` 与 `wd_tagger_enabled: true`。
 - [ ] 确认代理分流：B 站域名（`bilibili.com`、`bilivideo.com`、`hdslb.com`）走 `DIRECT` 直连，Google / Antigravity 走单一稳定节点。
 
-### Step 4：离线验货（`--dry-run`）与 134 条单元测试
+### Step 4：离线验货（`--dry-run`）与 149 条单元测试
 
 在接入真实小号与定时任务前，先运行全离线演练与单元测试（全程使用隔离临时沙箱，**零网络请求、零额度消耗、绝不触碰真实数据库与云盘**）：
 
@@ -251,7 +251,7 @@ python -m gemininest.runner --dry-run --headless
 python -m gemininest.runner --dry-run --mode sanitized_video --headless
 ```
 
-- [ ] 运行全量离线单元测试（确认 **134/134** 全部通过）：
+- [ ] 运行全量离线单元测试（确认 **149/149** 全部通过）：
 
 ```powershell
 python -m pytest -v

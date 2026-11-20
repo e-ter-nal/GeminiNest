@@ -7,10 +7,11 @@ import math
 import re
 import sqlite3
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from gemininest.contracts import (
     AppConfig,
@@ -18,6 +19,7 @@ from gemininest.contracts import (
     BudgetAndRuntimeConfig,
     BudgetLedgerEntry,
     BudgetStatus,
+    DiaryEntry,
     ErrorCode,
     GeminiNestError,
     MemoryConfig,
@@ -29,8 +31,10 @@ from gemininest.contracts import (
 )
 
 __all__ = [
+    "DEFAULT_CURIOSITY_MAX_SEARCHES",
     "BudgetLedgerEntry",
     "BudgetStatus",
+    "DiaryEntry",
     "ErrorCode",
     "MemoryRecord",
     "MemoryStore",
@@ -74,6 +78,7 @@ _DEFAULT_BUDGET_CONFIG = BudgetAndRuntimeConfig(
 
 _QUERY_SPLIT_RE = re.compile(r"[\s,，、;；/|#【】\[\]()（）《》「」『』:：!?！？。·•\"'`~]+")
 _WINDOW_SECONDS = 5 * 3600
+DEFAULT_CURIOSITY_MAX_SEARCHES = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -99,13 +104,38 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     tokenize='trigram'
 );
 
+CREATE TABLE IF NOT EXISTS diary_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER REFERENCES memories(id) ON DELETE SET NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    bv_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    impression_score INTEGER NOT NULL CHECK(impression_score >= 1 AND impression_score <= 10),
+    public_diary TEXT NOT NULL,
+    private_thought TEXT NOT NULL DEFAULT '',
+    pipeline_used TEXT NOT NULL DEFAULT 'audio_only' CHECK(pipeline_used IN (
+        'audio_only', 'sanitized_video', 'downgraded_audio'
+    )),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS applied_patches (
+    patch_id TEXT PRIMARY KEY,
+    op TEXT NOT NULL,
+    source_file TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS worldbook (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword TEXT NOT NULL UNIQUE,
     category TEXT NOT NULL CHECK(category IN ('core_lore', 'curiosity_queue', 'preference')),
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'archived')),
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    last_searched_at TEXT DEFAULT NULL,
+    search_count INTEGER NOT NULL DEFAULT 0 CHECK(search_count >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS watch_history (
@@ -135,10 +165,13 @@ CREATE TABLE IF NOT EXISTS budget_ledger (
     total_est_tokens INTEGER NOT NULL DEFAULT 0,
     budget_ratio_used REAL NOT NULL DEFAULT 0.0,
     status TEXT NOT NULL CHECK(status IN ('ok', 'rate_limited_429', 'safety_blocked')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    cache_status TEXT NOT NULL DEFAULT 'unknown' CHECK(cache_status IN ('hit', 'miss', 'unknown'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_bv_id ON memories(bv_id);
+CREATE INDEX IF NOT EXISTS idx_diary_entries_created ON diary_entries(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_diary_entries_bv ON diary_entries(bv_id);
 CREATE INDEX IF NOT EXISTS idx_budget_ledger_window ON budget_ledger(window_bucket, created_at);
 CREATE INDEX IF NOT EXISTS idx_budget_ledger_status ON budget_ledger(status, created_at);
 """
@@ -280,21 +313,95 @@ class MemoryStore:
         self._memory_cfg = memory_config or _DEFAULT_MEMORY_CONFIG
         self._budget_cfg = budget_config or _DEFAULT_BUDGET_CONFIG
         self._db_path_str = str(db_path)
+        self._tx_depth = 0
 
         if self._db_path_str != ":memory:":
             Path(self._db_path_str).parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            self._conn = sqlite3.connect(self._db_path_str, timeout=10.0)
+            self._conn = sqlite3.connect(
+                self._db_path_str,
+                timeout=10.0,
+                isolation_level=None,
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA busy_timeout = 10000;")
             self._conn.execute("PRAGMA foreign_keys = ON;")
             if self._db_path_str != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL;")
             self._conn.executescript(_SCHEMA_SQL)
-            self._conn.commit()
+            self._run_migrations()
         except sqlite3.OperationalError as exc:
             self._handle_operational_error(exc)
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(r["name"]) for r in rows}
+
+    def _run_migrations(self) -> None:
+        """Backward-compatible in-place schema migration for existing `cat_memory.db` files."""
+        with self.transaction():
+            wb_cols = self._table_columns("worldbook")
+            if "last_searched_at" not in wb_cols:
+                self._conn.execute(
+                    "ALTER TABLE worldbook ADD COLUMN last_searched_at TEXT DEFAULT NULL"
+                )
+            if "search_count" not in wb_cols:
+                self._conn.execute(
+                    "ALTER TABLE worldbook ADD COLUMN search_count INTEGER NOT NULL DEFAULT 0"
+                )
+
+            bl_cols = self._table_columns("budget_ledger")
+            if "cache_status" not in bl_cols:
+                self._conn.execute(
+                    "ALTER TABLE budget_ledger ADD COLUMN cache_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_worldbook_curiosity_rotation
+                ON worldbook(category, status, last_searched_at, search_count)
+                """
+            )
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Re-entrant atomic SQLite transaction (BEGIN IMMEDIATE + SAVEPOINT for nested scopes)."""
+        is_outer = self._tx_depth == 0
+        sp_name = f"gn_sp_{self._tx_depth}"
+        try:
+            if is_outer:
+                self._conn.execute("BEGIN IMMEDIATE")
+            else:
+                self._conn.execute(f"SAVEPOINT {sp_name}")
+        except sqlite3.OperationalError as exc:
+            self._handle_operational_error(exc)
+            raise
+
+        self._tx_depth += 1
+        try:
+            yield
+        except BaseException:
+            try:
+                if is_outer:
+                    self._conn.execute("ROLLBACK")
+                else:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except sqlite3.Error:
+                pass
+            raise
+        else:
+            try:
+                if is_outer:
+                    self._conn.execute("COMMIT")
+                else:
+                    self._conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except sqlite3.OperationalError as exc:
+                self._handle_operational_error(exc)
+                raise
+        finally:
+            self._tx_depth -= 1
 
     @classmethod
     def from_config(
@@ -406,7 +513,7 @@ class MemoryStore:
         latest_col = _join_text_field(latest_comments)
 
         try:
-            with self._conn:
+            with self.transaction():
                 cur = self._conn.execute(
                     """
                     INSERT INTO memories (
@@ -501,7 +608,7 @@ class MemoryStore:
         now_iso = _to_iso(_parse_datetime(now))
         placeholders = ", ".join("?" for _ in unique_ids)
         try:
-            with self._conn:
+            with self.transaction():
                 cur = self._conn.execute(
                     f"""
                     UPDATE memories
@@ -534,7 +641,7 @@ class MemoryStore:
         )
         now_iso = _to_iso(_parse_datetime(now))
         try:
-            with self._conn:
+            with self.transaction():
                 self._conn.execute(
                     """
                     UPDATE memories
@@ -803,8 +910,193 @@ class MemoryStore:
         return final_result
 
     # ------------------------------------------------------------------
-    # Worldbook table CRUD
+    # Persistent Diary Entries (full public_diary & private_thought)
     # ------------------------------------------------------------------
+
+    def _row_to_diary(self, row: sqlite3.Row) -> DiaryEntry:
+        return DiaryEntry(
+            id=int(row["id"]),
+            memory_id=int(row["memory_id"]) if row["memory_id"] is not None else None,
+            run_id=str(row["run_id"] or ""),
+            bv_id=str(row["bv_id"]),
+            title=str(row["title"]),
+            impression_score=int(row["impression_score"]),
+            public_diary=str(row["public_diary"]),
+            private_thought=str(row["private_thought"] or ""),
+            pipeline_used=row["pipeline_used"],
+            created_at=str(row["created_at"]),
+        )
+
+    def add_diary_entry(
+        self,
+        *,
+        bv_id: str,
+        title: str,
+        impression_score: int,
+        public_diary: str,
+        private_thought: str = "",
+        pipeline_used: Literal["audio_only", "sanitized_video", "downgraded_audio"] = "audio_only",
+        run_id: str = "",
+        memory_id: int | None = None,
+        created_at: datetime | str | None = None,
+    ) -> DiaryEntry:
+        """Persist full appreciation diary (`public_diary` + `private_thought`) in SQLite."""
+        score_int = int(impression_score)
+        if not (1 <= score_int <= 10):
+            raise ValueError(f"impression_score must be within [1, 10], got {score_int}")
+        now_iso = _to_iso(_parse_datetime(created_at))
+        try:
+            with self.transaction():
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO diary_entries (
+                        memory_id, run_id, bv_id, title, impression_score,
+                        public_diary, private_thought, pipeline_used, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        run_id.strip(),
+                        bv_id.strip(),
+                        title.strip(),
+                        score_int,
+                        public_diary.strip(),
+                        private_thought.strip(),
+                        pipeline_used,
+                        now_iso,
+                    ),
+                )
+                diary_id = int(cur.lastrowid)
+        except sqlite3.OperationalError as exc:
+            self._handle_operational_error(exc)
+            raise
+
+        entry = self.get_diary_entry(diary_id)
+        assert entry is not None
+        return entry
+
+    def get_diary_entry(self, diary_id: int) -> DiaryEntry | None:
+        row = self._conn.execute(
+            "SELECT * FROM diary_entries WHERE id = ?",
+            (int(diary_id),),
+        ).fetchone()
+        return self._row_to_diary(row) if row is not None else None
+
+    def list_recent_diary_entries(
+        self,
+        *,
+        limit: int = 10,
+        run_id: str | None = None,
+    ) -> tuple[DiaryEntry, ...]:
+        """List most recently persisted full diary entries (newest first)."""
+        eff_limit = max(0, int(limit))
+        if eff_limit == 0:
+            return ()
+        if run_id is not None:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM diary_entries
+                WHERE run_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (run_id.strip(), eff_limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM diary_entries
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (eff_limit,),
+            ).fetchall()
+        return tuple(self._row_to_diary(r) for r in rows)
+
+    # ------------------------------------------------------------------
+    # Idempotent Inbox Patch Ledger (`applied_patches`)
+    # ------------------------------------------------------------------
+
+    def is_patch_applied(self, patch_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM applied_patches WHERE patch_id = ?",
+            (patch_id.strip(),),
+        ).fetchone()
+        return row is not None
+
+    def record_applied_patch(
+        self,
+        *,
+        patch_id: str,
+        op: str,
+        content_hash: str,
+        source_file: str = "",
+        applied_at: datetime | str | None = None,
+    ) -> bool:
+        """Record an applied inbox patch_id; returns False if already present (idempotent)."""
+        pid = patch_id.strip()
+        if not pid:
+            raise ValueError("patch_id must be a non-empty string")
+        now_iso = _to_iso(_parse_datetime(applied_at))
+        try:
+            with self.transaction():
+                cur = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO applied_patches (
+                        patch_id, op, source_file, content_hash, applied_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (pid, op.strip(), source_file.strip(), content_hash.strip(), now_iso),
+                )
+            return int(cur.rowcount) > 0
+        except sqlite3.OperationalError as exc:
+            self._handle_operational_error(exc)
+            raise
+
+    def list_applied_patches(self, *, limit: int = 100) -> tuple[dict[str, str], ...]:
+        eff_limit = max(0, int(limit))
+        if eff_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            """
+            SELECT patch_id, op, source_file, content_hash, applied_at
+            FROM applied_patches
+            ORDER BY applied_at DESC, patch_id ASC
+            LIMIT ?
+            """,
+            (eff_limit,),
+        ).fetchall()
+        return tuple(
+            {
+                "patch_id": str(r["patch_id"]),
+                "op": str(r["op"]),
+                "source_file": str(r["source_file"]),
+                "content_hash": str(r["content_hash"]),
+                "applied_at": str(r["applied_at"]),
+            }
+            for r in rows
+        )
+
+    # ------------------------------------------------------------------
+    # Worldbook table CRUD & Curiosity Rotation
+    # ------------------------------------------------------------------
+
+    def _row_to_worldbook(self, row: sqlite3.Row) -> WorldbookEntry:
+        keys = row.keys()
+        last_searched = row["last_searched_at"] if "last_searched_at" in keys else None
+        search_count = int(row["search_count"]) if "search_count" in keys and row["search_count"] is not None else 0
+        return WorldbookEntry(
+            id=int(row["id"]),
+            keyword=row["keyword"],
+            category=row["category"],
+            content=row["content"],
+            status=row["status"],
+            updated_at=row["updated_at"],
+            last_searched_at=str(last_searched) if last_searched is not None else None,
+            search_count=search_count,
+        )
 
     def upsert_worldbook(
         self,
@@ -818,7 +1110,7 @@ class MemoryStore:
         now_iso = _to_iso(_parse_datetime(now))
         kw = keyword.strip()
         try:
-            with self._conn:
+            with self.transaction():
                 self._conn.execute(
                     """
                     INSERT INTO worldbook (keyword, category, content, status, updated_at)
@@ -827,7 +1119,17 @@ class MemoryStore:
                         category = excluded.category,
                         content = excluded.content,
                         status = excluded.status,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        search_count = CASE
+                            WHEN worldbook.status != 'active' AND excluded.status = 'active'
+                            THEN 0
+                            ELSE worldbook.search_count
+                        END,
+                        last_searched_at = CASE
+                            WHEN worldbook.status != 'active' AND excluded.status = 'active'
+                            THEN NULL
+                            ELSE worldbook.last_searched_at
+                        END
                     """,
                     (kw, category, content.strip(), status, now_iso),
                 )
@@ -839,14 +1141,7 @@ class MemoryStore:
             (kw,),
         ).fetchone()
         assert row is not None
-        return WorldbookEntry(
-            id=int(row["id"]),
-            keyword=row["keyword"],
-            category=row["category"],
-            content=row["content"],
-            status=row["status"],
-            updated_at=row["updated_at"],
-        )
+        return self._row_to_worldbook(row)
 
     def list_worldbook(
         self,
@@ -867,17 +1162,72 @@ class MemoryStore:
             f"SELECT * FROM worldbook {where_sql} ORDER BY updated_at DESC, id DESC",
             params,
         ).fetchall()
-        return tuple(
-            WorldbookEntry(
-                id=int(r["id"]),
-                keyword=r["keyword"],
-                category=r["category"],
-                content=r["content"],
-                status=r["status"],
-                updated_at=r["updated_at"],
-            )
-            for r in rows
-        )
+        return tuple(self._row_to_worldbook(r) for r in rows)
+
+    def select_curiosity_keywords(self, *, limit: int = 4) -> tuple[WorldbookEntry, ...]:
+        """Select active curiosity_queue entries prioritizing never-searched / least-recently-searched."""
+        eff_limit = max(0, int(limit))
+        if eff_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            """
+            SELECT * FROM worldbook
+            WHERE category = 'curiosity_queue' AND status = 'active'
+            ORDER BY
+                CASE WHEN last_searched_at IS NULL THEN 0 ELSE 1 END ASC,
+                last_searched_at ASC,
+                search_count ASC,
+                updated_at ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (eff_limit,),
+        ).fetchall()
+        return tuple(self._row_to_worldbook(r) for r in rows)
+
+    def mark_curiosity_searched(
+        self,
+        keywords: Sequence[str],
+        *,
+        now: datetime | str | None = None,
+        max_searches: int = DEFAULT_CURIOSITY_MAX_SEARCHES,
+    ) -> tuple[WorldbookEntry, ...]:
+        """Increment search_count, update last_searched_at, and mark consumed once max_searches reached."""
+        unique_kws = list(dict.fromkeys(kw.strip() for kw in keywords if kw and kw.strip()))
+        if not unique_kws:
+            return ()
+        eff_max = max(1, int(max_searches))
+        now_iso = _to_iso(_parse_datetime(now))
+        updated: list[WorldbookEntry] = []
+        try:
+            with self.transaction():
+                for kw in unique_kws:
+                    self._conn.execute(
+                        """
+                        UPDATE worldbook
+                        SET search_count = search_count + 1,
+                            last_searched_at = ?,
+                            updated_at = ?,
+                            status = CASE
+                                WHEN search_count + 1 >= ? THEN 'consumed'
+                                ELSE status
+                            END
+                        WHERE keyword = ?
+                          AND category = 'curiosity_queue'
+                          AND status = 'active'
+                        """,
+                        (now_iso, now_iso, eff_max, kw),
+                    )
+                    row = self._conn.execute(
+                        "SELECT * FROM worldbook WHERE keyword = ? AND category = 'curiosity_queue'",
+                        (kw,),
+                    ).fetchone()
+                    if row is not None:
+                        updated.append(self._row_to_worldbook(row))
+        except sqlite3.OperationalError as exc:
+            self._handle_operational_error(exc)
+            raise
+        return tuple(updated)
 
     # ------------------------------------------------------------------
     # Watch history table CRUD
@@ -900,7 +1250,7 @@ class MemoryStore:
         now_iso = _to_iso(_parse_datetime(now))
         recap_trimmed = prev_recap.strip()[:50]
         try:
-            with self._conn:
+            with self.transaction():
                 self._conn.execute(
                     """
                     INSERT INTO watch_history (
@@ -1003,6 +1353,28 @@ class MemoryStore:
     # Local compute budget ledger & 5-hour window accounting
     # ------------------------------------------------------------------
 
+    def _row_to_budget_entry(self, row: sqlite3.Row) -> BudgetLedgerEntry:
+        keys = row.keys()
+        raw_cs = row["cache_status"] if "cache_status" in keys and row["cache_status"] else "unknown"
+        cache_status: Literal["hit", "miss", "unknown"] = (
+            raw_cs if raw_cs in ("hit", "miss", "unknown") else "unknown"
+        )
+        return BudgetLedgerEntry(
+            id=int(row["id"]),
+            run_id=row["run_id"],
+            window_bucket=row["window_bucket"],
+            est_audio_tokens=int(row["est_audio_tokens"]),
+            est_video_tokens=int(row["est_video_tokens"]),
+            est_text_tokens=int(row["est_text_tokens"]),
+            est_cached_tokens=int(row["est_cached_tokens"]),
+            calibration_k=float(row["calibration_k"]),
+            total_est_tokens=int(row["total_est_tokens"]),
+            budget_ratio_used=float(row["budget_ratio_used"]),
+            status=row["status"],
+            created_at=row["created_at"],
+            cache_status=cache_status,
+        )
+
     def record_budget_usage(
         self,
         *,
@@ -1014,6 +1386,7 @@ class MemoryStore:
         calibration_k: float | None = None,
         total_est_tokens: int | None = None,
         status: Literal["ok", "rate_limited_429", "safety_blocked"] = "ok",
+        cache_status: Literal["hit", "miss", "unknown"] | None = None,
         window_bucket: str | None = None,
         now: datetime | str | None = None,
     ) -> BudgetLedgerEntry:
@@ -1023,6 +1396,14 @@ class MemoryStore:
         k = self._budget_cfg.token_calibration_k if calibration_k is None else float(calibration_k)
         if k <= 0.0:
             raise ValueError(f"calibration_k must be > 0, got {k}")
+
+        eff_cache_status: Literal["hit", "miss", "unknown"]
+        if cache_status is not None:
+            if cache_status not in ("hit", "miss", "unknown"):
+                raise ValueError(f"Invalid cache_status: {cache_status!r}")
+            eff_cache_status = cache_status
+        else:
+            eff_cache_status = "hit" if int(est_cached_tokens) > 0 else "unknown"
 
         now_dt = _parse_datetime(now)
         now_iso = _to_iso(now_dt)
@@ -1041,15 +1422,16 @@ class MemoryStore:
         ratio_used = round(computed_total / capacity, 6)
 
         try:
-            with self._conn:
+            with self.transaction():
                 cur = self._conn.execute(
                     """
                     INSERT INTO budget_ledger (
                         run_id, window_bucket,
                         est_audio_tokens, est_video_tokens, est_text_tokens, est_cached_tokens,
-                        calibration_k, total_est_tokens, budget_ratio_used, status, created_at
+                        calibration_k, total_est_tokens, budget_ratio_used, status, created_at,
+                        cache_status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -1063,6 +1445,7 @@ class MemoryStore:
                         ratio_used,
                         status,
                         now_iso,
+                        eff_cache_status,
                     ),
                 )
                 entry_id = int(cur.lastrowid)
@@ -1075,20 +1458,7 @@ class MemoryStore:
             (entry_id,),
         ).fetchone()
         assert row is not None
-        return BudgetLedgerEntry(
-            id=int(row["id"]),
-            run_id=row["run_id"],
-            window_bucket=row["window_bucket"],
-            est_audio_tokens=int(row["est_audio_tokens"]),
-            est_video_tokens=int(row["est_video_tokens"]),
-            est_text_tokens=int(row["est_text_tokens"]),
-            est_cached_tokens=int(row["est_cached_tokens"]),
-            calibration_k=float(row["calibration_k"]),
-            total_est_tokens=int(row["total_est_tokens"]),
-            budget_ratio_used=float(row["budget_ratio_used"]),
-            status=row["status"],
-            created_at=row["created_at"],
-        )
+        return self._row_to_budget_entry(row)
 
     def get_budget_status(
         self,
@@ -1177,20 +1547,4 @@ class MemoryStore:
                 (int(limit),),
             ).fetchall()
 
-        return tuple(
-            BudgetLedgerEntry(
-                id=int(r["id"]),
-                run_id=r["run_id"],
-                window_bucket=r["window_bucket"],
-                est_audio_tokens=int(r["est_audio_tokens"]),
-                est_video_tokens=int(r["est_video_tokens"]),
-                est_text_tokens=int(r["est_text_tokens"]),
-                est_cached_tokens=int(r["est_cached_tokens"]),
-                calibration_k=float(r["calibration_k"]),
-                total_est_tokens=int(r["total_est_tokens"]),
-                budget_ratio_used=float(r["budget_ratio_used"]),
-                status=r["status"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        )
+        return tuple(self._row_to_budget_entry(r) for r in rows)

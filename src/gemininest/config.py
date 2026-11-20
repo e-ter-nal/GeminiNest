@@ -585,6 +585,12 @@ def _parse_sync(raw: Mapping[str, Any]) -> SyncConfig:
         staggered_cleanup_weeks=cleanup_weeks,
     )
 
+    export_private_thought = (
+        _require_bool(sec, "export_private_thought", "sync")
+        if "export_private_thought" in sec
+        else True
+    )
+
     return SyncConfig(
         pure_text_only=pure_text_only,
         allowed_sync_extensions=normalized_exts,
@@ -599,6 +605,7 @@ def _parse_sync(raw: Mapping[str, Any]) -> SyncConfig:
         ),
         local_export_git_isolated=_require_bool(sec, "local_export_git_isolated", "sync"),
         v2_cold_backup=cold_backup,
+        export_private_thought=export_private_thought,
     )
 
 

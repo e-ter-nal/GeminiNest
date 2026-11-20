@@ -22,6 +22,7 @@ from gemininest.config import load_config
 from gemininest.contracts import ErrorCode, GeminiNestError, SponsorSegment
 from gemininest.media_processor import (
     MediaProcessor,
+    burn_run_temp,
     burn_temp,
     compute_keep_intervals,
     compute_segment_window,
@@ -29,6 +30,7 @@ from gemininest.media_processor import (
     managed_temp_workspace,
     probe_audio_info,
     probe_video_info,
+    read_active_run_ids,
     resolve_target_video_height,
     sweep_stale_temp,
 )
@@ -624,3 +626,70 @@ def test_v2_sanitized_video_payload_too_large_raises_e4002_and_burns(tmp_path: P
         processor.prepare_sanitized_video("BV1V2BIG001", "run_v2_big", source_video_path=sample_mp4)
     assert exc_info.value.error_code == ErrorCode.E4002_PAYLOAD_TOO_LARGE
     assert not any(temp_root.iterdir())
+
+
+def test_burn_run_temp_and_lease_aware_sweep_protects_active_runs(tmp_path: Path) -> None:
+    import json as _json
+
+    temp_root = tmp_path / "temp_root"
+    run_states_dir = tmp_path / "run_states"
+    temp_root.mkdir()
+    run_states_dir.mkdir()
+
+    now_ts = time.time()
+    old_ts = now_ts - 10_800  # 3 hours old
+
+    # 1. Active Run A & Active Run B (Run B directory mtime aged 3h, still protected by active lease!)
+    run_a = temp_root / "run_A"
+    (run_a / "BV1A").mkdir(parents=True)
+    (run_a / "BV1A" / "audio.m4a").write_bytes(b"a-bytes")
+
+    run_b = temp_root / "run_B"
+    (run_b / "BV1B").mkdir(parents=True)
+    (run_b / "BV1B" / "sanitized.mp4").write_bytes(b"b-bytes")
+    os.utime(run_b, (old_ts, old_ts))
+
+    # 2. Expired Run C (lease TTL expired) + Old Orphan + Fresh Orphan
+    run_c = temp_root / "run_C_expired"
+    (run_c / "BV1C").mkdir(parents=True)
+    (run_c / "BV1C" / "audio.m4a").write_bytes(b"c-bytes")
+
+    orphan_old = temp_root / "orphan_old"
+    (orphan_old / "BV1OLD").mkdir(parents=True)
+    os.utime(orphan_old, (old_ts, old_ts))
+
+    orphan_fresh = temp_root / "orphan_fresh"
+    (orphan_fresh / "BV1NEW").mkdir(parents=True)
+
+    (run_states_dir / "run_A.json").write_text(
+        _json.dumps({"run_id": "run_A", "status": "active", "lease_expires_epoch": now_ts + 3600}),
+        encoding="utf-8",
+    )
+    (run_states_dir / "run_B.json").write_text(
+        _json.dumps({"run_id": "run_B", "status": "active", "lease_expires_epoch": now_ts + 3600}),
+        encoding="utf-8",
+    )
+    (run_states_dir / "run_C_expired.json").write_text(
+        _json.dumps({"run_id": "run_C_expired", "status": "active", "lease_expires_epoch": now_ts - 60}),
+        encoding="utf-8",
+    )
+
+    assert read_active_run_ids(run_states_dir, now_ts=now_ts) == frozenset({"run_A", "run_B"})
+
+    # burn_run_temp("run_A") deletes ONLY run_A, never touching active run_B
+    assert burn_run_temp(temp_root, "run_A") is True
+    assert not run_a.exists()
+    assert run_b.exists()
+
+    # Lease-aware sweep reclaims expired run_C and old orphan, protects active run_B and fresh orphan
+    removed = sweep_stale_temp(
+        temp_root,
+        max_age_sec=3600,
+        now_ts=now_ts,
+        run_states_dir=run_states_dir,
+    )
+    assert set(removed) == {run_c, orphan_old}
+    assert not run_c.exists()
+    assert not orphan_old.exists()
+    assert run_b.exists()
+    assert orphan_fresh.exists()

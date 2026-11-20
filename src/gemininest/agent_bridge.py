@@ -1200,11 +1200,24 @@ class AgentBridge:
         run_id: str,
         token_estimate: TokenEstimate,
         cache_hit: bool = False,
+        cache_status: Literal["hit", "miss", "unknown"] | None = None,
         status: Literal["ok", "rate_limited_429", "safety_blocked"] = "ok",
         now: datetime | str | None = None,
     ) -> BudgetLedgerEntry:
         """Record estimated compute tokens into `memory_store.budget_ledger` with `calibration_k`."""
-        effective_cache_hit = bool(cache_hit and token_estimate.meets_implicit_cache_threshold)
+        if cache_status is not None:
+            if cache_status == "hit":
+                effective_cache_hit = bool(token_estimate.meets_implicit_cache_threshold)
+                eff_cache_status: Literal["hit", "miss", "unknown"] = (
+                    "hit" if effective_cache_hit else "miss"
+                )
+            else:
+                effective_cache_hit = False
+                eff_cache_status = cache_status
+        else:
+            effective_cache_hit = bool(cache_hit and token_estimate.meets_implicit_cache_threshold)
+            eff_cache_status = "hit" if effective_cache_hit else "unknown"
+
         if effective_cache_hit:
             est_cached_tokens = token_estimate.est_static_prefix_tokens
             est_text_tokens = token_estimate.est_dynamic_text_tokens + int(
@@ -1224,6 +1237,7 @@ class AgentBridge:
             est_cached_tokens=est_cached_tokens,
             calibration_k=self._budget_cfg.token_calibration_k,
             status=status,
+            cache_status=eff_cache_status,
             now=now,
         )
 

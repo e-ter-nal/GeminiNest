@@ -427,3 +427,179 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         status_expired = store.get_budget_status(now=t_429 + timedelta(hours=5))
         assert status_expired.in_cooldown is False
         assert status_expired.remaining_tokens > 0
+
+
+def test_legacy_db_migration_preserves_old_data_and_enables_new_features(tmp_path: Path) -> None:
+    """Verify v2.0.0 schema DB migrates smoothly without losing existing rows."""
+    db_file = tmp_path / "legacy_cat_memory.db"
+    conn = sqlite3.connect(str(db_file))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bv_id TEXT,
+                source TEXT NOT NULL CHECK(source IN ('bili_watch', 'web_patch', 'system')),
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                importance REAL NOT NULL,
+                stability_days REAL NOT NULL,
+                recall_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_recalled_at TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                memory_id UNINDEXED, title_col, desc_col, hot_comments_col, latest_comments_col,
+                tokenize='trigram'
+            );
+            CREATE TABLE worldbook (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL CHECK(category IN ('core_lore', 'curiosity_queue', 'preference')),
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'archived')),
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE watch_history (
+                bv_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                duration_sec INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                last_position_sec INTEGER NOT NULL DEFAULT 0,
+                prev_recap TEXT NOT NULL DEFAULT '',
+                pipeline_used TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE budget_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                window_bucket TEXT NOT NULL,
+                est_audio_tokens INTEGER NOT NULL DEFAULT 0,
+                est_video_tokens INTEGER NOT NULL DEFAULT 0,
+                est_text_tokens INTEGER NOT NULL DEFAULT 0,
+                est_cached_tokens INTEGER NOT NULL DEFAULT 0,
+                calibration_k REAL NOT NULL DEFAULT 1.0,
+                total_est_tokens INTEGER NOT NULL DEFAULT 0,
+                budget_ratio_used REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO memories (bv_id, source, title, summary, tags, importance, stability_days, recall_count, created_at, last_recalled_at)
+            VALUES ('BV1legacy001', 'bili_watch', '老库珍贵记忆', '升级后绝不能丢失', '["老库"]', 9.0, 60.0, 2, '2026-11-18T10:00:00+00:00', '2026-11-18T10:00:00+00:00');
+            INSERT INTO memory_fts (memory_id, title_col, desc_col, hot_comments_col, latest_comments_col)
+            VALUES (1, '老库珍贵记忆', '升级后绝不能丢失', '', '');
+            INSERT INTO worldbook (keyword, category, content, status, updated_at)
+            VALUES ('老好奇心词', 'curiosity_queue', '从老库继承', 'active', '2026-11-18T10:00:00+00:00');
+            INSERT INTO watch_history (bv_id, title, duration_sec, status, last_position_sec, prev_recap, pipeline_used, updated_at)
+            VALUES ('BV1legacy001', '老库珍贵记忆', 120, 'completed', 120, '老库已看完', 'audio_only', '2026-11-18T10:00:00+00:00');
+            INSERT INTO budget_ledger (run_id, window_bucket, est_audio_tokens, est_video_tokens, est_text_tokens, est_cached_tokens, calibration_k, total_est_tokens, budget_ratio_used, status, created_at)
+            VALUES ('legacy_run', '2026-11-18T10:00:00Z_5h', 3000, 0, 5000, 0, 1.0, 8000, 0.0057, 'ok', '2026-11-18T10:00:00+00:00');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with MemoryStore(db_file) as store:
+        # 1. All legacy records preserved intact
+        assert store.count_memories() == 1
+        old_mem = store.get_memory(1)
+        assert old_mem is not None and old_mem.title == "老库珍贵记忆"
+        assert store.get_watch_history("BV1legacy001") is not None
+
+        # 2. Migrated worldbook columns have safe defaults
+        wb = store.list_worldbook(category="curiosity_queue", status="active")
+        assert len(wb) == 1
+        assert wb[0].keyword == "老好奇心词"
+        assert wb[0].last_searched_at is None
+        assert wb[0].search_count == 0
+
+        # 3. Migrated budget_ledger defaults cache_status to "unknown"
+        ledger = store.list_budget_entries()
+        assert len(ledger) == 1
+        assert ledger[0].cache_status == "unknown"
+
+        # 4. New diary_entries and applied_patches tables work on migrated DB
+        diary = store.add_diary_entry(
+            memory_id=old_mem.id,
+            run_id="run_after_mig",
+            bv_id="BV1legacy001",
+            title="老库珍贵记忆",
+            impression_score=9,
+            public_diary="这是一篇完整持久化在迁移后 SQLite 数据库中的长手账内容，用于验证向后兼容升级。",
+            private_thought="老数据一点都没丢，很稳。",
+            pipeline_used="sanitized_video",
+        )
+        assert diary.id >= 1
+        assert store.list_recent_diary_entries(limit=5)[0].public_diary == diary.public_diary
+        assert store.record_applied_patch(patch_id="patch_mig_1", op="add_curiosity", content_hash="abc123") is True
+        assert store.is_patch_applied("patch_mig_1") is True
+
+
+def test_atomic_transaction_rolls_back_memory_and_diary_together() -> None:
+    with MemoryStore(":memory:") as store:
+        with pytest.raises(RuntimeError, match="forced failure"):
+            with store.transaction():
+                mem = store.add_memory(title="事务回滚测试", summary="摘要", importance=7.0)
+                store.add_diary_entry(
+                    memory_id=mem.id,
+                    run_id="run_tx",
+                    bv_id="BV1tx0001",
+                    title="事务回滚测试",
+                    impression_score=7,
+                    public_diary="完整日记",
+                )
+                raise RuntimeError("forced failure")
+        assert store.count_memories() == 0
+        assert store.list_recent_diary_entries() == ()
+
+
+def test_curiosity_rotation_and_auto_consumption() -> None:
+    with MemoryStore(":memory:") as store:
+        keywords = ["词条1", "词条2", "词条3", "词条4", "词条5"]
+        for idx, kw in enumerate(keywords):
+            store.upsert_worldbook(
+                keyword=kw,
+                category="curiosity_queue",
+                content=f"主题 {kw}",
+                status="active",
+                now=BASE_TIME + timedelta(minutes=idx),
+            )
+
+        # Round 1: picks first 2 never-searched keywords
+        r1 = [e.keyword for e in store.select_curiosity_keywords(limit=2)]
+        assert r1 == ["词条1", "词条2"]
+        store.mark_curiosity_searched(r1, now=BASE_TIME + timedelta(hours=1), max_searches=3)
+
+        # Round 2: picks next 2 never-searched keywords
+        r2 = [e.keyword for e in store.select_curiosity_keywords(limit=2)]
+        assert r2 == ["词条3", "词条4"]
+        store.mark_curiosity_searched(r2, now=BASE_TIME + timedelta(hours=2), max_searches=3)
+
+        # Round 3: never-searched 词条5 comes FIRST, then least-recently-searched 词条1
+        r3 = [e.keyword for e in store.select_curiosity_keywords(limit=2)]
+        assert r3 == ["词条5", "词条1"]
+        store.mark_curiosity_searched(r3, now=BASE_TIME + timedelta(hours=3), max_searches=3)
+
+        # Search 词条1 one more time -> search_count hits 3 -> auto-consumed!
+        updated = store.mark_curiosity_searched(["词条1"], now=BASE_TIME + timedelta(hours=4), max_searches=3)
+        assert len(updated) == 1
+        assert updated[0].search_count == 3
+        assert updated[0].status == "consumed"
+
+        active_kws = {e.keyword for e in store.select_curiosity_keywords(limit=10)}
+        assert "词条1" not in active_kws
+        assert active_kws == {"词条2", "词条3", "词条4", "词条5"}
+
+        # Re-upserting consumed keyword as active resets search_count & last_searched_at
+        revived = store.upsert_worldbook(
+            keyword="词条1",
+            category="curiosity_queue",
+            content="重新想看",
+            status="active",
+            now=BASE_TIME + timedelta(hours=5),
+        )
+        assert revived.status == "active"
+        assert revived.search_count == 0
+        assert revived.last_searched_at is None

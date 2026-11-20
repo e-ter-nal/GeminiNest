@@ -153,6 +153,7 @@
     "inbox_archived_subdir": "inbox_archived",
     "enable_local_export_git_commit": true,
     "local_export_git_isolated": true,
+    "export_private_thought": true,
     "v2_cold_backup": {
       "enabled": false,
       "schedule": "weekly",

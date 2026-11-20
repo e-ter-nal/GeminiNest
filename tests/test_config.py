@@ -228,3 +228,30 @@ def test_missing_or_corrupt_config_raises_e1001(tmp_path: Path) -> None:
     with pytest.raises(GeminiNestError) as exc_corrupt:
         load_config(config_path=corrupt, local_config_path=None)
     assert exc_corrupt.value.error_code is ErrorCode.E1001_CONFIG_INVALID
+
+
+def test_sync_export_private_thought_optional_switch(tmp_path: Path) -> None:
+    # Default config.json enables export_private_thought
+    base_cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
+    assert base_cfg.sync.export_private_thought is True
+
+    # Legacy config.json without export_private_thought key still defaults to True
+    legacy = copy.deepcopy(_load_base_dict())
+    legacy["sync"].pop("export_private_thought", None)
+    legacy_file = tmp_path / "legacy_config.json"
+    legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    legacy_cfg = load_config(config_path=legacy_file, local_config_path=None)
+    assert legacy_cfg.sync.export_private_thought is True
+
+    # Local override can turn export_private_thought off
+    local_file = tmp_path / "local_disable_private.json"
+    local_file.write_text(json.dumps({"sync": {"export_private_thought": False}}), encoding="utf-8")
+    merged = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_file)
+    assert merged.sync.export_private_thought is False
+
+    # Non-boolean value triggers E1001_CONFIG_INVALID
+    bad_local = tmp_path / "local_bad_private.json"
+    bad_local.write_text(json.dumps({"sync": {"export_private_thought": "no"}}), encoding="utf-8")
+    with pytest.raises(GeminiNestError) as exc_info:
+        load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
+    assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID
