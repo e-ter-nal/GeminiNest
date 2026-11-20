@@ -112,13 +112,13 @@ def _sample_prepared_media(tmp_path: Path, bv_id: str = "BV1test00001") -> Prepa
 
 def test_static_prefix_byte_stability_and_token_threshold(tmp_path: Path) -> None:
     cfg = _make_app_cfg()
-    bridge_a = AgentBridge(cfg, persona_path=REPO_PERSONA_PATH)
-    bridge_b = AgentBridge(cfg, persona_path=REPO_PERSONA_PATH)
+    bridge_a = AgentBridge(cfg, persona_path=REPO_PERSONA_PATH, local_persona_path="")
+    bridge_b = AgentBridge(cfg, persona_path=REPO_PERSONA_PATH, local_persona_path="")
 
     # Byte-for-byte identical across instances and calls
     assert bridge_a.static_prefix.encode("utf-8") == bridge_b.static_prefix.encode("utf-8")
     assert bridge_a.static_prefix_sha256 == bridge_b.static_prefix_sha256
-    assert build_static_prefix(REPO_PERSONA_PATH) == bridge_a.static_prefix
+    assert build_static_prefix(REPO_PERSONA_PATH, local_persona_path="") == bridge_a.static_prefix
 
     # Token count must exceed 4,096 implicit cache threshold and sit in 4,500-5,200 band
     est_tokens = estimate_text_tokens(bridge_a.static_prefix)

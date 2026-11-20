@@ -12,14 +12,6 @@ from gemininest.agent_bridge import (
     resolve_video_processing_mode,
     selection_packet_to_dict,
 )
-from gemininest.budget_ui import (
-    BudgetDecision,
-    notify_auth_expired,
-    notify_high_score_video,
-    parse_budget_ratio_input,
-    prompt_startup_budget,
-    send_toast_notification,
-)
 from gemininest.config import (
     AppConfig,
     ErrorCode,
@@ -32,7 +24,9 @@ from gemininest.config import (
 from gemininest.contracts import (
     AppreciationPacket,
     AppreciationResponse,
+    BudgetControlMode,
     BudgetLedgerEntry,
+    BudgetPlan,
     BudgetStatus,
     CommentItem,
     FetchBatchResult,
@@ -98,6 +92,22 @@ from gemininest.sync_manager import (
     validate_sync_extension,
 )
 
+_LAZY_BUDGET_UI_EXPORTS = frozenset(
+    {
+        "BudgetDecision",
+        "budget_plan_from_dict",
+        "build_budget_plan",
+        "decision_from_plan",
+        "notify_auth_expired",
+        "notify_high_score_video",
+        "parse_budget_ratio_input",
+        "parse_positive_float_input",
+        "parse_positive_int_input",
+        "prompt_startup_budget",
+        "send_toast_notification",
+    }
+)
+
 _LAZY_RUNNER_EXPORTS = frozenset(
     {
         "DryRunReport",
@@ -111,6 +121,10 @@ _LAZY_RUNNER_EXPORTS = frozenset(
 
 
 def __getattr__(name: str) -> object:
+    if name in _LAZY_BUDGET_UI_EXPORTS:
+        from gemininest import budget_ui
+
+        return getattr(budget_ui, name)
     if name in _LAZY_RUNNER_EXPORTS:
         from gemininest import runner
 
@@ -126,8 +140,10 @@ __all__ = [
     "AppreciationResponse",
     "BaseSafetyGate",
     "BilibiliFetcher",
+    "BudgetControlMode",
     "BudgetDecision",
     "BudgetLedgerEntry",
+    "BudgetPlan",
     "BudgetStatus",
     "CommentItem",
     "DEFAULT_LOCAL_PERSONA_PATH",
@@ -165,6 +181,8 @@ __all__ = [
     "WorldbookEntry",
     "appreciation_packet_to_dict",
     "blackout_frame_in_place",
+    "budget_plan_from_dict",
+    "build_budget_plan",
     "build_static_prefix",
     "burn_temp",
     "burn_temp_dir",
@@ -173,6 +191,7 @@ __all__ = [
     "compute_segment_window",
     "compute_window_bucket",
     "create_safety_gate",
+    "decision_from_plan",
     "estimate_audio_tokens",
     "estimate_text_tokens",
     "estimate_video_tokens",
@@ -193,6 +212,8 @@ __all__ = [
     "notify_high_score_video",
     "parse_budget_ratio_input",
     "parse_memory_patch_blocks",
+    "parse_positive_float_input",
+    "parse_positive_int_input",
     "preprocess_wd_tagger_image",
     "probe_audio_info",
     "probe_video_info",

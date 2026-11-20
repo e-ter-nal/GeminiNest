@@ -510,6 +510,34 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
     if cooldown <= 0:
         raise _config_error("'budget_and_runtime.cooldown_hours_on_429' must be > 0")
 
+    default_budget_mode: Literal["use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"] = "use_ratio"
+    if "default_budget_mode" in sec:
+        raw_mode = _require_str(sec, "default_budget_mode", "budget_and_runtime")
+        if raw_mode not in ("use_ratio", "max_videos", "reserve_ratio", "max_minutes"):
+            raise _config_error(
+                f"Invalid 'budget_and_runtime.default_budget_mode': {raw_mode!r}; "
+                "expected one of 'use_ratio', 'max_videos', 'reserve_ratio', 'max_minutes'"
+            )
+        default_budget_mode = raw_mode  # type: ignore[assignment]
+
+    default_max_videos = 3
+    if "default_max_videos" in sec:
+        default_max_videos = _require_int(sec, "default_max_videos", "budget_and_runtime")
+        if default_max_videos < 1:
+            raise _config_error("'budget_and_runtime.default_max_videos' must be >= 1")
+
+    default_reserve_ratio = 0.40
+    if "default_reserve_ratio" in sec:
+        default_reserve_ratio = _require_float(sec, "default_reserve_ratio", "budget_and_runtime")
+        if not (0.0 <= default_reserve_ratio <= 1.0):
+            raise _config_error("'budget_and_runtime.default_reserve_ratio' must be in [0.0, 1.0]")
+
+    default_max_minutes = 15
+    if "default_max_minutes" in sec:
+        default_max_minutes = _require_int(sec, "default_max_minutes", "budget_and_runtime")
+        if default_max_minutes < 1:
+            raise _config_error("'budget_and_runtime.default_max_minutes' must be >= 1")
+
     return BudgetAndRuntimeConfig(
         default_window_budget_ratio=ratio,
         startup_popup_timeout_sec=popup_timeout,
@@ -522,6 +550,10 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
         token_calibration_k=calib_k,
         lock_file_path=_require_str(sec, "lock_file_path", "budget_and_runtime"),
         cooldown_hours_on_429=cooldown,
+        default_budget_mode=default_budget_mode,
+        default_max_videos=default_max_videos,
+        default_reserve_ratio=default_reserve_ratio,
+        default_max_minutes=default_max_minutes,
     )
 
 

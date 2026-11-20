@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -34,6 +35,9 @@ from gemininest.agent_bridge import (
 )
 from gemininest.budget_ui import (
     BudgetDecision,
+    budget_plan_from_dict,
+    build_budget_plan,
+    decision_from_plan,
     notify_auth_expired,
     notify_high_score_video,
     prompt_startup_budget,
@@ -43,6 +47,8 @@ from gemininest.contracts import (
     AppConfig,
     AppreciationPacket,
     AppreciationResponse,
+    BudgetPlan,
+    BudgetStatus,
     CommentItem,
     ErrorCode,
     GeminiNestError,
@@ -96,9 +102,215 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _now_epoch() -> float:
+    return time.time()
+
+
 def _generate_run_id(prefix: str = "run") -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{prefix}_{stamp}_{os.getpid()}"
+
+
+# ---------------------------------------------------------------------------
+# Run State Persistence & 4-Mode Budget Enforcement Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_run_state_path(
+    cfg: AppConfig,
+    *,
+    db_path: str | Path | None,
+    temp_root: Path,
+    run_id: str,
+) -> Path:
+    safe_run_id = sanitize_temp_segment(run_id, field_name="run_id")
+    raw_db = str(db_path) if db_path is not None else cfg.memory.db_path
+    if raw_db and raw_db != ":memory:":
+        base_dir = Path(raw_db).parent
+    else:
+        base_dir = temp_root.parent
+    return base_dir / "run_states" / f"{safe_run_id}.json"
+
+
+def _save_run_state(path: Path, state: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _load_run_state(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _record_run_state_bv(
+    path: Path,
+    *,
+    bv_id: str,
+    field: Literal["prepared_bvs", "committed_bvs"],
+) -> None:
+    state = _load_run_state(path)
+    if state is None:
+        return
+    existing = list(state.get(field) or [])
+    if bv_id not in existing:
+        existing.append(bv_id)
+        state[field] = existing
+        state["updated_at"] = _utc_now_iso()
+        try:
+            _save_run_state(path, state)
+        except OSError as exc:
+            logger.warning("Failed to update run state %s: %s", path, exc)
+
+
+def _effective_budget_plan(
+    decision: BudgetDecision,
+    *,
+    current_window_used_ratio: float = 0.0,
+) -> BudgetPlan:
+    if decision.budget_plan is not None:
+        return decision.budget_plan
+    if decision.rest_today or decision.budget_ratio <= 0.0:
+        return build_budget_plan(
+            "rest",
+            current_window_used_ratio=current_window_used_ratio,
+        )
+    return build_budget_plan(
+        "use_ratio",
+        value=decision.budget_ratio,
+        current_window_used_ratio=current_window_used_ratio,
+    )
+
+
+def _check_budget_status_for_plan(
+    store: MemoryStore,
+    plan: BudgetPlan,
+) -> tuple[BudgetStatus, bool]:
+    if plan.rest_today or plan.allowed_ratio <= 0.0 or plan.window_cap_ratio <= 0.0:
+        status = store.get_budget_status()
+        return status, False
+    status = store.get_budget_status(allowed_ratio=plan.window_cap_ratio)
+    can_proceed = (not status.in_cooldown) and (status.remaining_tokens > 0)
+    return status, can_proceed
+
+
+def _resolve_cli_budget_decision(
+    args: argparse.Namespace,
+    *,
+    budget_status: BudgetStatus,
+    now_epoch_fn: Callable[[], float] | None = None,
+) -> BudgetDecision | None:
+    """Resolve explicit CLI budget flags (`--budget-ratio`, `--max-videos`, `--reserve-ratio`, `--max-minutes`)."""
+    eff_now_fn = now_epoch_fn or _now_epoch
+    budget_ratio = getattr(args, "budget_ratio", None)
+    max_videos = getattr(args, "budget_max_videos", None)
+    if max_videos is None:
+        max_videos = getattr(args, "max_videos", None)
+    reserve_ratio = getattr(args, "reserve_ratio", None)
+    max_minutes = getattr(args, "max_minutes", None)
+
+    provided: list[tuple[Literal["use_ratio", "max_videos", "reserve_ratio", "max_minutes"], Any]] = []
+    if budget_ratio is not None:
+        provided.append(("use_ratio", budget_ratio))
+    if max_videos is not None:
+        provided.append(("max_videos", max_videos))
+    if reserve_ratio is not None:
+        provided.append(("reserve_ratio", reserve_ratio))
+    if max_minutes is not None:
+        provided.append(("max_minutes", max_minutes))
+
+    if not provided:
+        return None
+    if len(provided) > 1:
+        raise GeminiNestError(
+            ErrorCode.E1001_CONFIG_INVALID,
+            "Only one of --budget-ratio, --max-videos, --reserve-ratio, --max-minutes may be specified at a time.",
+        )
+
+    mode, value = provided[0]
+    try:
+        plan = build_budget_plan(
+            mode,
+            value=value,
+            current_window_used_ratio=budget_status.used_ratio,
+            now_epoch=float(eff_now_fn()),
+        )
+    except ValueError as exc:
+        raise GeminiNestError(ErrorCode.E1001_CONFIG_INVALID, str(exc)) from exc
+
+    return decision_from_plan(plan, source="cli_override", elapsed_sec=0.0)
+
+
+def _check_prepare_media_budget_limit(
+    state: Mapping[str, Any] | None,
+    *,
+    store: MemoryStore,
+    run_id: str,
+    bv_id: str,
+    now_epoch: float,
+) -> dict[str, Any] | None:
+    """Evaluate persisted `budget_plan` limits before preparing media for the next video."""
+    if state is None:
+        return None
+    raw_plan = state.get("budget_plan")
+    if not isinstance(raw_plan, Mapping):
+        return None
+
+    plan = budget_plan_from_dict(raw_plan)
+    if plan.rest_today:
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "bv_id": bv_id,
+            "stopped_reason": "budget_limit_reached",
+            "stop_detail": "rest_today",
+            "budget_plan": asdict(plan),
+        }
+
+    if plan.deadline_epoch is not None and now_epoch >= plan.deadline_epoch:
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "bv_id": bv_id,
+            "stopped_reason": "budget_limit_reached",
+            "stop_detail": "max_minutes_deadline_reached",
+            "deadline_epoch": plan.deadline_epoch,
+            "now_epoch": round(now_epoch, 3),
+            "budget_plan": asdict(plan),
+        }
+
+    if plan.max_videos is not None:
+        counted_bvs = set(state.get("prepared_bvs") or ()) | set(state.get("committed_bvs") or ())
+        if bv_id not in counted_bvs and len(counted_bvs) >= plan.max_videos:
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "bv_id": bv_id,
+                "stopped_reason": "budget_limit_reached",
+                "stop_detail": "max_videos_reached",
+                "videos_processed": len(counted_bvs),
+                "max_videos": plan.max_videos,
+                "budget_plan": asdict(plan),
+            }
+
+    status, can_proceed = _check_budget_status_for_plan(store, plan)
+    if not can_proceed:
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "bv_id": bv_id,
+            "stopped_reason": "budget_limit_reached",
+            "stop_detail": "token_budget_exhausted_or_cooldown",
+            "budget_status": asdict(status),
+            "budget_plan": asdict(plan),
+        }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +1183,7 @@ def run_dry_run(
     notifier_factory: Callable[..., Any] | None = None,
     tk_module: Any = None,
     monotonic_fn: Callable[[], float] | None = None,
+    time_fn: Callable[[], float] | None = None,
 ) -> DryRunReport:
     """Execute the full offline `--dry-run` loop with zero network requests and zero quota cost.
 
@@ -1028,17 +1241,23 @@ def run_dry_run(
 
         try:
             # 0. Startup budget confirmation (headless by default in --dry-run)
+            eff_time_fn = time_fn or _now_epoch
             default_status = store.get_budget_status()
             budget_kwargs: dict[str, Any] = {
                 "headless": headless,
                 "budget_status": default_status,
                 "tk_module": tk_module,
+                "now_epoch_fn": eff_time_fn,
             }
             if monotonic_fn is not None:
                 budget_kwargs["monotonic_fn"] = monotonic_fn
             decision = prompt_startup_budget(eff_cfg, **budget_kwargs)
+            budget_plan = _effective_budget_plan(
+                decision,
+                current_window_used_ratio=default_status.used_ratio,
+            )
 
-            if decision.rest_today or decision.budget_ratio <= 0.0:
+            if decision.rest_today or budget_plan.rest_today:
                 return DryRunReport(
                     run_id=eff_run_id,
                     budget_decision=decision,
@@ -1057,8 +1276,8 @@ def run_dry_run(
                     pipeline_mode=eff_mode,
                 )
 
-            budget_status = store.get_budget_status(allowed_ratio=decision.budget_ratio)
-            if budget_status.in_cooldown or budget_status.remaining_tokens <= 0:
+            budget_status, can_proceed = _check_budget_status_for_plan(store, budget_plan)
+            if not can_proceed:
                 return DryRunReport(
                     run_id=eff_run_id,
                     budget_decision=decision,
@@ -1203,8 +1422,17 @@ def run_dry_run(
             # 6. Per-video appreciation loop (prepare audio/video -> safety gate -> appreciate -> commit -> burn)
             for item_idx, selected_item in enumerate(sel_response.selected_videos):
                 bv_id = selected_item.bv_id
-                cur_status = store.get_budget_status(allowed_ratio=decision.budget_ratio)
-                if cur_status.in_cooldown or cur_status.remaining_tokens <= 0:
+                if budget_plan.deadline_epoch is not None and float(eff_time_fn()) >= budget_plan.deadline_epoch:
+                    stopped_reason = "budget_limit_reached"
+                    break
+                if (
+                    budget_plan.max_videos is not None
+                    and (len(appreciated_bvs) + len(safety_blocked_bvs)) >= budget_plan.max_videos
+                ):
+                    stopped_reason = "budget_limit_reached"
+                    break
+                _cur_status, cur_can_proceed = _check_budget_status_for_plan(store, budget_plan)
+                if not cur_can_proceed:
                     stopped_reason = "budget_limit_reached"
                     break
 
@@ -1426,17 +1654,24 @@ def _cmd_check_budget(args: argparse.Namespace) -> int:
     cfg, _secrets = _load_config_from_args(args, offline=True)
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         default_status = store.get_budget_status()
-        decision = prompt_startup_budget(
-            cfg,
-            headless=args.headless,
-            default_ratio=args.budget_ratio,
-            budget_status=default_status,
+        decision = _resolve_cli_budget_decision(args, budget_status=default_status)
+        if decision is None:
+            decision = prompt_startup_budget(
+                cfg,
+                headless=args.headless,
+                budget_status=default_status,
+                now_epoch_fn=_now_epoch,
+            )
+        plan = _effective_budget_plan(
+            decision,
+            current_window_used_ratio=default_status.used_ratio,
         )
-        if decision.rest_today or decision.budget_ratio <= 0.0:
+        if decision.rest_today or plan.rest_today:
             _emit_json(
                 {
                     "ok": True,
                     "decision": asdict(decision),
+                    "budget_plan": asdict(plan),
                     "budget_status": asdict(default_status),
                     "can_proceed": False,
                 },
@@ -1444,13 +1679,14 @@ def _cmd_check_budget(args: argparse.Namespace) -> int:
             )
             return 0
 
-        status = store.get_budget_status(allowed_ratio=decision.budget_ratio)
+        status, can_proceed = _check_budget_status_for_plan(store, plan)
         _emit_json(
             {
                 "ok": True,
                 "decision": asdict(decision),
+                "budget_plan": asdict(plan),
                 "budget_status": asdict(status),
-                "can_proceed": (not status.in_cooldown and status.remaining_tokens > 0),
+                "can_proceed": can_proceed,
             },
             output_path=args.output,
         )
@@ -1468,35 +1704,64 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
         sweep_stale_temp(eff_temp_root)
         with MemoryStore.from_config(cfg, db_path=args.db) as store:
             default_status = store.get_budget_status()
-            decision = prompt_startup_budget(
-                cfg,
-                headless=args.headless,
-                budget_status=default_status,
+            decision = _resolve_cli_budget_decision(args, budget_status=default_status)
+            if decision is None:
+                decision = prompt_startup_budget(
+                    cfg,
+                    headless=args.headless,
+                    budget_status=default_status,
+                    now_epoch_fn=_now_epoch,
+                )
+            plan = _effective_budget_plan(
+                decision,
+                current_window_used_ratio=default_status.used_ratio,
             )
-            if decision.rest_today or decision.budget_ratio <= 0.0:
+            if decision.rest_today or plan.rest_today:
                 _emit_json(
                     {
                         "ok": True,
                         "run_id": eff_run_id,
                         "stopped_reason": "rest_today",
                         "decision": asdict(decision),
+                        "budget_plan": asdict(plan),
                     },
                     output_path=args.output,
                 )
                 return 0
 
-            budget_status = store.get_budget_status(allowed_ratio=decision.budget_ratio)
-            if budget_status.in_cooldown or budget_status.remaining_tokens <= 0:
+            budget_status, can_proceed = _check_budget_status_for_plan(store, plan)
+            if not can_proceed:
                 _emit_json(
                     {
                         "ok": True,
                         "run_id": eff_run_id,
                         "stopped_reason": "cooldown_or_budget_exhausted",
+                        "decision": asdict(decision),
+                        "budget_plan": asdict(plan),
                         "budget_status": asdict(budget_status),
                     },
                     output_path=args.output,
                 )
                 return 0
+
+            run_state_path = _resolve_run_state_path(
+                cfg,
+                db_path=args.db,
+                temp_root=eff_temp_root,
+                run_id=eff_run_id,
+            )
+            _save_run_state(
+                run_state_path,
+                {
+                    "run_id": eff_run_id,
+                    "created_at": _utc_now_iso(),
+                    "updated_at": _utc_now_iso(),
+                    "budget_plan": asdict(plan),
+                    "decision": asdict(decision),
+                    "prepared_bvs": [],
+                    "committed_bvs": [],
+                },
+            )
 
             # Step 1: Absorb reverse [MEMORY_PATCH] files from inbox/ before querying curiosity & memories.
             # In offline mode, only touch cloud inbox when `--cloud-dir` is explicitly provided so
@@ -1587,12 +1852,17 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                 mark_recalled=True,
             )
             bridge = AgentBridge(cfg, persona_path=args.persona)
+            eff_max_select = (
+                max(1, min(10, int(plan.max_videos)))
+                if plan.max_videos is not None
+                else args.max_select
+            )
             packet = bridge.build_selection_packet(
                 run_id=eff_run_id,
                 candidates=fresh,
                 recalled_memories=recalled,
                 active_curiosity_keywords=active_curiosity,
-                max_select=args.max_select,
+                max_select=eff_max_select,
             )
             _emit_json(
                 {
@@ -1601,6 +1871,9 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                     "snapshot_path": snapshot_used,
                     "candidates_total": len(candidates),
                     "filtered_blacklist_count": len(rejected_results),
+                    "decision": asdict(decision),
+                    "budget_plan": asdict(plan),
+                    "run_state_path": str(run_state_path),
                     "budget_status": asdict(budget_status),
                     "inbox_sync": inbox_sync_dict,
                     "packet": selection_packet_to_dict(packet),
@@ -1622,6 +1895,28 @@ def _cmd_prepare_media(args: argparse.Namespace) -> int:
     safe_bv = sanitize_temp_segment(args.bv, field_name="bv_id")
     eff_temp_root = Path(args.temp_root)
     segment_index = int(getattr(args, "segment_index", 0) or 0)
+    run_state_path = _resolve_run_state_path(
+        cfg,
+        db_path=args.db,
+        temp_root=eff_temp_root,
+        run_id=safe_run_id,
+    )
+
+    # Pre-check persisted 4-mode budget_plan (max_videos / deadline_epoch / token budget)
+    # BEFORE making any Bilibili API requests or running FFmpeg.
+    run_state = _load_run_state(run_state_path)
+    if run_state is not None:
+        with MemoryStore.from_config(cfg, db_path=args.db) as precheck_store:
+            stop_payload = _check_prepare_media_budget_limit(
+                run_state,
+                store=precheck_store,
+                run_id=safe_run_id,
+                bv_id=safe_bv,
+                now_epoch=_now_epoch(),
+            )
+        if stop_payload is not None:
+            _emit_json(stop_payload, output_path=args.output)
+            return 0
 
     detail: VideoDetail | None = None
     if args.snapshot:
@@ -1838,6 +2133,7 @@ def _cmd_prepare_media(args: argparse.Namespace) -> int:
             output_payload["downgraded_to_audio"] = True
             output_payload["error_code"] = ErrorCode.E5001_SAFETY_GATE_DOWNGRADED.value
 
+        _record_run_state_bv(run_state_path, bv_id=safe_bv, field="prepared_bvs")
         _emit_json(output_payload, output_path=args.output)
         return 0
 
@@ -1848,6 +2144,12 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
     safe_bv = sanitize_temp_segment(args.bv, field_name="bv_id")
     eff_temp_root = Path(args.temp_root)
     media_processor = MediaProcessor(cfg, temp_root=eff_temp_root)
+    run_state_path = _resolve_run_state_path(
+        cfg,
+        db_path=args.db,
+        temp_root=eff_temp_root,
+        run_id=safe_run_id,
+    )
 
     if args.response_file:
         raw_response = Path(args.response_file).read_text(encoding="utf-8")
@@ -1883,6 +2185,7 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
             cache_hit=bool(args.cache_hit),
             headless=args.headless,
         )
+        _record_run_state_bv(run_state_path, bv_id=safe_bv, field="committed_bvs")
         _emit_json(outcome, output_path=args.output)
         return 0
 
@@ -1971,7 +2274,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             export_dir=getattr(args, "export_dir", None),
             cloud_nest_dir=getattr(args, "cloud_dir", None),
             headless=True if not getattr(args, "show_popup", False) else False,
-            max_videos=int(getattr(args, "max_videos", 2)),
+            max_videos=2 if getattr(args, "max_videos", None) is None else int(args.max_videos),
             pipeline_mode=getattr(args, "mode", None),
             source_audio_path=getattr(args, "source_audio", None),
             source_video_path=getattr(args, "source_video", None),
@@ -2058,7 +2361,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--snapshot", default=None, help="Path to offline snapshot JSON")
     parser.add_argument("--run-id", default=None, help="Explicit ASCII run_id")
-    parser.add_argument("--max-videos", type=int, default=2, help="Max videos in dry-run replay")
+    parser.add_argument("--max-videos", type=int, default=None, help="Max videos in dry-run replay or budget override")
     parser.add_argument(
         "--mode",
         choices=("audio_only", "sanitized_video"),
@@ -2073,6 +2376,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_budget = subparsers.add_parser("check-budget", help="Check 5h window compute budget")
     p_budget.add_argument("--budget-ratio", type=float, default=None)
+    p_budget.add_argument("--max-videos", dest="budget_max_videos", type=int, default=None)
+    p_budget.add_argument("--reserve-ratio", type=float, default=None)
+    p_budget.add_argument("--max-minutes", type=float, default=None)
     p_budget.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
     p_budget.add_argument("--output", default=argparse.SUPPRESS)
 
@@ -2084,6 +2390,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("--snapshot", default=argparse.SUPPRESS)
     p_feed.add_argument("--offline", action="store_true")
     p_feed.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
+    p_feed.add_argument("--budget-ratio", type=float, default=None, help="Explicit use_ratio budget (0.0-1.0); skips popup")
+    p_feed.add_argument("--max-videos", dest="budget_max_videos", type=int, default=None, help="Explicit max_videos budget (>=1); skips popup")
+    p_feed.add_argument("--reserve-ratio", type=float, default=None, help="Explicit reserve_ratio budget (0.0-1.0); skips popup")
+    p_feed.add_argument("--max-minutes", type=float, default=None, help="Explicit max_minutes duration cap (>0); skips popup")
     p_feed.add_argument("--max-select", type=int, default=5)
     p_feed.add_argument("--export-dir", default=argparse.SUPPRESS)
     p_feed.add_argument("--cloud-dir", default=argparse.SUPPRESS)

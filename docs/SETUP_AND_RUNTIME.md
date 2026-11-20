@@ -117,14 +117,20 @@ Copy-Item config.local.example.json config.local.json
 
 ## 3. Antigravity 左侧 `Scheduled Tasks` 定时任务配置
 
-### 3.1 调度窗口与交互式 60 秒预算弹窗机制
+### 3.1 调度窗口与 4 选 1 预算控制（GUI 弹窗 + CLI 双支持）
 
 * **推荐调度窗口**：每天设置 **2 个独立 5 小时额度窗口**（例如 `11:30` 与 `20:30`），初期标定前 3 天观察 `budget_ledger` 消耗后，可在 `config.local.json` 中微调 `token_calibration_k`。
 * **防撞车锁**：`runner.py` 内置 `.cat.lock` 存活 PID 校验锁，防止电脑合盖休眠后系统补发任务导致并发撞车；崩溃残留的死 PID 锁会自动回收。
-* **为什么默认命令去掉了 `--headless`？**
-  * **交互式 60 秒非抢占预算弹窗**：不带 `--headless` 运行 `prepare-feed` 时，`budget_ui.py` 会在桌面前弹出不抢占焦点的 60 秒倒计时 `tkinter` 小窗（基于 `time.monotonic()` 单调时钟，防休眠唤醒后卡死）。你在电脑前可以随时微调本窗口预算比例（如调高至 `0.60` 或调低至 `0.20`），或一键点击 **「今日休息 (0.0)」** 让小猫今天休眠；若 60 秒内无操作，自动按 `default_window_budget_ratio = 0.35` 出发。此外，`commit-appreciation` 遇到印象分 `≥ 8` 的宝藏视频会自动推送原生 Windows Toast 通知。
-  * **无人值守 / 锁屏自动静默兜底**：即使电脑处于锁屏、远程会话断开或无交互桌面（Session 0）环境，`budget_ui.py` 也会自动捕获 `tk.TclError` 并静默回退至默认预算比例 `0.35`，**绝不会卡死或报错中断**。
-  * 仅当你明确希望“即使人在电脑前也完全不弹预算小窗与 Toast”时，才需手动在 `prepare-feed` 和 `commit-appreciation` 后追加 `--headless`。
+* **4 选 1 互斥预算控制模式（默认 `use_ratio = 0.35`）**：
+  * `use_ratio`（`--budget-ratio 0.35`）：按本次 5h 窗口算力用量百分比控制；
+  * `max_videos`（`--max-videos 3`）：按本轮最多观看视频个数控制；
+  * `reserve_ratio`（`--reserve-ratio 0.40`）：按保留剩余用量底线控制（自动换算 `allowed_ratio = max(0.0, 1.0 - reserve_ratio - current_window_used_ratio)`）；
+  * `max_minutes`（`--max-minutes 15`）：按本轮玩耍时长上限控制（产出 `deadline_epoch`，超时后在下一条视频制备前优雅止步）；
+  * 另有 **「今日休息 (0.0)」** 按钮一键中止本轮；`prepare-feed` 传入上述任一 CLI 参数时自动跳过弹窗直接生效，并将生效的 `budget_plan` 随运行状态落盘供 `prepare-media` 自动校验。
+* **Windows 桌面弹窗与无头 / 隔离桌面兜底机制**：
+  * **交互式桌面（`WinSta0\Default`）**：不带 `--headless` 且未传 CLI 预算覆盖参数时，`budget_ui.py` 会在桌面前置（`-topmost` + Win32 `SW_SHOWNOACTIVATE` / `SWP_NOACTIVATE`）弹出不抢占键盘焦点的 60 秒 4 选 1 `tkinter` 小窗，顶部实时展示当前 5h 窗口已用比例；若父进程携带 `SW_HIDE` 隐藏标志，会自动通过干净辅助子进程拉起可见小窗。60 秒无操作自动按 `config.json` 默认模式出发。
+  * **无交互/隔离桌面自动快退兜底**：在锁屏、Session 0，或 Antigravity 命令沙箱隔离桌面（如 `WinSta0\exebox-*`）下运行时，`budget_ui.py` 会自动检测当前 Windows 桌面非 `Default`（或捕获 `TclError`），**不再空等 60 秒隐身窗口**，而是立即静默回退至默认预算配置继续执行；需要定制本次预算时，直接在 `prepare-feed` 命令追加 `--budget-ratio` / `--max-videos` / `--reserve-ratio` / `--max-minutes` 即可。
+  * 仅当你明确希望“即使在交互桌面也完全不弹预算小窗与 Toast”时，才需手动在 `prepare-feed` 和 `commit-appreciation` 后追加 `--headless`。
 
 ### 3.2 使用 `Create With Prompt` 快捷创建定时任务
 
@@ -147,16 +153,17 @@ Copy-Item config.local.example.json config.local.json
 请严格使用 Python 解释器 `<YOUR_CONDA_PYTHON>`（设置环境变量 `PYTHONPATH=src`），按以下三阶段协议顺序执行，严禁跳过安全校验或残留临时媒体文件：
 
 【阶段 1：吸收反向补丁 + 预算确认 + 准备今日菜单（小脑选片）】
-1. 执行命令（不带 `--headless`，以启用交互式 60 秒非抢占预算弹窗；若当前处于锁屏/无桌面环境，程序会自动捕获 `TclError` 静默按默认 0.35 预算执行；同时自动完成 `.cat.lock` 锁校验、残留临时目录清扫、Step 1 吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心拉取、黑名单硬过滤与 Top-8 记忆召回）：
+1. 执行命令（默认不带 `--headless`，交互桌面自动弹出 60 秒 4 选 1 预算确认窗；锁屏/隔离桌面自动静默回退默认配置不卡死；也可按需显式追加 `--budget-ratio 0.35` / `--max-videos 3` / `--reserve-ratio 0.40` / `--max-minutes 15` 四选一参数跳过弹窗直接生效；同时自动完成 `.cat.lock` 锁校验、残留临时目录清扫、Step 1 吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心拉取、黑名单硬过滤、Top-8 记忆召回及 `budget_plan` 状态落盘）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-feed --max-select 4`
 2. 解析标准输出的 JSON：
    - 若出现 `stopped_reason`（如 `rest_today` / `cooldown_or_budget_exhausted`）或错误码 `E2001_BILI_AUTH_EXPIRED` / `E2002_BILI_RATE_LIMIT_412` / `E7002_LOCKFILE_CONFLICT`，立即停止本轮巡逻并简短汇报原因，严禁继续拉取或重试。
-   - 若成功获得 `packet`（包含 `static_prefix_prompt` 与 `dynamic_menu_prompt`），请你严格按 `static_prefix_prompt` 中的 `cat-soul.md` 与 `SelectionResponse` JSON Schema 选出 2–4 条最有灵魂、高信息密度或高视听价值的候选视频（`target_mode` 与 `dynamic_menu_prompt` 指示的当前管线模式保持一致），记住 `run_id` 与选中 BV 列表。
+   - 若成功获得 `packet`（包含 `static_prefix_prompt` 与 `dynamic_menu_prompt`）与 `budget_plan`，请你严格按 `static_prefix_prompt` 中的 `cat-soul.md` 与 `SelectionResponse` JSON Schema 选出 2–4 条（若 `budget_plan.max_videos` 已限定则不超过该上限）最有灵魂、高信息密度或高视听价值的候选视频（`target_mode` 与 `dynamic_menu_prompt` 指示的当前管线模式保持一致），记住 `run_id` 与选中 BV 列表。
 
 【阶段 2：逐条制备媒体 -> 原生 `read_file` 鉴赏 -> 提交回写并物理焚毁】
 对每个选中的 `bv_id` 顺序执行：
-1. 调用媒体制备命令（程序自动按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
+1. 调用媒体制备命令（程序自动先校验 `budget_plan` 是否已达 `max_videos`、超过 `deadline_epoch` 或窗口额度耗尽，再按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-media --run-id <run_id> --bv <bv_id>`
+   - **若返回 `stopped_reason: "budget_limit_reached"`**（达到观看个数上限、超过玩耍时长截止时间或窗口预算耗尽），**立即优雅中止阶段 2 循环，跳过剩余 BV 直接进入阶段 3 收尾同步**。
    - 若返回 `E3001_BLACKLIST_REJECTED`、`E4001_FFMPEG_FAILED` 或 `E4002_PAYLOAD_TOO_LARGE`，跳过该 BV 继续下一条。
 2. 读取返回 JSON 中的 `prepared_media.payload_path`、`prepared_media.mode`、`prepared_media.frame_count` 与 `prepared_media.effective_duration_sec`，调用 Antigravity 原生工具 `read_file(Path="<prepared_media.payload_path>")` 加载本地净版媒体（`.m4a` 或 `.mp4`），并结合 `packet.static_prefix_prompt` 与 `packet.dynamic_context_prompt` 进行沉浸鉴赏：
    - **当 `prepared_media.mode` 为 `audio_only` 或 `downgraded_audio` 时（最高红线：纯听觉诚实）**：只根据标题、简介、字幕、热评与真实听到的声音（BGM、节奏、语气、音效）写手账，**严禁捏造未提供的具体视觉画面细节**。

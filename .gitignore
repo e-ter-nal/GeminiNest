@@ -12,6 +12,7 @@ config.local.json
 data/cat_memory.db
 data/cat_memory.db-*
 data/temp/
+data/run_states/
 data/snapshots/
 data/.cat.lock
 data/exports/

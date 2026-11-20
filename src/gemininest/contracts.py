@@ -157,6 +157,32 @@ class MemoryConfig:
     recall_stability_boost: float
 
 
+BudgetControlMode = Literal[
+    "use_ratio",
+    "max_videos",
+    "reserve_ratio",
+    "max_minutes",
+    "rest",
+]
+
+
+@dataclass(frozen=True)
+class BudgetPlan:
+    """Unified 4-in-1 budget control plan persisted across prepare-feed -> prepare-media."""
+
+    mode: BudgetControlMode
+    allowed_ratio: float
+    window_cap_ratio: float
+    current_window_used_ratio: float = 0.0
+    use_ratio: float | None = None
+    max_videos: int | None = None
+    reserve_ratio: float | None = None
+    max_minutes: float | None = None
+    started_epoch: float | None = None
+    deadline_epoch: float | None = None
+    rest_today: bool = False
+
+
 @dataclass(frozen=True)
 class BudgetAndRuntimeConfig:
     default_window_budget_ratio: float
@@ -168,6 +194,10 @@ class BudgetAndRuntimeConfig:
     token_calibration_k: float
     lock_file_path: str
     cooldown_hours_on_429: int
+    default_budget_mode: BudgetControlMode = "use_ratio"
+    default_max_videos: int = 3
+    default_reserve_ratio: float = 0.40
+    default_max_minutes: int = 15
 
 
 @dataclass(frozen=True)

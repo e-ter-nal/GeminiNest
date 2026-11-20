@@ -896,3 +896,269 @@ def test_prepare_media_cli_routes_sanitized_video_and_records_e5001_downgrade(
     rc_burn2 = main([*common, "burn-temp", "--all"])
     assert rc_burn2 == 0
     assert not any(temp_root.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# 4-Mode Budget Control (CLI Override + Run State + prepare-media Enforcement)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_feed_cli_4_mode_overrides_and_prepare_media_enforcement(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snapshots")
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg_path = tmp_path / "budget_local.json"
+    local_cfg_path.write_text(
+        json.dumps({"media_preprocess": {"ffmpeg_binary": ffmpeg_bin}}),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "budget_modes.db"
+    temp_root = tmp_path / "budget_temp"
+    lock_path = tmp_path / "budget.lock"
+
+    # Guarantee CLI overrides NEVER invoke prompt_startup_budget
+    def _forbid_popup(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("prompt_startup_budget must be skipped when CLI budget flag is passed")
+
+    monkeypatch.setattr("gemininest.runner.prompt_startup_budget", _forbid_popup)
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg_path),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+    ]
+
+    # 1. Mutual exclusion check: passing 2 budget flags -> E1001_CONFIG_INVALID
+    rc_bad = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_conflict_01",
+            "--budget-ratio",
+            "0.35",
+            "--max-videos",
+            "2",
+        ]
+    )
+    assert rc_bad == 1
+    bad_out = json.loads(capsys.readouterr().out)
+    assert bad_out["ok"] is False
+    assert bad_out["error_code"] == ErrorCode.E1001_CONFIG_INVALID.value
+
+    # 2. --max-videos 1 -> allows 1st BV, gracefully stops 2nd BV with stopped_reason="budget_limit_reached"
+    rc_vid = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_maxvid_01",
+            "--max-videos",
+            "1",
+        ]
+    )
+    assert rc_vid == 0
+    feed_vid = json.loads(capsys.readouterr().out)
+    assert feed_vid["ok"] is True
+    assert feed_vid["decision"]["source"] == "cli_override"
+    assert feed_vid["budget_plan"]["mode"] == "max_videos"
+    assert feed_vid["budget_plan"]["max_videos"] == 1
+    assert Path(feed_vid["run_state_path"]).is_file()
+
+    wav_path = synthesize_offline_wav(ffmpeg_bin, tmp_path / "mode_src.wav", duration_sec=3.0)
+    rc_m1 = main(
+        [
+            *common,
+            "prepare-media",
+            "--offline",
+            "--run-id",
+            "cli_maxvid_01",
+            "--bv",
+            "BV1drygem001",
+            "--source-audio",
+            str(wav_path),
+        ]
+    )
+    assert rc_m1 == 0
+    out_m1 = json.loads(capsys.readouterr().out)
+    assert out_m1["ok"] is True
+    assert "prepared_media" in out_m1
+
+    # 2nd distinct BV must hit max_videos=1 and gracefully stop BEFORE touching temp_root
+    rc_m2 = main(
+        [
+            *common,
+            "prepare-media",
+            "--offline",
+            "--run-id",
+            "cli_maxvid_01",
+            "--bv",
+            "BV1drydiy002",
+            "--source-audio",
+            str(wav_path),
+        ]
+    )
+    assert rc_m2 == 0
+    out_m2 = json.loads(capsys.readouterr().out)
+    assert out_m2["ok"] is True
+    assert out_m2["stopped_reason"] == "budget_limit_reached"
+    assert out_m2["stop_detail"] == "max_videos_reached"
+    assert not (temp_root / "cli_maxvid_01" / "BV1drydiy002").exists()
+
+    # Clean up BV1 temp
+    assert main([*common, "burn-temp", "--all"]) == 0
+    capsys.readouterr()
+
+    # 3. --max-minutes 10 -> persists deadline_epoch; once clock passes deadline, prepare-media stops gracefully
+    fake_now = [1_700_000_000.0]
+    monkeypatch.setattr("gemininest.runner._now_epoch", lambda: fake_now[0])
+
+    rc_min = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_maxmin_01",
+            "--max-minutes",
+            "10",
+        ]
+    )
+    assert rc_min == 0
+    feed_min = json.loads(capsys.readouterr().out)
+    assert feed_min["budget_plan"]["mode"] == "max_minutes"
+    assert feed_min["budget_plan"]["deadline_epoch"] == 1_700_000_600.0
+
+    # Advance wall clock past deadline (+601s)
+    fake_now[0] = 1_700_000_601.0
+    rc_expired = main(
+        [
+            *common,
+            "prepare-media",
+            "--offline",
+            "--run-id",
+            "cli_maxmin_01",
+            "--bv",
+            "BV1drygem001",
+            "--source-audio",
+            str(wav_path),
+        ]
+    )
+    assert rc_expired == 0
+    out_exp = json.loads(capsys.readouterr().out)
+    assert out_exp["ok"] is True
+    assert out_exp["stopped_reason"] == "budget_limit_reached"
+    assert out_exp["stop_detail"] == "max_minutes_deadline_reached"
+    assert not any(temp_root.iterdir())
+
+    # 4. --reserve-ratio with existing 50% window usage -> 0.40 reserve leaves 0.10 allowed (cap=0.60);
+    #    0.60 reserve leaves 0.0 allowed -> stopped_reason="cooldown_or_budget_exhausted"
+    cfg_check = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg_path)
+    with MemoryStore.from_config(cfg_check, db_path=db_path) as store:
+        store.record_budget_usage(
+            run_id="prior_usage",
+            total_est_tokens=700_000,  # 50% of 1,400,000
+            status="ok",
+        )
+
+    rc_res_ok = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_reserve_ok",
+            "--reserve-ratio",
+            "0.40",
+        ]
+    )
+    assert rc_res_ok == 0
+    out_res_ok = json.loads(capsys.readouterr().out)
+    assert out_res_ok["ok"] is True
+    assert out_res_ok["budget_plan"]["mode"] == "reserve_ratio"
+    assert out_res_ok["budget_plan"]["allowed_ratio"] == pytest.approx(0.10, abs=1e-4)
+    assert out_res_ok["budget_plan"]["window_cap_ratio"] == pytest.approx(0.60, abs=1e-4)
+    assert out_res_ok["budget_status"]["remaining_tokens"] == 140_000
+
+    rc_res_stop = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_reserve_stop",
+            "--reserve-ratio",
+            "0.60",
+        ]
+    )
+    assert rc_res_stop == 0
+    out_res_stop = json.loads(capsys.readouterr().out)
+    assert out_res_stop["ok"] is True
+    assert out_res_stop["stopped_reason"] == "cooldown_or_budget_exhausted"
+    assert out_res_stop["budget_plan"]["allowed_ratio"] == 0.0
+
+    # 5. --budget-ratio 0.0 -> rest_today
+    rc_zero = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "cli_zero_rest",
+            "--budget-ratio",
+            "0.0",
+        ]
+    )
+    assert rc_zero == 0
+    out_zero = json.loads(capsys.readouterr().out)
+    assert out_zero["ok"] is True
+    assert out_zero["stopped_reason"] == "rest_today"
+
+
+def test_dry_run_stops_gracefully_on_max_minutes_deadline(tmp_path: Path) -> None:
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    cfg = _make_offline_cfg(tmp_path, ffmpeg_bin)
+    cfg_min = replace(
+        cfg,
+        budget_and_runtime=replace(
+            cfg.budget_and_runtime,
+            default_budget_mode="max_minutes",
+            default_max_minutes=1,
+        ),
+    )
+    # 1st call at budget decision (t=1000 -> deadline=1060), 2nd call before video 0 (t=1010 -> ok),
+    # 3rd call before video 1 (t=1065 -> deadline exceeded -> stops gracefully after 1 video!)
+    times = iter([1000.0, 1010.0, 1065.0, 1070.0])
+
+    report = run_dry_run(
+        cfg_min,
+        run_id="dryrun_deadline_01",
+        db_path=tmp_path / "deadline.db",
+        temp_root=tmp_path / "deadline_temp",
+        lock_file_path=tmp_path / "deadline.lock",
+        persona_path=REPO_PERSONA_PATH,
+        headless=True,
+        max_videos=2,
+        time_fn=lambda: next(times),
+    )
+    assert report.budget_decision.mode == "max_minutes"
+    assert report.budget_decision.deadline_epoch == 1060.0
+    assert len(report.appreciated_bvs) == 1
+    assert report.stopped_reason == "budget_limit_reached"
+    assert report.temp_residual_count == 0
