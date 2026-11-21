@@ -17,6 +17,12 @@ GeminiNest/
 ├── ARCHITECTURE.md                   # 全局架构设计白皮书
 ├── SPEC_AND_TASKS.md                 # 本文件：详细规范与施工任务书
 ├── HANDOFF_LOG.md                    # 跨对话交接黑板
+├── assets/
+│   └── gemininest.ico                # 桌面小窗与 Win32 系统托盘自定义图标
+├── scripts/
+│   ├── create_companion_shortcut.py  # 一键生成桌面无黑框小窗快捷方式
+│   ├── download_wd_tagger.py         # wd-tagger ONNX 权重与标签 CSV 下载校验器
+│   └── inbox_gdoc_exporter.gs        # Google Apps Script 云端 .gdoc -> .txt 定时转换脚本
 ├── requirements.txt                  # v1 极简依赖清单（v2 依赖独立写于 requirements-v2.txt）
 ├── requirements-dev.txt              # 离线单元测试依赖（pytest）
 ├── src/
@@ -30,13 +36,16 @@ GeminiNest/
 │       ├── agent_bridge.py           # [模块6] Antigravity 宿主桥接层（前缀拼装/媒体清单/JSON校验/账本估算）
 │       ├── memory_store.py           # [模块7] SQLite FTS5 + 艾宾浩斯 Top-8 引擎 + 账本
 │       ├── sync_manager.py           # [模块8] Google Drive 纯文本正反向同步 + exports 独立隐藏 Git
-│       ├── budget_ui.py              # 启动 60 秒非抢占预算弹窗 + Windows Toast 通知
-│       └── runner.py                 # 顶层调度入口（含进程锁、宿主驱动状态机、--dry-run 离线回放）
+│       ├── budget_ui.py              # 4 条件联合预算面板（Tk/Toplevel）+ 原子文件 IPC + 120s Toast 转发
+│       ├── companion.py              # WinSta0\Default 桌面常驻轻量小窗 + Win32 系统托盘 + 状态看板
+│       └── runner.py                 # 顶层调度入口（进程锁、三分支启动门禁、只读 status、--dry-run 离线回放）
 ├── data/                             # [全目录受控，均由主仓库 Git 忽略]
 │   ├── cat_memory.db                 # [Git忽略] SQLite 主库
 │   ├── exports/                      # [主仓库忽略，内部维护独立隐藏 .git 仓库留痕] 纯文本导出区
 │   ├── snapshots/                    # [Git忽略] 黑匣子 Dry-Run 离线快照
-│   ├── temp/                         # [Git忽略] 媒体临时区（两阶段用完即焚 + 启停兜底清扫）
+│   ├── run_states/                   # [Git忽略] 跨命令巡逻活跃运行租约与 token 预估缓存
+│   ├── budget_ipc/                   # [Git忽略] 跨桌面预算请求/确认/Toast 原子 IPC 文件区
+│   ├── temp/                         # [Git忽略] 媒体临时区（两阶段用完即焚 + 租约安全兜底清扫）
 │   └── models/                       # [Git忽略] v2 wd-tagger ONNX 权重目录
 └── tests/                            # 离线单元测试（全离线、零网络请求）
 ```
@@ -159,8 +168,8 @@ Gemini_Nest/
    * 轮转 `1_yesterday_readonly/` 前，先对目标旧文件递归 `os.chmod(p, stat.S_IWRITE)` 清除只读属性，再以整文件覆写（避免虚拟盘 `.tmp` 原子重命名引发 `file (1).md` 冲突副本），写入后容错恢复 `S_IREAD` 并在文本顶部附 `<!-- READONLY SNAPSHOT: DO NOT EDIT -->` 标记。
 3. **`data/exports/` 独立隐藏 Git 仓库**：
    * 主工程 `.gitignore` 严格忽略 `data/exports/`；`data/exports/` 内部初始化独立本地 Git 仓库（`git -C data/exports commit`），彻底隔离私人冲浪日记历史与未来可开源的工程代码库。
-4. **`tkinter` 无头 / 定时任务兜底**：
-   * `budget_ui.py` 支持 `--headless` 与配置开关，并捕获 `tk.TclError`（Session 0 无交互桌面时自动静默采用默认预算 `0.35`）；弹窗禁用抢占焦点，采用 `time.monotonic()` 单调时钟做 60 秒倒计时兜底，避免系统休眠唤醒后卡死。
+4. **`tkinter` 无头 / 隔离桌面与跨桌面前端**：
+   * `budget_ui.py` 与 `companion.py` 支持 4 条件联合交集上限（公版默认 `0.4` / `100` / `0.30` / `30`）及 `--headless` / CLI 参数覆盖；当隔离桌面（`WinSta0\exebox-*`）直接弹窗不可见时，通过 `data/budget_ipc/` 原子文件 IPC 交由真实桌面 `WinSta0\Default` 常驻小窗以 `tk.Toplevel` 弹窗并代发 120s TTL Toast，锁屏 `tk.TclError` 或 60s `time.monotonic()` 超时自动静默按当前有效交集默认值继续。
 
 ---
 
@@ -214,3 +223,8 @@ Gemini_Nest/
 - [x] 升级 `agent_bridge.py`：支持 `media_resolution`（`low`/`medium`/`high`）与 `video_processing_mode`（`static`/`agentic`/`auto` 按 300 秒阈值切换）。
 - [x] Phase 5-B 真实权重部署与首次“睁眼”试飞验收（`SmilingWolf/wd-vit-tagger-v3` + Windows DirectML GPU 加速 + 净版 `sanitized.mp4` 宿主 `read_file` 真实观影、用完即焚与云盘同步闭环），合并 `feat/v2-visual` 至 `main` 并打附注标签 `v2.0.0`。
 - [ ] 可选扩展：实现本地赛博相册与每周 `py7zr`（AES-256 + `header_encryption=True`）加密打包上传 + 错周延迟清理。
+
+### Phase 6：[v3 分支 `feat/v3-companion`] 4 条件联合预算、桌面常驻托盘前端与三分支启动门禁
+- [x] 升级 `budget_ui.py` / `config.py` / `contracts.py` / `runner.py`：实现 4 条件联合交集上限（`max_use_ratio` / `max_videos` / `reserve_ratio` / `max_minutes`）、CLI「仅传 1 项其余不限」与 `MAX_SELECT_PER_BATCH_GUARDRAIL = 30` 防滥用护栏。
+- [x] 实现 `companion.py`、`assets/gemininest.ico` 与 `scripts/create_companion_shortcut.py`：真实桌面 `WinSta0\Default` 常驻轻量 `tkinter` 小窗（单实例互斥锁 + `.companion.lock` 心跳）、纯 Win32 `Shell_NotifyIconW` 系统托盘收纳/还原、高 DPI 自适应布局、5h 窗口起点与日记/记忆计数展示。
+- [x] 实现三分支启动门禁与只读接口：扩展 `runner.py status` 只读看板接口；在 `prepare-feed` 接入小窗 IPC 握手（`desktop_companion_offline` / `desktop_companion_aborted`）、云盘挂载门禁（`cloud_drive_unmounted` / `E8001`）与 120s TTL Toast 代发，全量离线单测 `163/163` 通过后合并回 `main` 并发布 `v3.0.0`。

@@ -5,8 +5,8 @@
 ---
 
 ## 当前全局状态（Current Snapshot）
-* **当前阶段**：✅ **v3 桌面常驻轻量前端（`WinSta0\Default`）+ 系统托盘收纳 + 三分支启动门禁 + 只读 `status` 接口完成开发与全离线验收并已合并 `main`**（离线单元测试 **163/163 全绿**，零网络、零真实数据触碰；暂未 `git push`）
-* **当前分支**：`main`（已 `--no-ff` 合并 `feat/v3-companion`，本地领先 `origin/main`，暂未 `git push`）
+* **当前阶段**：✅ **v3.0.0 发布收尾：桌面常驻轻量前端（`WinSta0\Default`）+ 系统托盘收纳 + 三分支启动门禁 + 只读 `status` 接口完成开发与全离线验收，文档已同步至 v3.0.0 并推送至 GitHub `origin/main`**（离线单元测试 **163/163 全绿**，零网络、零真实数据触碰）
+* **当前分支**：`main`（已 `--no-ff` 合并 `feat/v3-companion` 并同步更新文档，已 `git push` 至 `origin/main` 与版本标签 `v3.0.0`）
 * **当前激活模式**：`config.json` 默认保持 v1 `audio_only`、`wd_tagger_enabled: false`、4 条件公版安全默认预算（`0.4` / `100` / `0.30` / `30`），以及桌面前端与启动门禁默认配置（`companion_policy: "required"`、`ipc_dir: "data/budget_ipc"`、`ipc_ack_timeout_sec: 2.5`、`require_cloud_mount_on_start: true`）；未改动本机私有 `config.local.json`
 * **已落盘与核验基建**：
   * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已并列补充「桌面小窗交互模式」与「`--headless` 纯无头自动化模式」，并在第 3.3 节标准唤醒 Prompt 补充 `desktop_companion_offline` / `desktop_companion_aborted` / `cloud_drive_unmounted` 明确中文汇报与立即中止指令）
@@ -33,17 +33,22 @@
 6. **[Phase 0 拍板]** `inbox/` 反向补丁采用云端 Google Apps Script 定时将 `.gdoc` 转存同名 `.txt` + 原生兼容手动 `.md`/`.txt`；`fetcher.py` v1 直接使用 `httpx`（只读 Web API + WBI 签名）+ `yt-dlp`，暂不挂载 `bilibili-mcp-agent` MCP。
 
 ## 下一对话启动入口（Next Action）
-* **上线与收尾建议（`feat/v3-companion` 已合并至 `main`，暂未 `git push`）**：
-  1. **日常巡逻前准备**：桌面已生成「GeminiNest 桌面小窝助手」快捷方式（或随时运行 `<YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py` 重建）；巡逻前双击启动小窗（可点击「收进托盘」隐藏至系统托盘「显示隐藏的图标」），即可接收 `Scheduled Tasks` 发来的跨桌面 `Toplevel` 预算弹窗与 Toast；如需推送远端，确认无误后执行 `git push`（可选打标签 `v3.0.0`）。
-  2. 可按 `docs/SETUP_AND_RUNTIME.md` 更新定时任务唤醒 Prompt（新增对 `desktop_companion_offline` / `desktop_companion_aborted` / `cloud_drive_unmounted` 的中文明确终止汇报）。
+* **日常运行与可选扩展（v3.0.0 已同步至 GitHub `origin/main`）**：
+  1. **日常巡逻前准备**：桌面已生成「GeminiNest 桌面小窝助手」快捷方式（或随时运行 `<YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py` 重建）；巡逻前双击启动小窗（可点击「收进托盘」隐藏至系统托盘「显示隐藏的图标」），即可接收 `Scheduled Tasks` 发来的跨桌面 `Toplevel` 预算弹窗与 Toast。
+  2. 可按 `docs/SETUP_AND_RUNTIME.md` 第 3.3 节更新定时任务唤醒 Prompt（新增对 `desktop_companion_offline` / `desktop_companion_aborted` / `cloud_drive_unmounted` 的中文明确终止汇报）。
   3. 如需推进可选扩展（Phase 5 末项）：安装 `py7zr` 实现本地赛博相册与每周 AES-256（`header_encryption=True`）加密冷备卷及错周清理。
   4. 建议人工清理云盘历史遗留目录 `<YOUR_GOOGLE_DRIVE_NEST>\Videos`（2026-11-18 创建），确保云盘 100% 纯文本隔离。
 
 ---
 
 ## 历史对话交接记录（按时间倒序追加）
+### [v3.0.0 Release Docs & GitHub Sync] - 2026-11-21
+* **文档与发版同步**：
+  * 更新 `README.md`（版本徽章升级至 `v3.0.0`、离线单测徽章与清单同步为 `163 passed`、补全 v3 桌面常驻托盘与三分支门禁架构对比、流程图与 `assets/gemininest.ico` 目录项）、`ARCHITECTURE.md`（更新至 `v3.0` 架构说明）、`SPEC_AND_TASKS.md`（补充 `companion.py`/`budget_ipc`/`run_states` 目录树与 Phase 6 v3 里程碑勾选）、`docs/SETUP_AND_RUNTIME.md`（适用版本同步为 `v3.0.0`）及本交接日志顶部状态。
+  * 在 `main` 分支完成文档提交并推送 `origin/main` 与附注标签 `v3.0.0`（注意：历史局部标签 `v1.0.0`/`v2.0.0` 仍仅保留在本地 `archive/local-v2-history`，不推送远端）。
+* **回归验证**：`<YOUR_CONDA_PYTHON> -m pytest -v` **163 passed**，全仓库路径/凭据扫描零残留。
 ### [v3 Companion & 3-Branch Startup Gate - 桌面常驻轻量前端 + 跨桌面 IPC + 只读 `status`] - 2026-11-21
-* **分支与合并状态**：基于 `main` 在 `feat/v3-companion` 完成开发与桌面交互打磨后，已 `--no-ff` 合并回 **`main`**（暂未 `git push`）。
+* **分支与合并状态**：基于 `main` 在 `feat/v3-companion` 完成开发与桌面交互打磨后，已 `--no-ff` 合并回 **`main`**。
 * **核心实现**：
   * **配置与契约扩展（`.gitignore` / `config.json` / `contracts.py` / `config.py`）**：
     * `.gitignore` 新增忽略 `data/budget_ipc/`、`data/.companion.lock`、`data/*.lock`。

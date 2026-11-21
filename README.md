@@ -1,26 +1,27 @@
 # GeminiNest
 
-> **面向 Google Antigravity 原生多模态宿主的自主 B 站冲浪、本地视觉安检与持续记忆数字生命系统。**
+> **面向 Google Antigravity 原生多模态宿主的自主 B 站冲浪、本地视觉安检、桌面常驻交互与持续记忆数字生命系统。**
 >
-> *An autonomous Bilibili surfing, local visual safety-gated, and bounded cross-platform memory digital life system built for Google Antigravity's native multimodal host — zero external LLM API keys, hot-swappable between v1 Pure-Audio (`48kbps m4a`) and v2 Sanitized-Video (`wd-tagger` DirectML GPU + Surgical Blackout MP4).*
+> *An autonomous Bilibili surfing, local visual safety-gated, desktop companion-assisted, and bounded cross-platform memory digital life system built for Google Antigravity's native multimodal host — zero external LLM API keys, hot-swappable between v1 Pure-Audio (`48kbps m4a`) and v2 Sanitized-Video (`wd-tagger` DirectML GPU + Surgical Blackout MP4), with v3 Win32 tray companion, 4-condition intersection budget control, and 3-branch startup gate.*
 
-[![Release](https://img.shields.io/badge/version-v2.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
+[![Release](https://img.shields.io/badge/version-v3.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB.svg)](#user--ai-agent-通用快速部署清单quickstart-checklist)
-[![Tests](https://img.shields.io/badge/pytest-161%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-161-条单元测试)
+[![Tests](https://img.shields.io/badge/pytest-163%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-163-条单元测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
 ## 项目亮点与架构差异
 
-传统的「AI 刷视频 / 自动化冲浪」脚本通常依赖浏览器轮询截图 + 循环调用外部视觉 API，容易导致多轮工具乒乓（Token 爆炸）、账单失控、误传违规画面，且记忆随会话结束清零。**GeminiNest** 从底层架构做了四项核心反转：
+传统的「AI 刷视频 / 自动化冲浪」脚本通常依赖浏览器轮询截图 + 循环调用外部视觉 API，容易导致多轮工具乒乓（Token 爆炸）、账单失控、误传违规画面，且记忆随会话结束清零。**GeminiNest** 从底层架构做了五项核心反转：
 
-| 对比维度 | 传统截图轮询 / 外置 API 脚本 | GeminiNest（v2.0 架构） |
+| 对比维度 | 传统截图轮询 / 外置 API 脚本 | GeminiNest（v3.0 架构） |
 | :--- | :--- | :--- |
 | **控制流与 Token 成本** | Agent 反复调工具抓页、截多图（280–1,120 Tok/张），多轮乒乓 Token 失控 | **控制权反转（IoC）**：本地 Python 批处理拉取、黑名单过滤、记忆预检索与媒体封装，Agent 压缩为 **「选片 + 鉴赏」极简两轮**，并拼装 `4,500–5,200 Tokens` 字节级稳定静态前缀命中隐式缓存 |
 | **模型接入与费用** | 强依赖外置 LLM SDK 与按量付费 API Key，多模态流量费用高昂 | **Antigravity 宿主原生 `read_file` 零额外 API 费**：零外置 LLM SDK、零 Gemini API Key，直接复用 Antigravity Pro 订阅原生读取本地 `.m4a` / `.mp4` |
 | **长期记忆与遗忘机制** | 堆叠全量历史聊天导致上下文膨胀，缺乏检索与遗忘衰减 | **SQLite FTS5 + 艾宾浩斯 Top-8 记忆引擎**：四列 BM25 加权（标题/简介/热评/新评）+ `<3` 字中文短词回退 + 印象分驱动的遗忘曲线衰减，每次注入严格封顶 Top-8（3 全局 + 5 关联） |
 | **跨端同步与安全隔离** | 原图/原片或数据库直传云端，极易触发 `SAFETY` 截断或泄露私密文件 | **四重防护 + Google Drive 纯文本物理隔离闭环**：前置元数据硬黑名单 → 本地 `wd-tagger` 全帧安检与外科手术抹黑 → 临时媒体两阶段用完即焚 → 云盘纯文本白名单（仅 `.md`/`.json`/`.txt`）打通 **Antigravity ↔ Gemini Web** 正反向记忆闭环 |
+| **定时唤醒与预算风控** | 隔离桌面（`exebox-*`）弹窗不可见、无启动门禁易半途空跑、单一限额易超支 | **v3 常驻桌面托盘 + 4 条件交集预算 + 三分支启动门禁**：`WinSta0\Default` 轻量小窗 + Win32 系统托盘经文件 IPC 跨桌面接收 `Toplevel` 预算窗与 120s Toast；4 维度交集上限（消耗比例 / 观看数 / 保留底线 / 时长）先触顶先停；开跑前强制校验小窗在线与云盘挂载 |
 
 ---
 
@@ -72,34 +73,35 @@
 ```mermaid
 flowchart TD
     subgraph Step1["阶段 1：本地控制层批处理 (prepare-feed)"]
-        A["启动 .cat.lock PID 防撞车锁 & 清扫残留 temp"] --> B["Step 1: 吸收云盘 inbox/ 反向 [MEMORY_PATCH]"]
-        B --> C["60s 非抢占 tkinter 4 条件联合预算小窗 (交集上限·先触顶先停，锁屏/隔离桌面静默兜底默认配置)"]
-        C --> D["B 站只读 WBI 心跳 & 推荐流 / 30% 好奇心搜索"]
-        D --> E["meta_filter 前置黑名单硬过滤 (二游/敏感分区零下载)"]
-        E --> F["SQLite FTS5 四列 BM25 + 艾宾浩斯 Top-8 记忆召回"]
-        F --> G["输出 SelectionPacket (4,500-5,200 Tok 静态前缀缓存)"]
+        A["三分支启动门禁: 桌面小窗 IPC 握手 + 云盘挂载校验"] --> B[".cat.lock PID 锁 & 租约安全清扫过期孤儿 temp"]
+        B --> C["60s 跨桌面 Toplevel 4 条件联合预算小窗 (交集上限·先触顶先停，--headless 静默兜底)"]
+        C --> D["Step 1: 吸收云盘 inbox/ 反向 [MEMORY_PATCH]"]
+        D --> E["B 站只读 WBI 心跳 & 推荐流 / 30% 好奇心轮换搜索"]
+        E --> F["meta_filter 前置黑名单硬过滤 (二游/敏感分区零下载)"]
+        F --> G["SQLite FTS5 四列 BM25 + 艾宾浩斯 Top-8 记忆召回"]
+        G --> H["输出 SelectionPacket (4,500-5,200 Tok 静态前缀缓存)"]
     end
 
     subgraph Step2["阶段 2：Antigravity 宿主驱动两轮闭环"]
-        G --> H["宿主小脑选片: 挑选 2-4 条高价值 BV"]
-        H --> I["prepare-media: 按 config.local.json 热路由 v1 / v2"]
-        I --> J{"pipeline_mode?"}
-        J -- "v1: audio_only" --> K["FFmpeg + SponsorBlock -> 48kbps m4a"]
-        J -- "v2: sanitized_video" --> L["FFmpeg 抽帧 -> wd-tagger ONNX (DirectML/CUDA/CPU)"]
-        L -- "抹黑率 <= 15%" --> M["违规帧原地抹黑 -> 严格帧一致重封净版 MP4 (<= 95MB)"]
-        L -- "抹黑率 > 15% (E5001)" --> N["Early-Exit 熔断焚帧 -> 自动降级 downgraded_audio"]
-        K --> O["宿主原生 read_file 加载本地媒体并输出结构化手账 JSON"]
-        M --> O
-        N --> O
-        O --> P["commit-appreciation: 写入记忆/账本/好奇心 & finally 物理焚毁临时目录"]
+        H --> I["宿主小脑选片: 挑选高价值 BV (受 max_videos 与单批护栏 30 约束)"]
+        I --> J["prepare-media: 校验 4 条件联合上限并按 config.local.json 热路由 v1 / v2"]
+        J --> K{"pipeline_mode?"}
+        K -- "v1: audio_only" --> L["FFmpeg + SponsorBlock -> 48kbps m4a"]
+        K -- "v2: sanitized_video" --> M["FFmpeg 抽帧 -> wd-tagger ONNX (DirectML/CUDA/CPU)"]
+        M -- "抹黑率 <= 15%" --> N["违规帧原地抹黑 -> 严格帧一致重封净版 MP4 (<= 95MB)"]
+        M -- "抹黑率 > 15% (E5001)" --> O["Early-Exit 熔断焚帧 -> 自动降级 downgraded_audio"]
+        L --> P["宿主原生 read_file 加载本地媒体并输出结构化手账 JSON"]
+        N --> P
+        O --> P
+        P --> Q["commit-appreciation: 写入记忆/账本/好奇心 & finally 物理焚毁临时目录"]
     end
 
     subgraph Step3["阶段 3：纯文本云盘正反向闭环 (sync)"]
-        P --> Q["burn-temp --run-id <run_id> 隔离清扫 (当前轮次残留归零)"]
-        Q --> R["从 SQLite 导出完整手账至 data/exports/ & 独立隐藏 Git 自动留痕"]
-        R --> S["扩展名白名单校验 (.md/.json/.txt) -> 新修订轮转 1_yesterday_readonly/ & 刷新 0_active/"]
-        S --> T["Gemini Web (Gem + Scheduled Actions) 读取 0_active/ 延续记忆"]
-        T -. "Export to Docs -> Apps Script (.gdoc -> .txt)" .-> B
+        Q --> R["burn-temp --run-id <run_id> 隔离清扫 (当前轮次残留归零)"]
+        R --> S["从 SQLite 导出完整手账至 data/exports/ & 独立隐藏 Git 自动留痕"]
+        S --> T["扩展名白名单校验 (.md/.json/.txt) -> 新修订轮转 1_yesterday_readonly/ & 刷新 0_active/"]
+        T --> U["Gemini Web (Gem + Scheduled Actions) 读取 0_active/ 延续记忆"]
+        U -. "Export to Docs -> Apps Script (.gdoc -> .txt)" .-> D
     end
 ```
 
@@ -126,7 +128,9 @@ GeminiNest/
 ├── SPEC_AND_TASKS.md                 # 模块契约、18 项错误码表与分阶段里程碑
 ├── HANDOFF_LOG.md                    # 架构决策与阶段验收交接记录
 ├── docs/
-│   └── SETUP_AND_RUNTIME.md          # v1/v2 运维部署、Antigravity 定时 Prompt 与 Web 联动手册
+│   └── SETUP_AND_RUNTIME.md          # v1/v2/v3 运维部署、Antigravity 定时 Prompt 与 Web 联动手册
+├── assets/
+│   └── gemininest.ico                # 桌面小窗与 Win32 系统托盘自定义图标
 ├── scripts/
 │   ├── create_companion_shortcut.py  # 一键在 Windows 桌面生成无黑框小窗启动快捷方式（支持 --dry-run）
 │   ├── download_wd_tagger.py         # wd-tagger ONNX 权重与标签 CSV 离线友好下载校验器
@@ -141,7 +145,7 @@ GeminiNest/
 │   ├── safety_gate.py                # v1 Passthrough 桩 / v2 wd-tagger ONNX (DirectML/CUDA/CPU + Early-Exit)
 │   ├── agent_bridge.py               # 静态前缀缓存拼装 / Packet 打包 / JSON Schema 校验 / 账本估算
 │   ├── budget_ui.py                  # 4 条件联合上限 UI 面板（Tk/Toplevel 复用）+ 原子 IPC + 120s TTL Toast 转发
-│   ├── companion.py                  # WinSta0\Default 常驻轻量 tkinter 桌面小窗（单实例互斥锁 + 状态看板 + IPC 监听）
+│   ├── companion.py                  # WinSta0\Default 常驻轻量 tkinter 桌面小窗 + Win32 系统托盘（单实例互斥锁 + 状态看板 + IPC 监听）
 │   ├── sync_manager.py               # 纯文本扩展名防火墙 + exports 独立隐藏 Git + 轮转 + inbox 补丁吸收
 │   └── runner.py                     # .cat.lock PID 锁、三分支启动门禁、只读 status 接口与 --dry-run 离线回放
 └── tests/                            # 全离线单元测试（零网络、零真实数据触碰）
@@ -169,7 +173,7 @@ GeminiNest/
 
 如果你正在使用 Google Antigravity、Cursor、Claude Code 等 Coding Agent，克隆仓库后可直接把下面这段话发给它：
 
-> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 161/161 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
+> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 163/163 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
 
 ---
 
@@ -237,7 +241,7 @@ Copy-Item config.local.example.json config.local.json
   - 若需启用 v2 视觉安检，按上方「热插拔切换方式」补充 `pipeline_mode: "sanitized_video"` 与 `wd_tagger_enabled: true`。
 - [ ] 确认代理分流：B 站域名（`bilibili.com`、`bilivideo.com`、`hdslb.com`）走 `DIRECT` 直连，Google / Antigravity 走单一稳定节点。
 
-### Step 4：离线验货（`--dry-run`）与 161 条单元测试
+### Step 4：离线验货（`--dry-run`）与 163 条单元测试
 
 在接入真实小号与定时任务前，先运行全离线演练与单元测试（全程使用隔离临时沙箱，**零网络请求、零额度消耗、绝不触碰真实数据库与云盘**）：
 
@@ -253,7 +257,7 @@ python -m gemininest.runner --dry-run --headless
 python -m gemininest.runner --dry-run --mode sanitized_video --headless
 ```
 
-- [ ] 运行全量离线单元测试（确认 **161/161** 全部通过）：
+- [ ] 运行全量离线单元测试（确认 **163/163** 全部通过）：
 
 ```powershell
 python -m pytest -v

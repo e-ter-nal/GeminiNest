@@ -1,6 +1,6 @@
 # GeminiNest 运维部署与跨端联动实操手册（v1 / v2 通用版）
 
-> 本手册适用于 **GeminiNest v2.0.0+**，全面兼容 **v1 纯音频模式（`audio_only`）** 与 **v2 视觉安检净版视频模式（`sanitized_video`）**。涵盖环境初始化、v2 `wd-tagger`（DirectML GPU / CPU）热插拔启用、**Antigravity `Scheduled Tasks` 自适应唤醒 Prompt（含 `Create With Prompt` 快捷建任务）**、**Google Apps Script 自动导出脚本**，以及 **Gemini Web 端常驻 Skill 与每日 `Scheduled Actions`** 配置。
+> 本手册适用于 **GeminiNest v3.0.0**（全面兼容 **v1 纯音频模式 `audio_only`** 与 **v2 视觉安检净版视频模式 `sanitized_video`**）。涵盖环境初始化、v2 `wd-tagger`（DirectML GPU / CPU）热插拔启用、**v3 桌面常驻小窗/Win32 托盘与三分支启动门禁**、**Antigravity `Scheduled Tasks` 自适应唤醒 Prompt（含 `Create With Prompt` 快捷建任务）**、**Google Apps Script 自动导出脚本**，以及 **Gemini Web 端常驻 Skill 与每日 `Scheduled Actions`** 配置。
 >
 > **安全红线**：本文档全部路径均为通用占位符（`<YOUR_PROJECT_DIR>`、`<YOUR_CONDA_PYTHON>`、`<YOUR_FFMPEG_PATH>`、`<YOUR_GOOGLE_DRIVE_NEST>`），严禁在文档、Git 仓库或云盘中写入真实 Cookie、密钥或本机私密信息。
 
