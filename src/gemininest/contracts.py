@@ -166,6 +166,8 @@ BudgetControlMode = Literal[
     "rest",
 ]
 
+CompanionPolicy = Literal["required", "optional", "disabled"]
+
 
 def compute_effective_allowed_ratio(
     *,
@@ -294,6 +296,10 @@ class BudgetAndRuntimeConfig:
     default_max_videos: int | None = 100
     default_reserve_ratio: float | None = 0.30
     default_max_minutes: int | None = 30
+    companion_policy: CompanionPolicy = "required"
+    ipc_dir: str = "data/budget_ipc"
+    ipc_ack_timeout_sec: float = 2.5
+    require_cloud_mount_on_start: bool = True
 
 
 @dataclass(frozen=True)

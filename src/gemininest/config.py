@@ -17,6 +17,7 @@ from gemininest.contracts import (
     BlacklistConfig,
     BM25WeightsConfig,
     BudgetAndRuntimeConfig,
+    CompanionPolicy,
     ErrorCode,
     FetcherConfig,
     GeminiNestError,
@@ -38,6 +39,7 @@ __all__ = [
     "BM25WeightsConfig",
     "BlacklistConfig",
     "BudgetAndRuntimeConfig",
+    "CompanionPolicy",
     "ErrorCode",
     "FetcherConfig",
     "GeminiNestError",
@@ -557,6 +559,32 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
             if default_max_minutes < 1:
                 raise _config_error("'budget_and_runtime.default_max_minutes' must be >= 1 or null")
 
+    companion_policy: CompanionPolicy = "required"
+    if "companion_policy" in sec:
+        raw_cp = _require_str(sec, "companion_policy", "budget_and_runtime")
+        if raw_cp not in ("required", "optional", "disabled"):
+            raise _config_error(
+                f"Invalid 'budget_and_runtime.companion_policy': {raw_cp!r}; "
+                "expected 'required', 'optional', or 'disabled'"
+            )
+        companion_policy = raw_cp  # type: ignore[assignment]
+
+    ipc_dir = "data/budget_ipc"
+    if "ipc_dir" in sec:
+        ipc_dir = _require_str(sec, "ipc_dir", "budget_and_runtime")
+
+    ipc_ack_timeout_sec = 2.5
+    if "ipc_ack_timeout_sec" in sec:
+        ipc_ack_timeout_sec = _require_float(sec, "ipc_ack_timeout_sec", "budget_and_runtime")
+        if ipc_ack_timeout_sec <= 0.0:
+            raise _config_error("'budget_and_runtime.ipc_ack_timeout_sec' must be > 0")
+
+    require_cloud_mount_on_start = True
+    if "require_cloud_mount_on_start" in sec:
+        require_cloud_mount_on_start = _require_bool(
+            sec, "require_cloud_mount_on_start", "budget_and_runtime"
+        )
+
     return BudgetAndRuntimeConfig(
         default_window_budget_ratio=ratio,
         startup_popup_timeout_sec=popup_timeout,
@@ -573,6 +601,10 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
         default_max_videos=default_max_videos,
         default_reserve_ratio=default_reserve_ratio,
         default_max_minutes=default_max_minutes,
+        companion_policy=companion_policy,
+        ipc_dir=ipc_dir,
+        ipc_ack_timeout_sec=ipc_ack_timeout_sec,
+        require_cloud_mount_on_start=require_cloud_mount_on_start,
     )
 
 

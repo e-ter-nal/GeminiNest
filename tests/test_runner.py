@@ -1817,3 +1817,492 @@ def test_prepare_feed_curiosity_rotation_and_auto_consumption_cli(
         consumed = store.list_worldbook(category="curiosity_queue", status="consumed")
         assert len(consumed) == 5
         assert all(e.search_count == 3 and e.last_searched_at is not None for e in consumed)
+
+
+# ---------------------------------------------------------------------------
+# v3 Companion Gate, IPC Handshake, Cloud Mount Check & Read-Only `status`
+# ---------------------------------------------------------------------------
+
+
+def test_runner_status_is_strictly_readonly_and_returns_aggregated_snapshot(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg = tmp_path / "status_local.json"
+    local_cfg.write_text(
+        json.dumps(
+            {
+                "project": {"pipeline_mode": "sanitized_video"},
+                "media_preprocess": {"ffmpeg_binary": ffmpeg_bin},
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "status_memory.db"
+    temp_root = tmp_path / "status_temp"
+    lock_path = tmp_path / ".cat.lock"
+    comp_lock = tmp_path / ".companion.lock"
+    ipc_dir = tmp_path / "budget_ipc"
+    cloud_dir = tmp_path / "cloud_nest"
+    cloud_dir.mkdir()
+    ws_root = REPO_ROOT
+
+    common_base = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--companion-lock",
+        str(comp_lock),
+        "--ipc-dir",
+        str(ipc_dir),
+        "--workspace-root",
+        str(ws_root),
+        "--cloud-dir",
+        str(cloud_dir),
+    ]
+
+    # 1. Before DB exists: status must NOT create cat_memory.db or .cat.lock on disk!
+    assert main([*common_base, "status"]) == 0
+    out_empty = json.loads(capsys.readouterr().out)
+    assert out_empty["ok"] is True
+    assert out_empty["pipeline_mode"] == "sanitized_video"
+    assert out_empty["used_tokens"] == 0
+    assert out_empty["capacity_tokens"] == 1_400_000
+    assert out_empty["remaining_tokens"] == 1_400_000
+    assert out_empty["in_cooldown"] is False
+    assert out_empty["cloud_mounted"] is True
+    assert out_empty["cat_lock_active"] is False
+    assert out_empty["active_run_count"] == 0
+    assert out_empty["companion_online"] is False
+    assert out_empty["memory_count"] == 0
+    assert out_empty["diary_count"] == 0
+    assert out_empty["recent_diaries"] == []
+    assert not db_path.exists()
+    assert not lock_path.exists()
+
+    # 2. Populate 4 diaries, budget usage, active run lease, .cat.lock, and .companion.lock
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg)
+    with MemoryStore.from_config(cfg, db_path=db_path) as store:
+        store.record_budget_usage(run_id="r_stat", total_est_tokens=140_000, status="ok")
+        for idx in range(1, 5):
+            store.add_diary_entry(
+                run_id=f"r_{idx}",
+                bv_id=f"BV1stat000{idx}",
+                title=f"状态测试手账 {idx}",
+                impression_score=5 + idx,
+                public_diary=f"正文 {idx}",
+                created_at=f"2026-11-21T0{idx}:00:00Z",
+            )
+
+    run_states_dir = db_path.parent / "run_states"
+    run_states_dir.mkdir(parents=True, exist_ok=True)
+    import time as _time
+
+    now_ep = _time.time()
+    (run_states_dir / "active_run.json").write_text(
+        json.dumps({"run_id": "active_run", "status": "active", "lease_expires_epoch": now_ep + 3600.0}),
+        encoding="utf-8",
+    )
+    (run_states_dir / "expired_run.json").write_text(
+        json.dumps({"run_id": "expired_run", "status": "active", "lease_expires_epoch": 1.0}),
+        encoding="utf-8",
+    )
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "run_id": "other"}), encoding="utf-8")
+    comp_lock.write_text(
+        json.dumps({"pid": os.getpid(), "workspace_root": str(ws_root), "heartbeat_epoch": now_ep}),
+        encoding="utf-8",
+    )
+
+    assert main([*common_base, "status"]) == 0
+    out_pop = json.loads(capsys.readouterr().out)
+    assert out_pop["used_tokens"] == 140_000
+    assert out_pop["used_ratio"] == pytest.approx(0.10)
+    assert out_pop["remaining_tokens"] == 1_260_000
+    assert out_pop["cat_lock_active"] is True
+    assert out_pop["active_run_count"] == 1
+    assert out_pop["companion_online"] is True
+    assert out_pop["memory_count"] == 0
+    assert out_pop["diary_count"] == 4
+    assert [d["bv_id"] for d in out_pop["recent_diaries"]] == [
+        "BV1stat0004",
+        "BV1stat0003",
+        "BV1stat0002",
+    ]
+    assert set(out_pop["recent_diaries"][0].keys()) == {
+        "created_at",
+        "title",
+        "bv_id",
+        "impression_score",
+    }
+    lock_path.unlink(missing_ok=True)
+    comp_lock.unlink(missing_ok=True)
+
+
+def test_startup_gate_branches_a_b_c_and_ipc_roundtrip(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    import time as _time
+    from gemininest.budget_ui import atomic_write_json, read_json_safe
+    from gemininest.companion import CompanionController, CompanionInstanceGuard
+
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snapshots")
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    cloud_dir = tmp_path / "cloud_mounted"
+    cloud_dir.mkdir()
+    missing_cloud = tmp_path / "cloud_missing"
+
+    local_cfg = tmp_path / "gate_local.json"
+    local_cfg.write_text(
+        json.dumps(
+            {
+                "media_preprocess": {"ffmpeg_binary": ffmpeg_bin},
+                "budget_and_runtime": {
+                    "companion_policy": "required",
+                    "ipc_ack_timeout_sec": 0.4,
+                    "startup_popup_timeout_sec": 1,
+                    "require_cloud_mount_on_start": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "gate.db"
+    temp_root = tmp_path / "gate_temp"
+    lock_path = tmp_path / "gate.cat.lock"
+    comp_lock = tmp_path / ".companion.lock"
+    ipc_dir = tmp_path / "budget_ipc"
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(temp_root),
+        "--lock-file",
+        str(lock_path),
+        "--companion-lock",
+        str(comp_lock),
+        "--ipc-dir",
+        str(ipc_dir),
+        "--workspace-root",
+        str(REPO_ROOT),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+    ]
+
+    # Guard: ensure BilibiliFetcher is NEVER called when startup gate intercepts!
+    def _forbid_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("BilibiliFetcher must not be touched when startup gate aborts")
+
+    monkeypatch.setattr("gemininest.runner.BilibiliFetcher", _forbid_fetch)
+    monkeypatch.setenv("BILI_SESSDATA", "dummy_offline_sess")
+    monkeypatch.setenv("BILI_JCT", "dummy_offline_jct")
+    monkeypatch.setenv("BILI_BUVID3", "dummy_offline_buvid3")
+
+    # 1. Branch A: Companion offline (no .companion.lock) -> exit 0 + desktop_companion_offline
+    rc_off = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "gate_off_01",
+            "--cloud-dir",
+            str(cloud_dir),
+        ]
+    )
+    assert rc_off == 0
+    out_off = json.loads(capsys.readouterr().out)
+    assert out_off["ok"] is True
+    assert out_off["stopped_reason"] == "desktop_companion_offline"
+    assert not (db_path.parent / "run_states" / "gate_off_01.json").exists()
+    assert not lock_path.exists()
+
+    # 2. Branch A ack timeout: .companion.lock alive, but no ack written within ipc_ack_timeout_sec
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(REPO_ROOT),
+            "heartbeat_epoch": _time.time(),
+        },
+    )
+    rc_ack_to = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--run-id",
+            "gate_ack_to",
+            "--cloud-dir",
+            str(cloud_dir),
+        ]
+    )
+    assert rc_ack_to == 0
+    out_ack_to = json.loads(capsys.readouterr().out)
+    assert out_ack_to["stopped_reason"] == "desktop_companion_offline"
+    assert not (ipc_dir / "req_gate_ack_to.json").exists()
+
+    # 3. Branch B: Online patrol (NOT --offline, NOT --skip-inbox), EVEN with --headless ->
+    #    unmounted cloud drive returns exit 0 + cloud_drive_unmounted (E8001)
+    rc_cloud_hl = main(
+        [
+            *common,
+            "prepare-feed",
+            "--headless",
+            "--run-id",
+            "gate_cloud_hl",
+            "--cloud-dir",
+            str(missing_cloud),
+        ]
+    )
+    assert rc_cloud_hl == 0
+    out_cloud_hl = json.loads(capsys.readouterr().out)
+    assert out_cloud_hl["ok"] is True
+    assert out_cloud_hl["stopped_reason"] == "cloud_drive_unmounted"
+    assert out_cloud_hl["error_code"] == ErrorCode.E8001_CLOUD_DRIVE_UNMOUNTED.value
+    assert not (db_path.parent / "run_states" / "gate_cloud_hl.json").exists()
+
+    # Also without --headless while companion is online: Branch B aborts BEFORE writing req_!
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(REPO_ROOT),
+            "heartbeat_epoch": _time.time(),
+        },
+    )
+    rc_cloud_gui = main(
+        [
+            *common,
+            "prepare-feed",
+            "--run-id",
+            "gate_cloud_gui",
+            "--cloud-dir",
+            str(missing_cloud),
+        ]
+    )
+    assert rc_cloud_gui == 0
+    out_cloud_gui = json.loads(capsys.readouterr().out)
+    assert out_cloud_gui["stopped_reason"] == "cloud_drive_unmounted"
+    assert not (ipc_dir / "req_gate_cloud_gui.json").exists()
+
+    # Branch B with --offline preserves offline fallback even when cloud_dir is missing
+    rc_off_cloud = main(
+        [
+            *common,
+            "prepare-feed",
+            "--offline",
+            "--headless",
+            "--run-id",
+            "gate_off_cloud",
+            "--cloud-dir",
+            str(missing_cloud),
+        ]
+    )
+    assert rc_off_cloud == 0
+    out_off_cloud = json.loads(capsys.readouterr().out)
+    assert out_off_cloud["ok"] is True
+    assert "packet" in out_off_cloud
+
+    # 4. Branch C: Companion aborts (removes lock) after ack -> desktop_companion_aborted
+    stop_abort_thread = threading.Event()
+
+    def _abort_companion_worker() -> None:
+        while not stop_abort_thread.is_set():
+            req = ipc_dir / "req_gate_abort.json"
+            if req.is_file():
+                atomic_write_json(
+                    ipc_dir / "ack_gate_abort.json",
+                    {"type": "budget_ack", "run_id": "gate_abort", "ack_epoch": _time.time()},
+                )
+                _time.sleep(0.08)
+                comp_lock.unlink(missing_ok=True)
+                return
+            _time.sleep(0.02)
+
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(REPO_ROOT),
+            "heartbeat_epoch": _time.time(),
+        },
+    )
+    t_abort = threading.Thread(target=_abort_companion_worker, daemon=True)
+    t_abort.start()
+    try:
+        rc_abort = main(
+            [
+                *common,
+                "prepare-feed",
+                "--offline",
+                "--run-id",
+                "gate_abort",
+                "--cloud-dir",
+                str(cloud_dir),
+            ]
+        )
+    finally:
+        stop_abort_thread.set()
+        t_abort.join(timeout=2.0)
+    assert rc_abort == 0
+    out_abort = json.loads(capsys.readouterr().out)
+    assert out_abort["ok"] is True
+    assert out_abort["stopped_reason"] == "desktop_companion_aborted"
+    assert not (ipc_dir / "req_gate_abort.json").exists()
+
+    # 5. Branch C: 60s (1s in test cfg) timeout after ack -> proceeds with timeout_default
+    stop_to_thread = threading.Event()
+
+    def _timeout_companion_worker() -> None:
+        while not stop_to_thread.is_set():
+            req = ipc_dir / "req_gate_timeout.json"
+            if req.is_file():
+                atomic_write_json(
+                    ipc_dir / "ack_gate_timeout.json",
+                    {"type": "budget_ack", "run_id": "gate_timeout", "ack_epoch": _time.time()},
+                )
+                return
+            _time.sleep(0.02)
+
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(REPO_ROOT),
+            "heartbeat_epoch": _time.time(),
+        },
+    )
+    t_to = threading.Thread(target=_timeout_companion_worker, daemon=True)
+    t_to.start()
+    try:
+        rc_to = main(
+            [
+                *common,
+                "prepare-feed",
+                "--offline",
+                "--skip-inbox",
+                "--run-id",
+                "gate_timeout",
+            ]
+        )
+    finally:
+        stop_to_thread.set()
+        t_to.join(timeout=2.0)
+    assert rc_to == 0
+    out_to = json.loads(capsys.readouterr().out)
+    assert out_to["ok"] is True
+    assert out_to["decision"]["source"] == "timeout_default"
+    assert out_to["budget_plan"]["max_videos"] == 100
+    assert not (ipc_dir / "req_gate_timeout.json").exists()
+    assert not (ipc_dir / "ack_gate_timeout.json").exists()
+
+    # 6. Branch C full IPC roundtrip with CompanionController (auto_default + Toast forwarding)
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg)
+    guard = CompanionInstanceGuard(
+        comp_lock,
+        workspace_root=REPO_ROOT,
+        ipc_dir=ipc_dir,
+        use_win32_mutex=False,
+    )
+    guard.acquire(mode="auto_default")
+    forwarded_toasts: list[tuple[str, str, str | None]] = []
+    ctrl = CompanionController(
+        cfg,
+        workspace_root=REPO_ROOT,
+        ipc_dir=ipc_dir,
+        companion_lock_path=comp_lock,
+        mode="auto_default",
+        guard=guard,
+        toast_dispatcher=lambda t, m, u: forwarded_toasts.append((t, m, u)) or True,
+    )
+    stop_ctrl = threading.Event()
+
+    def _ctrl_loop() -> None:
+        while not stop_ctrl.is_set():
+            ctrl.process_ipc_once()
+            _time.sleep(0.02)
+
+    t_ctrl = threading.Thread(target=_ctrl_loop, daemon=True)
+    t_ctrl.start()
+    try:
+        rc_auto = main(
+            [
+                *common,
+                "prepare-feed",
+                "--offline",
+                "--skip-inbox",
+                "--run-id",
+                "gate_auto_ok",
+            ]
+        )
+        assert rc_auto == 0
+        out_auto = json.loads(capsys.readouterr().out)
+        assert out_auto["ok"] is True
+        assert out_auto["decision"]["source"] == "companion_auto_default"
+        assert "packet" in out_auto
+
+        # commit-appreciation (without --headless) forwards high-score Toast to CompanionController!
+        resp_json = json.dumps(
+            {
+                "bv_id": "BV1drygem001",
+                "public_diary": "IPC 闭环测试完整手账正文。",
+                "private_thought": "真好听。",
+                "impression_score": 9,
+                "memory_summary": "测试 Toast 转发摘要。",
+                "continue_watching": False,
+                "recap_50chars": "已听完。",
+                "next_curiosity_keywords": [],
+                "safety_blocked": False,
+                "block_reason": None,
+            },
+            ensure_ascii=False,
+        )
+        assert (
+            main(
+                [
+                    *common,
+                    "commit-appreciation",
+                    "--run-id",
+                    "gate_auto_ok",
+                    "--bv",
+                    "BV1drygem001",
+                    "--response-json",
+                    resp_json,
+                ]
+            )
+            == 0
+        )
+        commit_out = json.loads(capsys.readouterr().out)
+        assert commit_out["toast_sent"] is True
+
+        # Wait briefly for CompanionController loop to consume toast_*.json
+        deadline = _time.monotonic() + 1.5
+        while not forwarded_toasts and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert len(forwarded_toasts) == 1
+        assert "9 分宝藏" in forwarded_toasts[0][0]
+    finally:
+        stop_ctrl.set()
+        t_ctrl.join(timeout=2.0)
+        guard.release()
+

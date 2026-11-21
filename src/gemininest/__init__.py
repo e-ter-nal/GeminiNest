@@ -29,6 +29,7 @@ from gemininest.contracts import (
     BudgetPlan,
     BudgetStatus,
     CommentItem,
+    CompanionPolicy,
     DiaryEntry,
     FetchBatchResult,
     FilterResult,
@@ -107,16 +108,30 @@ from gemininest.sync_manager import (
 _LAZY_BUDGET_UI_EXPORTS = frozenset(
     {
         "BudgetDecision",
+        "atomic_write_json",
         "budget_plan_from_dict",
         "build_budget_plan",
         "decision_from_plan",
+        "enqueue_toast_ipc",
         "notify_auth_expired",
         "notify_high_score_video",
+        "open_budget_toplevel",
         "parse_budget_ratio_input",
         "parse_positive_float_input",
         "parse_positive_int_input",
+        "probe_companion_lock",
         "prompt_startup_budget",
+        "read_json_safe",
         "send_toast_notification",
+    }
+)
+
+_LAZY_COMPANION_EXPORTS = frozenset(
+    {
+        "CompanionAlreadyRunningError",
+        "CompanionController",
+        "CompanionInstanceGuard",
+        "run_companion_app",
     }
 )
 
@@ -137,6 +152,10 @@ def __getattr__(name: str) -> object:
         from gemininest import budget_ui
 
         return getattr(budget_ui, name)
+    if name in _LAZY_COMPANION_EXPORTS:
+        from gemininest import companion
+
+        return getattr(companion, name)
     if name in _LAZY_RUNNER_EXPORTS:
         from gemininest import runner
 
@@ -158,6 +177,10 @@ __all__ = [
     "BudgetPlan",
     "BudgetStatus",
     "CommentItem",
+    "CompanionAlreadyRunningError",
+    "CompanionController",
+    "CompanionInstanceGuard",
+    "CompanionPolicy",
     "DEFAULT_CURIOSITY_MAX_SEARCHES",
     "DEFAULT_LOCAL_PERSONA_PATH",
     "DiaryEntry",

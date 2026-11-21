@@ -14,7 +14,10 @@ data/cat_memory.db-*
 data/temp/
 data/run_states/
 data/snapshots/
+data/budget_ipc/
 data/.cat.lock
+data/.companion.lock
+data/*.lock
 data/exports/
 data/album_local/
 *.m4a

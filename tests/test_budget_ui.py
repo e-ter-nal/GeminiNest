@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -12,16 +13,21 @@ import pytest
 
 import gemininest.budget_ui as budget_ui_mod
 from gemininest.budget_ui import (
+    TOAST_DEFAULT_TTL_SEC,
+    atomic_write_json,
     budget_plan_from_dict,
     build_budget_plan,
     compute_effective_allowed_ratio,
     decision_from_plan,
     notify_auth_expired,
     notify_high_score_video,
+    open_budget_toplevel,
     parse_budget_ratio_input,
     parse_positive_float_input,
     parse_positive_int_input,
+    probe_companion_lock,
     prompt_startup_budget,
+    read_json_safe,
 )
 from gemininest.config import load_config
 from gemininest.contracts import BudgetPlan, BudgetStatus
@@ -214,6 +220,16 @@ class _FakeTkModule:
             entry_overrides=self.entry_overrides,
             clear_first=self.clear_first,
         )
+        self.last_root = root
+        return root
+
+    def Toplevel(self, master: Any) -> _FakeTkRoot:  # noqa: N802
+        root = _FakeTkRoot(
+            action_plan=self.action_plan,
+            entry_overrides=self.entry_overrides,
+            clear_first=self.clear_first,
+        )
+        root.master = master  # type: ignore[attr-defined]
         self.last_root = root
         return root
 
@@ -698,3 +714,142 @@ def test_toast_notifications_threshold_headless_and_safe_fallback() -> None:
         is False
     )
     assert notify_auth_expired(cfg, notifier_factory=broken_factory) is False
+
+
+def test_open_budget_toplevel_reuses_4_condition_panel_without_second_tk(tmp_path: Path) -> None:
+    del tmp_path
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
+    tk_mod = _FakeTkModule(action_plan="confirm", entry_overrides={1: "7"})
+    master_root = _FakeTkRoot()
+    captured: list[Any] = []
+
+    win = open_budget_toplevel(
+        master_root,
+        cfg,
+        on_decision=captured.append,
+        tk_module=tk_mod,
+        monotonic_fn=lambda: 100.0,
+    )
+    assert getattr(win, "master", None) is master_root
+    # Toplevel must NEVER trigger a nested mainloop
+    assert len(win.entry_vars) == 4
+    win.entry_vars[1].set("7")
+    confirm_btn = win._find_button("确认出发")
+    assert confirm_btn is not None and confirm_btn.command is not None
+    confirm_btn.command()
+
+    assert len(captured) == 1
+    assert captured[0].source == "user_custom"
+    assert captured[0].max_videos == 7
+    assert win.destroyed is True
+    assert master_root.destroyed is False
+
+
+def test_atomic_ipc_probe_companion_lock_and_toast_forwarding(tmp_path: Path) -> None:
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
+    ipc_dir = tmp_path / "budget_ipc"
+    comp_lock = tmp_path / ".companion.lock"
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+
+    # 1. Atomic write & safe read leave zero .tmp files
+    sample = ipc_dir / "req_test.json"
+    atomic_write_json(sample, {"hello": "world", "count": 1})
+    assert read_json_safe(sample) == {"hello": "world", "count": 1}
+    assert not list(ipc_dir.glob("*.tmp"))
+
+    # 2. Companion lock probe: missing -> corrupt -> workspace mismatch -> stale -> dead PID -> online
+    assert probe_companion_lock(comp_lock)[0] is False
+    comp_lock.write_text("{corrupt", encoding="utf-8")
+    assert probe_companion_lock(comp_lock)[2] == "lock_corrupt"
+
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(tmp_path / "other_ws"),
+            "heartbeat_epoch": 1000.0,
+        },
+    )
+    assert probe_companion_lock(comp_lock, expected_workspace_root=ws_root, now_epoch=1001.0)[2] == "workspace_mismatch"
+
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(ws_root),
+            "heartbeat_epoch": 900.0,
+        },
+    )
+    assert probe_companion_lock(comp_lock, expected_workspace_root=ws_root, now_epoch=1001.0)[2] == "heartbeat_stale"
+
+    assert (
+        probe_companion_lock(
+            comp_lock,
+            expected_workspace_root=ws_root,
+            now_epoch=905.0,
+            pid_checker=lambda _pid: False,
+        )[2]
+        == "pid_dead"
+    )
+
+    atomic_write_json(
+        comp_lock,
+        {
+            "pid": os.getpid(),
+            "workspace_root": str(ws_root),
+            "heartbeat_epoch": 1000.0,
+        },
+    )
+    assert probe_companion_lock(comp_lock, expected_workspace_root=ws_root, now_epoch=1005.0)[0] is True
+
+    # 3. Toast IPC forwarding when online & not headless (120s TTL)
+    assert (
+        notify_high_score_video(
+            cfg,
+            bv_id="BV1toast0001",
+            title="好片推荐",
+            impression_score=9,
+            summary="音画俱佳",
+            headless=False,
+            ipc_dir=ipc_dir,
+            companion_lock_path=comp_lock,
+            workspace_root=ws_root,
+            now_epoch_fn=lambda: 1005.0,
+        )
+        is True
+    )
+    assert (
+        notify_auth_expired(
+            cfg,
+            detail="code=-101",
+            headless=False,
+            ipc_dir=ipc_dir,
+            companion_lock_path=comp_lock,
+            workspace_root=ws_root,
+            now_epoch_fn=lambda: 1006.0,
+        )
+        is True
+    )
+    toast_files = sorted(ipc_dir.glob("toast_*.json"))
+    assert len(toast_files) == 2
+    t0 = read_json_safe(toast_files[0])
+    assert t0 is not None
+    assert t0["expires_epoch"] - t0["created_epoch"] == pytest.approx(TOAST_DEFAULT_TTL_SEC)
+
+    # Headless still suppresses Toast IPC
+    assert (
+        notify_high_score_video(
+            cfg,
+            bv_id="BV1toast0002",
+            title="无头屏蔽",
+            impression_score=10,
+            headless=True,
+            ipc_dir=ipc_dir,
+            companion_lock_path=comp_lock,
+            workspace_root=ws_root,
+            now_epoch_fn=lambda: 1007.0,
+        )
+        is False
+    )
+    assert len(list(ipc_dir.glob("toast_*.json"))) == 2

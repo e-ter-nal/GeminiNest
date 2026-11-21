@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/badge/version-v2.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB.svg)](#user--ai-agent-通用快速部署清单quickstart-checklist)
-[![Tests](https://img.shields.io/badge/pytest-151%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-151-条单元测试)
+[![Tests](https://img.shields.io/badge/pytest-161%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-161-条单元测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -128,6 +128,7 @@ GeminiNest/
 ├── docs/
 │   └── SETUP_AND_RUNTIME.md          # v1/v2 运维部署、Antigravity 定时 Prompt 与 Web 联动手册
 ├── scripts/
+│   ├── create_companion_shortcut.py  # 一键在 Windows 桌面生成无黑框小窗启动快捷方式（支持 --dry-run）
 │   ├── download_wd_tagger.py         # wd-tagger ONNX 权重与标签 CSV 离线友好下载校验器
 │   └── inbox_gdoc_exporter.gs        # Google Apps Script 云端 .gdoc -> .txt 定时转换脚本
 ├── src/gemininest/
@@ -139,10 +140,11 @@ GeminiNest/
 │   ├── media_processor.py            # FFmpeg v1 音频裁剪 / v2 抽帧与严格帧一致净版 MP4 重封 / 用完即焚
 │   ├── safety_gate.py                # v1 Passthrough 桩 / v2 wd-tagger ONNX (DirectML/CUDA/CPU + Early-Exit)
 │   ├── agent_bridge.py               # 静态前缀缓存拼装 / Packet 打包 / JSON Schema 校验 / 账本估算
-│   ├── budget_ui.py                  # 60s 非抢占 tkinter 4 条件联合预算小窗（含清空条件/实时预览/隔离桌面快退）+ Toast
+│   ├── budget_ui.py                  # 4 条件联合上限 UI 面板（Tk/Toplevel 复用）+ 原子 IPC + 120s TTL Toast 转发
+│   ├── companion.py                  # WinSta0\Default 常驻轻量 tkinter 桌面小窗（单实例互斥锁 + 状态看板 + IPC 监听）
 │   ├── sync_manager.py               # 纯文本扩展名防火墙 + exports 独立隐藏 Git + 轮转 + inbox 补丁吸收
-│   └── runner.py                     # .cat.lock PID 锁、宿主驱动 CLI 子命令与 --dry-run 离线回放
-└── tests/                            # 151 条全离线单元测试（零网络、零真实数据触碰）
+│   └── runner.py                     # .cat.lock PID 锁、三分支启动门禁、只读 status 接口与 --dry-run 离线回放
+└── tests/                            # 全离线单元测试（零网络、零真实数据触碰）
 ```
 
 ### 2. `.gitignore` 严格屏蔽的本地私有文件（严禁提交至 Git）
@@ -155,7 +157,7 @@ GeminiNest/
 | `data/cat_memory.db`（及 `-wal`/`-shm`） | 本地 SQLite 长期记忆、世界书、观看史与 5 小时算力账本 |
 | `data/models/`（`model.onnx`、`selected_tags.csv`） | v2 `wd-tagger` 本地 ONNX 权重（约 361 MB） |
 | `data/exports/`（含内部独立 `.git/`） | 导出的纯文本手账与独立隐藏 Git 历史仓库（物理隔绝主代码库） |
-| `data/temp/`、`data/snapshots/`、`data/.cat.lock` | 两阶段用完即焚临时媒体目录、离线黑匣子快照与 PID 防撞车锁 |
+| `data/temp/`、`data/snapshots/`、`data/budget_ipc/`、`data/*.lock` | 两阶段用完即焚临时媒体目录、离线黑匣子快照、跨桌面 IPC 文件目录与 `.cat.lock` / `.companion.lock` 进程锁 |
 
 ---
 
@@ -167,7 +169,7 @@ GeminiNest/
 
 如果你正在使用 Google Antigravity、Cursor、Claude Code 等 Coding Agent，克隆仓库后可直接把下面这段话发给它：
 
-> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 151/151 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
+> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 161/161 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
 
 ---
 
@@ -235,7 +237,7 @@ Copy-Item config.local.example.json config.local.json
   - 若需启用 v2 视觉安检，按上方「热插拔切换方式」补充 `pipeline_mode: "sanitized_video"` 与 `wd_tagger_enabled: true`。
 - [ ] 确认代理分流：B 站域名（`bilibili.com`、`bilivideo.com`、`hdslb.com`）走 `DIRECT` 直连，Google / Antigravity 走单一稳定节点。
 
-### Step 4：离线验货（`--dry-run`）与 151 条单元测试
+### Step 4：离线验货（`--dry-run`）与 161 条单元测试
 
 在接入真实小号与定时任务前，先运行全离线演练与单元测试（全程使用隔离临时沙箱，**零网络请求、零额度消耗、绝不触碰真实数据库与云盘**）：
 
@@ -251,18 +253,29 @@ python -m gemininest.runner --dry-run --headless
 python -m gemininest.runner --dry-run --mode sanitized_video --headless
 ```
 
-- [ ] 运行全量离线单元测试（确认 **151/151** 全部通过）：
+- [ ] 运行全量离线单元测试（确认 **161/161** 全部通过）：
 
 ```powershell
 python -m pytest -v
 ```
 
-### Step 5：配置 Antigravity 定时巡逻与跨端云盘联动
+### Step 5：选择启动模式并配置 Antigravity 定时巡逻
 
-- [ ] 阅读 [`docs/SETUP_AND_RUNTIME.md`](docs/SETUP_AND_RUNTIME.md)，完成以下生产落地配置：
-  1. 在 Antigravity 左侧 **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴「v1 / v2 自适应通用版唤醒 Prompt」（默认不带 `--headless`，保留 60 秒非抢占 **4 条件联合上限**预算弹窗——公版默认 `max_use_ratio=0.4` / `max_videos=100` / `reserve_ratio=0.30` / `max_minutes=30`，可在 `config.local.json` 按需覆写或设为 `null` 不限；锁屏或隔离桌面自动静默兜底默认组合）；
-  2. *(可选)* 部署 [`scripts/inbox_gdoc_exporter.gs`](scripts/inbox_gdoc_exporter.gs) 至 Google Apps Script（每 15 分钟将 `inbox/` 中的 `.gdoc` 转存为同名 `.txt`）；
-  3. *(可选)* 配置 Gemini Web 端常驻 Gem 与每日 `Scheduled Actions`，实现手机/网页端与本地记忆的纯文本双向闭环。
+项目并列支持以下两种启动方式（详情与标准唤醒 Prompt 请参阅 [`docs/SETUP_AND_RUNTIME.md`](docs/SETUP_AND_RUNTIME.md)）：
+
+- **方式 ①：桌面小窗交互模式（推荐，解决隔离桌面 `exebox-*` 弹窗不可见问题）**：
+  1. 在 `gemininest` 环境下运行一键桌面快捷方式生成脚本（零黑框启动 `pythonw.exe -m gemininest.companion`）：
+     ```powershell
+     python scripts/create_companion_shortcut.py
+     # 可先追加 --dry-run 预演确认解析路径
+     ```
+  2. 双击桌面的「**GeminiNest 桌面小窝助手**」快捷方式常驻真实桌面（`WinSta0\Default`）：支持随时切换「**每次弹窗询问**」与「**自动默认值执行**」、后台异步刷新 `runner status`（当前模式 / 5h 算力 / 云盘挂载 / 手账数）、以及 120s TTL 原生 Toast 代发。
+  3. 在 Antigravity **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴 `docs/SETUP_AND_RUNTIME.md` 第 3.3 节「标准唤醒 Prompt」（默认不带 `--headless`，触发前自动执行小窗在线校验、云盘挂载门禁与跨桌面 4 条件联合预算弹窗）。
+- **方式 ②：`--headless` 纯无头自动化模式（或显式 CLI 预算覆盖）**：
+  - 无需打开桌面小窗，直接在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按配置 4 项默认值静默执行，跳过交互弹窗与 Toast），或传入 `--budget-ratio` / `--max-videos` / `--reserve-ratio` / `--max-minutes` 任意组合（未传维度本轮自动不限）；在线巡逻仍会在开跑前强制校验 Google Drive 云盘挂载状态（`require_cloud_mount_on_start: true`）。
+- ***(可选) 云端联动***：
+  1. 部署 [`scripts/inbox_gdoc_exporter.gs`](scripts/inbox_gdoc_exporter.gs) 至 Google Apps Script（每 15 分钟将 `inbox/` 中的 `.gdoc` 转存为同名 `.txt`）；
+  2. 配置 Gemini Web 端常驻 Gem 与每日 `Scheduled Actions`，实现手机/网页端与本地记忆的纯文本双向闭环。
 
 ---
 

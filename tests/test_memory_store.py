@@ -617,3 +617,20 @@ def test_curiosity_rotation_and_auto_consumption() -> None:
         assert revived.status == "active"
         assert revived.search_count == 0
         assert revived.last_searched_at is None
+
+
+def test_count_diary_entries_returns_exact_total() -> None:
+    with MemoryStore(":memory:") as store:
+        assert store.count_diary_entries() == 0
+        for idx in range(1, 5):
+            store.add_diary_entry(
+                run_id=f"run_{idx}",
+                bv_id=f"BV1diary000{idx}",
+                title=f"日记标题 {idx}",
+                impression_score=min(10, 5 + idx),
+                public_diary=f"正文 {idx}",
+                created_at=BASE_TIME + timedelta(minutes=idx),
+            )
+            assert store.count_diary_entries() == idx
+        recent_3 = store.list_recent_diary_entries(limit=3)
+        assert [d.bv_id for d in recent_3] == ["BV1diary0004", "BV1diary0003", "BV1diary0002"]

@@ -143,7 +143,11 @@
     "est_5h_window_token_capacity": 1400000,
     "token_calibration_k": 1.0,
     "lock_file_path": "data/.cat.lock",
-    "cooldown_hours_on_429": 5
+    "cooldown_hours_on_429": 5,
+    "companion_policy": "required",
+    "ipc_dir": "data/budget_ipc",
+    "ipc_ack_timeout_sec": 2.5,
+    "require_cloud_mount_on_start": true
   },
   "sync": {
     "pure_text_only": true,
