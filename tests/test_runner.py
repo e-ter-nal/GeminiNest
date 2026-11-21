@@ -1884,6 +1884,7 @@ def test_runner_status_is_strictly_readonly_and_returns_aggregated_snapshot(
     assert out_empty["cat_lock_active"] is False
     assert out_empty["active_run_count"] == 0
     assert out_empty["companion_online"] is False
+    assert out_empty["memory_count"] == 0
     assert out_empty["diary_count"] == 0
     assert out_empty["recent_diaries"] == []
     assert not db_path.exists()
@@ -1930,6 +1931,7 @@ def test_runner_status_is_strictly_readonly_and_returns_aggregated_snapshot(
     assert out_pop["cat_lock_active"] is True
     assert out_pop["active_run_count"] == 1
     assert out_pop["companion_online"] is True
+    assert out_pop["memory_count"] == 0
     assert out_pop["diary_count"] == 4
     assert [d["bv_id"] for d in out_pop["recent_diaries"]] == [
         "BV1stat0004",

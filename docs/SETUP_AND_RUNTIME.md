@@ -157,7 +157,7 @@ Copy-Item config.local.example.json config.local.json
        ```
     2. **双击桌面「GeminiNest 桌面小窝助手」**（或运行 `pythonw -m gemininest.companion`）：常驻轻量 `tkinter` 小窗在 `WinSta0\Default` 监听 `data/budget_ipc/`，不持有 `.cat.lock`、不并发写库，后台线程定时调用只读 `python -m gemininest.runner status` 刷新 **当前管线模式、5h 窗口算力、云盘挂载、手账总数与最新时间**。
     3. **小窗运行策略单选切换**：
-       * **「每次弹窗询问」**（默认）：收到巡逻请求时以 `tk.Toplevel` 非抢占弹出 60 秒 **4 条件联合上限**确认窗（含实时预览、清空条件、确认出发、今日休息），支持小窗最小化到任务栏并在高分/失效时通过 `winotify` 代发 120s TTL 原生 Toast；
+       * **「每次弹窗询问」**（默认）：收到巡逻请求时以 `tk.Toplevel` 非抢占弹出 60 秒 **4 条件联合上限**确认窗（含实时预览、清空条件、确认出发、今日休息），支持点击「收进托盘」或最小化将其收纳至 Windows 系统托盘「显示隐藏的图标」（左键恢复、右键提供打开面板/刷新/切换模式/退出菜单），并在高分/失效时通过 `winotify` 代发 120s TTL 原生 Toast；
        * **「自动默认值执行」**：收到请求后不弹窗，立即按配置 4 项默认值回传继续巡逻。
     4. **三分支启动门禁（`config.json` `budget_and_runtime`）**：
        * `companion_policy: "required"`（默认）：未传 `--headless` 且未传 CLI 预算参数时，先校验 `data/.companion.lock` 存活与 `ack` 握手（`ipc_ack_timeout_sec: 2.5`），未启动小窗则**退出码 0** 返回 `stopped_reason: "desktop_companion_offline"`；等待确认中途用户点「退出」小窗则返回 `stopped_reason: "desktop_companion_aborted"`；60s 超时按配置 4 项默认值继续。

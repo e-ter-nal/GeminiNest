@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+try:
+    import ctypes.wintypes as wintypes
+except Exception:  # noqa: BLE001
+    wintypes = None  # type: ignore[assignment]
 import hashlib
 import json
 import logging
@@ -60,6 +64,7 @@ __all__ = [
     "CompanionController",
     "CompanionInstanceGuard",
     "CompanionMode",
+    "Win32TrayIcon",
     "build_companion_mutex_name",
     "main",
     "resolve_cli_python_executable",
@@ -690,6 +695,435 @@ class CompanionController:
         self._in_flight_popups.clear()
 
 
+def _resolve_companion_icon_path(workspace_root: Path | None = None) -> Path | None:
+    """Locate `assets/gemininest.ico` relative to workspace root or package location."""
+    candidates: list[Path] = []
+    if workspace_root is not None:
+        candidates.append(Path(workspace_root) / "assets" / "gemininest.ico")
+    candidates.append(Path(__file__).resolve().parents[2] / "assets" / "gemininest.ico")
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+class Win32TrayIcon:
+    """Pure-stdlib Win32 system tray icon running on a background daemon message loop."""
+
+    _WM_NULL = 0x0000
+    _WM_DESTROY = 0x0002
+    _WM_CLOSE = 0x0010
+    _WM_COMMAND = 0x0111
+    _WM_USER = 0x0400
+    _WM_TRAYICON = _WM_USER + 20
+    _WM_LBUTTONUP = 0x0202
+    _WM_LBUTTONDBLCLK = 0x0203
+    _WM_RBUTTONUP = 0x0205
+    _WM_CONTEXTMENU = 0x007B
+
+    _NIM_ADD = 0x00000000
+    _NIM_DELETE = 0x00000002
+    _NIF_MESSAGE = 0x00000001
+    _NIF_ICON = 0x00000002
+    _NIF_TIP = 0x00000004
+
+    _IMAGE_ICON = 1
+    _LR_LOADFROMFILE = 0x00000010
+    _LR_DEFAULTSIZE = 0x00000040
+    _IDI_APPLICATION = 32512
+
+    _MF_STRING = 0x00000000
+    _MF_SEPARATOR = 0x00000800
+    _TPM_LEFTALIGN = 0x0000
+    _TPM_BOTTOMALIGN = 0x0020
+    _TPM_RIGHTBUTTON = 0x0002
+
+    _ID_TRAY_SHOW = 1001
+    _ID_TRAY_REFRESH = 1002
+    _ID_TRAY_TOGGLE_MODE = 1003
+    _ID_TRAY_EXIT = 1004
+
+    def __init__(
+        self,
+        *,
+        action_queue: queue.Queue[str],
+        icon_path: Path | None = None,
+        tooltip: str = "GeminiNest 桌面小窝助手",
+    ) -> None:
+        self.action_queue = action_queue
+        self.icon_path = Path(icon_path) if icon_path is not None else None
+        self.tooltip = tooltip
+        self._thread: threading.Thread | None = None
+        self._started_event = threading.Event()
+        self._ready = False
+        self._stop_requested = False
+        self._hwnd: Any = None
+        self._wndproc_ref: Any = None
+        self._notify_cls: Any = None
+        self._hicon: Any = None
+        self._owns_hicon = False
+        self._nid_active = False
+
+    def start(self, timeout_sec: float = 2.0) -> bool:
+        """Start the tray message pump in a daemon thread; returns False on non-Win32 or error."""
+        if sys.platform != "win32" or wintypes is None:
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return self._ready
+        self._stop_requested = False
+        self._started_event.clear()
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="gemininest-win32-tray",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started_event.wait(timeout=max(0.2, float(timeout_sec)))
+        return self._ready
+
+    def stop(self) -> None:
+        """Remove the tray icon and shut down the hidden message window cleanly."""
+        self._stop_requested = True
+        hwnd = self._hwnd
+        if hwnd is not None and sys.platform == "win32":
+            try:
+                ctypes.windll.user32.PostMessageW(hwnd, self._WM_CLOSE, 0, 0)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._thread = None
+
+    def _build_nid(self, hwnd: Any, hicon: Any) -> Any:
+        nid = self._notify_cls()
+        nid.cbSize = ctypes.sizeof(self._notify_cls)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = self._NIF_MESSAGE | self._NIF_ICON | self._NIF_TIP
+        nid.uCallbackMessage = self._WM_TRAYICON
+        nid.hIcon = hicon
+        nid.szTip = self.tooltip[:127]
+        return nid
+
+    def _delete_tray_icon(self, shell32: Any, hwnd: Any) -> None:
+        if not self._nid_active:
+            return
+        self._nid_active = False
+        try:
+            nid = self._notify_cls()
+            nid.cbSize = ctypes.sizeof(self._notify_cls)
+            nid.hWnd = hwnd
+            nid.uID = 1
+            shell32.Shell_NotifyIconW(self._NIM_DELETE, ctypes.byref(nid))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _show_context_menu(self, user32: Any, hwnd: Any) -> None:
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_SHOW, "打开主面板")
+            user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_REFRESH, "立即刷新状态")
+            user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_TOGGLE_MODE, "切换运行模式")
+            user32.AppendMenuW(menu, self._MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_EXIT, "退出")
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetForegroundWindow(hwnd)
+            user32.TrackPopupMenu(
+                menu,
+                self._TPM_LEFTALIGN | self._TPM_BOTTOMALIGN | self._TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                None,
+            )
+            user32.PostMessageW(hwnd, self._WM_NULL, 0, 0)
+        finally:
+            user32.DestroyMenu(menu)
+
+    def _thread_main(self) -> None:
+        if wintypes is None:
+            self._started_event.set()
+            return
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+
+        lresult_t = ctypes.c_ssize_t
+        hicon_t = ctypes.c_void_p
+        hcursor_t = ctypes.c_void_p
+        hbrush_t = ctypes.c_void_p
+        hmenu_t = ctypes.c_void_p
+        hwnd_t = wintypes.HWND
+        wparam_t = wintypes.WPARAM
+        lparam_t = wintypes.LPARAM
+        wndproc_t = ctypes.WINFUNCTYPE(lresult_t, hwnd_t, wintypes.UINT, wparam_t, lparam_t)
+
+        class _WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", wndproc_t),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", hicon_t),
+                ("hCursor", hcursor_t),
+                ("hBrush", hbrush_t),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+                ("hIconSm", hicon_t),
+            ]
+
+        class _NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", hwnd_t),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", hicon_t),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+            ]
+
+        self._notify_cls = _NOTIFYICONDATAW
+
+        user32.DefWindowProcW.argtypes = [hwnd_t, wintypes.UINT, wparam_t, lparam_t]
+        user32.DefWindowProcW.restype = lresult_t
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+        user32.RegisterClassExW.restype = wintypes.ATOM
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.UnregisterClassW.restype = wintypes.BOOL
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            hwnd_t,
+            hmenu_t,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = hwnd_t
+        user32.DestroyWindow.argtypes = [hwnd_t]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [hwnd_t, wintypes.UINT, wparam_t, lparam_t]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG),
+            hwnd_t,
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = lresult_t
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.PostQuitMessage.restype = None
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        user32.LoadIconW.restype = hicon_t
+        user32.DestroyIcon.argtypes = [hicon_t]
+        user32.DestroyIcon.restype = wintypes.BOOL
+        user32.CreatePopupMenu.argtypes = []
+        user32.CreatePopupMenu.restype = hmenu_t
+        user32.AppendMenuW.argtypes = [hmenu_t, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+        user32.AppendMenuW.restype = wintypes.BOOL
+        user32.DestroyMenu.argtypes = [hmenu_t]
+        user32.DestroyMenu.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [hwnd_t]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.TrackPopupMenu.argtypes = [
+            hmenu_t,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            hwnd_t,
+            wintypes.LPVOID,
+        ]
+        user32.TrackPopupMenu.restype = wintypes.BOOL
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterWindowMessageW.restype = wintypes.UINT
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+
+        hinst = kernel32.GetModuleHandleW(None)
+        class_name = f"GeminiNestTrayClass_{id(self)}_{os.getpid()}"
+        taskbar_created_msg = user32.RegisterWindowMessageW("TaskbarCreated")
+
+        hicon: Any = None
+        owns_hicon = False
+        if self.icon_path is not None and self.icon_path.is_file():
+            loaded = user32.LoadImageW(
+                None,
+                str(self.icon_path),
+                self._IMAGE_ICON,
+                0,
+                0,
+                self._LR_LOADFROMFILE | self._LR_DEFAULTSIZE,
+            )
+            if loaded:
+                hicon = loaded
+                owns_hicon = True
+        if not hicon:
+            hicon = user32.LoadIconW(
+                None,
+                ctypes.cast(ctypes.c_void_p(self._IDI_APPLICATION), wintypes.LPCWSTR),
+            )
+        self._hicon = hicon
+        self._owns_hicon = owns_hicon
+
+        cmd_map = {
+            self._ID_TRAY_SHOW: "show",
+            self._ID_TRAY_REFRESH: "refresh",
+            self._ID_TRAY_TOGGLE_MODE: "toggle_mode",
+            self._ID_TRAY_EXIT: "exit",
+        }
+
+        def _wnd_proc(hwnd: Any, msg: int, wparam: int, lparam: int) -> int:
+            if msg == self._WM_TRAYICON:
+                event = lparam & 0xFFFF
+                if event in (self._WM_LBUTTONUP, self._WM_LBUTTONDBLCLK):
+                    self.action_queue.put("show")
+                elif event in (self._WM_RBUTTONUP, self._WM_CONTEXTMENU):
+                    self._show_context_menu(user32, hwnd)
+                return 0
+            if msg == self._WM_COMMAND:
+                action = cmd_map.get(wparam & 0xFFFF)
+                if action is not None:
+                    self.action_queue.put(action)
+                return 0
+            if taskbar_created_msg and msg == taskbar_created_msg:
+                try:
+                    nid = self._build_nid(hwnd, self._hicon)
+                    if shell32.Shell_NotifyIconW(self._NIM_ADD, ctypes.byref(nid)):
+                        self._nid_active = True
+                except Exception:  # noqa: BLE001
+                    pass
+                return 0
+            if msg == self._WM_CLOSE:
+                self._delete_tray_icon(shell32, hwnd)
+                user32.DestroyWindow(hwnd)
+                return 0
+            if msg == self._WM_DESTROY:
+                self._delete_tray_icon(shell32, hwnd)
+                user32.PostQuitMessage(0)
+                return 0
+            return int(user32.DefWindowProcW(hwnd, msg, wparam, lparam))
+
+        wndproc_cb = wndproc_t(_wnd_proc)
+        self._wndproc_ref = wndproc_cb
+
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wc.lpfnWndProc = wndproc_cb
+        wc.hInstance = hinst
+        wc.hIcon = hicon
+        wc.hIconSm = hicon
+        wc.lpszClassName = class_name
+
+        atom = user32.RegisterClassExW(ctypes.byref(wc))
+        if not atom:
+            if owns_hicon and hicon:
+                user32.DestroyIcon(hicon)
+            self._started_event.set()
+            return
+
+        hwnd = None
+        try:
+            hwnd = user32.CreateWindowExW(
+                0,
+                class_name,
+                "GeminiNestTrayMsg",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            self._hwnd = hwnd
+            if hwnd:
+                nid = self._build_nid(hwnd, hicon)
+                self._nid_active = bool(shell32.Shell_NotifyIconW(self._NIM_ADD, ctypes.byref(nid)))
+                self._ready = self._nid_active
+            self._started_event.set()
+            if not hwnd or self._stop_requested:
+                if hwnd:
+                    self._delete_tray_icon(shell32, hwnd)
+                    user32.DestroyWindow(hwnd)
+                return
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Win32TrayIcon loop error: %s", exc)
+            self._started_event.set()
+        finally:
+            if hwnd:
+                self._delete_tray_icon(shell32, hwnd)
+            self._hwnd = None
+            try:
+                user32.UnregisterClassW(class_name, hinst)
+            except Exception:  # noqa: BLE001
+                pass
+            if owns_hicon and hicon:
+                try:
+                    user32.DestroyIcon(hicon)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._hicon = None
+
+
+def _format_bucket_start_local(window_bucket: str) -> str:
+    raw = str(window_bucket or "").strip()
+    if not raw:
+        return ""
+    ts_part = raw[:-3] if raw.endswith("_5h") else raw
+    try:
+        dt = datetime.fromisoformat(ts_part.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _format_status_snapshot(data: Mapping[str, Any]) -> dict[str, str]:
     if not data.get("ok"):
         err = str(data.get("error") or data.get("message") or "状态暂不可用")
@@ -709,8 +1143,10 @@ def _format_status_snapshot(data: Mapping[str, Any]) -> dict[str, str]:
     used_pct = float(data.get("used_ratio") or 0.0) * 100.0
     in_cooldown = bool(data.get("in_cooldown", False))
     cooldown_tag = " [429 冷却中]" if in_cooldown else ""
+    bucket_local = _format_bucket_start_local(str(data.get("window_bucket") or ""))
+    window_prefix = f"本 5h 窗口（{bucket_local} 起）" if bucket_local else "5h 窗口算力"
     window_line = (
-        f"5h 窗口算力：已用 {used_pct:.1f}%（{used_tok:,} / {cap_tok:,}）"
+        f"{window_prefix}：已用 {used_pct:.1f}%（{used_tok:,} / {cap_tok:,}）"
         f"｜ 剩余 {rem_tok:,}{cooldown_tag}"
     )
 
@@ -722,6 +1158,7 @@ def _format_status_snapshot(data: Mapping[str, Any]) -> dict[str, str]:
     cloud_line = f"云盘：{cloud_text} ｜ 后端状态：{patrol_text}"
 
     diary_count = int(data.get("diary_count") or 0)
+    raw_mem_count = data.get("memory_count")
     recent = data.get("recent_diaries")
     latest_time = "暂无记录"
     latest_title = ""
@@ -733,7 +1170,11 @@ def _format_status_snapshot(data: Mapping[str, Any]) -> dict[str, str]:
             raw_title = str(first.get("title") or "").strip()
             if raw_title:
                 latest_title = f"《{raw_title[:22]}》"
-    diary_line = f"手账总数：{diary_count} 篇 ｜ 最新：{latest_time} {latest_title}".strip()
+    if raw_mem_count is not None:
+        diary_prefix = f"手账：{diary_count} 篇（累计记忆 {int(raw_mem_count)} 条）"
+    else:
+        diary_prefix = f"手账总数：{diary_count} 篇"
+    diary_line = f"{diary_prefix} ｜ 最新：{latest_time} {latest_title}".strip()
 
     return {
         "mode_line": f"当前管线模式：{mode_desc}",
@@ -758,6 +1199,7 @@ def run_companion_app(
     status_refresh_sec: float = _DEFAULT_STATUS_REFRESH_SEC,
     tk_module: Any = None,
     use_win32_mutex: bool = True,
+    use_win32_tray: bool | None = None,
     now_epoch_fn: Callable[[], float] = time.time,
     monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> int:
@@ -794,7 +1236,7 @@ def run_companion_app(
                 err_root.withdraw()
                 messagebox.showinfo(
                     "GeminiNest 桌面小窝助手",
-                    "GeminiNest 桌面小窝助手已经在运行中（请查看任务栏窗口）。",
+                    "GeminiNest 桌面小窝助手已经在运行中（请查看系统托盘“显示隐藏的图标”或桌面窗口）。",
                 )
                 err_root.destroy()
             except Exception:  # noqa: BLE001
@@ -809,6 +1251,24 @@ def run_companion_app(
     else:
         tk = tk_module
 
+    icon_path = _resolve_companion_icon_path(ws_root)
+    eff_tray = (tk_module is None and sys.platform == "win32") if use_win32_tray is None else bool(use_win32_tray)
+    tray_action_queue: queue.Queue[str] = queue.Queue()
+    tray: Win32TrayIcon | None = (
+        Win32TrayIcon(action_queue=tray_action_queue, icon_path=icon_path)
+        if eff_tray
+        else None
+    )
+    tray_ready = False
+    if tray is not None:
+        try:
+            tray_ready = tray.start()
+        except Exception:  # noqa: BLE001
+            tray_ready = False
+        if not tray_ready:
+            tray.stop()
+            tray = None
+
     root: Any = None
     controller: CompanionController | None = None
     shutting_down = {"flag": False}
@@ -817,6 +1277,12 @@ def run_companion_app(
         root = tk.Tk()
         root.title("GeminiNest 桌面小窝助手")
         root.resizable(False, False)
+        iconbitmap_fn = getattr(root, "iconbitmap", None)
+        if callable(iconbitmap_fn) and icon_path is not None and icon_path.is_file():
+            try:
+                iconbitmap_fn(str(icon_path))
+            except Exception:  # noqa: BLE001
+                pass
 
         def _launch_toplevel_popup(
             req_data: dict[str, Any],
@@ -860,7 +1326,7 @@ def run_companion_app(
             text="GeminiNest 桌面常驻助手（WinSta0\\Default）",
             font=("Microsoft YaHei UI", 10, "bold"),
             anchor="w",
-            wraplength=460,
+            wraplength=540,
         ).pack(fill="x", pady=(0, 6))
 
         mode_var = tk.StringVar(value="当前管线模式：正在读取状态...")
@@ -882,7 +1348,7 @@ def run_companion_app(
                 justify="left",
                 anchor="w",
                 fg=color,
-                wraplength=460,
+                wraplength=540,
             ).pack(fill="x", pady=2)
 
         sep = tk.Frame(frame, height=1, bg="#d0d0d0")
@@ -930,6 +1396,8 @@ def run_companion_app(
                 ipc_var.set(f"正在等待预算弹窗确认：{', '.join(active)}")
             elif controller.mode == "auto_default":
                 ipc_var.set("运行模式：自动默认值执行（收到巡逻请求将秒回默认 4 条件）")
+            elif tray_ready:
+                ipc_var.set("运行模式：每次弹窗询问（IPC 监听就绪，可最小化到系统托盘）")
             else:
                 ipc_var.set("运行模式：每次弹窗询问（IPC 监听就绪，可最小化到任务栏）")
 
@@ -943,10 +1411,59 @@ def run_companion_app(
                 ipc_var.set("正在后台刷新状态...")
                 controller.trigger_status_refresh_async()
 
+        def _hide_to_tray() -> None:
+            if shutting_down["flag"] or root is None:
+                return
+            if tray_ready:
+                withdraw_fn = getattr(root, "withdraw", None)
+                if callable(withdraw_fn):
+                    try:
+                        withdraw_fn()
+                        return
+                    except Exception:  # noqa: BLE001
+                        pass
+            iconify_fn = getattr(root, "iconify", None)
+            if callable(iconify_fn):
+                try:
+                    iconify_fn()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _restore_from_tray() -> None:
+            if shutting_down["flag"] or root is None:
+                return
+            for fn_name, fn_args in (
+                ("deiconify", ()),
+                ("state", ("normal",)),
+                ("lift", ()),
+                ("focus_force", ()),
+            ):
+                fn = getattr(root, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn(*fn_args)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        def _on_unmap(event: Any = None) -> None:
+            if shutting_down["flag"] or not tray_ready or root is None:
+                return
+            if event is not None and getattr(event, "widget", root) is not root:
+                return
+            state_fn = getattr(root, "state", None)
+            if callable(state_fn):
+                try:
+                    if str(state_fn()) == "iconic":
+                        root.after(10, _hide_to_tray)
+                except Exception:  # noqa: BLE001
+                    pass
+
         def _on_exit() -> None:
             if shutting_down["flag"]:
                 return
             shutting_down["flag"] = True
+            if tray is not None:
+                tray.stop()
             if controller is not None:
                 controller.close_in_flight_popups()
             guard.release()
@@ -956,15 +1473,30 @@ def run_companion_app(
                 pass
 
         btn_row = tk.Frame(frame)
-        btn_row.pack(fill="x", pady=(4, 0))
-        tk.Button(btn_row, text="立即刷新", width=12, command=_on_manual_refresh).pack(
-            side="left", padx=(0, 8)
+        btn_row.pack(fill="x", pady=(8, 2))
+        tk.Button(
+            btn_row, text="立即刷新", padx=12, pady=3, command=_on_manual_refresh
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="收进托盘" if tray_ready else "最小化",
+            padx=12,
+            pady=3,
+            command=_hide_to_tray,
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="退出", padx=12, pady=3, command=_on_exit).pack(
+            side="right"
         )
-        tk.Button(btn_row, text="退出", width=12, command=_on_exit).pack(side="right")
 
         root.protocol("WM_DELETE_WINDOW", _on_exit)
+        bind_fn = getattr(root, "bind", None)
+        if callable(bind_fn) and tray_ready:
+            try:
+                bind_fn("<Unmap>", _on_unmap)
+            except Exception:  # noqa: BLE001
+                pass
 
-        # Adaptive high-DPI sizing & clean screen placement
+        # Adaptive high-DPI sizing & clean screen placement (position-only geometry prevents clipped buttons)
         update_idle = getattr(root, "update_idletasks", None)
         if callable(update_idle):
             try:
@@ -978,14 +1510,20 @@ def run_companion_app(
             req_h = int(req_h_fn()) if callable(req_h_fn) else 0
         except Exception:  # noqa: BLE001
             req_w, req_h = 0, 0
-        width = max(480, req_w + 16)
-        height = max(270, req_h + 16)
+        width = max(580, req_w + 24)
+        height = max(320, req_h + 24)
+        minsize_fn = getattr(root, "minsize", None)
+        if callable(minsize_fn):
+            try:
+                minsize_fn(width, height)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             screen_w = int(root.winfo_screenwidth())
             screen_h = int(root.winfo_screenheight())
             pos_x = max(20, screen_w - width - 36)
             pos_y = max(20, screen_h - height - 80)
-            root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+            root.geometry(f"+{pos_x}+{pos_y}")
         except Exception:  # noqa: BLE001
             root.geometry(f"{width}x{height}")
 
@@ -999,6 +1537,26 @@ def run_companion_app(
             if shutting_down["flag"] or controller is None:
                 return
             try:
+                while True:
+                    try:
+                        tray_cmd = tray_action_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if tray_cmd == "show":
+                        _restore_from_tray()
+                    elif tray_cmd == "refresh":
+                        _on_manual_refresh()
+                    elif tray_cmd == "toggle_mode":
+                        next_mode: CompanionMode = (
+                            "ask" if controller.mode == "auto_default" else "auto_default"
+                        )
+                        run_mode_var.set(next_mode)
+                        controller.set_mode(next_mode)
+                        _update_ipc_banner()
+                    elif tray_cmd == "exit":
+                        _on_exit()
+                        return
+
                 controller.process_ipc_once()
                 while True:
                     try:
@@ -1027,6 +1585,8 @@ def run_companion_app(
         return 0
     finally:
         shutting_down["flag"] = True
+        if tray is not None:
+            tray.stop()
         if controller is not None:
             controller.close_in_flight_popups()
         guard.release()

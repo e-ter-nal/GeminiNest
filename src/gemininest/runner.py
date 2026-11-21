@@ -2226,6 +2226,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     with store_cm as store:
         window_status = store.get_budget_status(allowed_ratio=1.0)
+        memory_count = store.count_memories()
         diary_count = store.count_diary_entries()
         recent_entries = store.list_recent_diary_entries(limit=3)
 
@@ -2283,6 +2284,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "active_run_count": active_run_count,
             "companion_online": companion_online,
             "companion_status": companion_status,
+            "memory_count": memory_count,
             "diary_count": diary_count,
             "recent_diaries": recent_diaries,
         },

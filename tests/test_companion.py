@@ -386,6 +386,7 @@ def test_run_companion_app_single_tk_toplevel_radio_switch_and_clean_exit(
         lambda self: {
             "ok": True,
             "pipeline_mode": "audio_only",
+            "window_bucket": "2026-11-21T05:00:00Z_5h",
             "used_tokens": 14000,
             "capacity_tokens": 1400000,
             "used_ratio": 0.01,
@@ -394,6 +395,7 @@ def test_run_companion_app_single_tk_toplevel_radio_switch_and_clean_exit(
             "cloud_mounted": True,
             "cat_lock_active": False,
             "active_run_count": 0,
+            "memory_count": 7,
             "diary_count": 5,
             "recent_diaries": [{"created_at": "2026-11-21T06:00:00Z", "title": "测试日记"}],
         },
@@ -407,6 +409,7 @@ def test_run_companion_app_single_tk_toplevel_radio_switch_and_clean_exit(
         workspace_root=ws_root,
         tk_module=tk_mod,
         use_win32_mutex=False,
+        use_win32_tray=False,
     )
     assert rc == 0
     # Strict single Tk() rule
@@ -415,6 +418,228 @@ def test_run_companion_app_single_tk_toplevel_radio_switch_and_clean_exit(
     assert tk_mod.toplevels[0].master is tk_mod.root
     assert tk_mod.root is not None and tk_mod.root.destroyed is True
     assert not comp_lock.exists()
+
+
+def test_format_status_snapshot_displays_window_bucket_and_memory_count() -> None:
+    from gemininest.companion import _format_status_snapshot, _resolve_companion_icon_path
+
+    rendered = _format_status_snapshot(
+        {
+            "ok": True,
+            "pipeline_mode": "sanitized_video",
+            "window_bucket": "2026-11-21T05:00:00Z_5h",
+            "used_tokens": 0,
+            "capacity_tokens": 1_400_000,
+            "used_ratio": 0.0,
+            "remaining_tokens": 1_400_000,
+            "in_cooldown": False,
+            "cloud_mounted": True,
+            "cat_lock_active": False,
+            "active_run_count": 0,
+            "memory_count": 7,
+            "diary_count": 0,
+            "recent_diaries": [],
+        }
+    )
+    assert "本 5h 窗口（" in rendered["window_line"]
+    assert "起）" in rendered["window_line"]
+    assert "手账：0 篇（累计记忆 7 条）" in rendered["diary_line"]
+
+    icon_path = _resolve_companion_icon_path(REPO_ROOT)
+    assert icon_path is not None and icon_path.is_file()
+    assert icon_path.name == "gemininest.ico"
+
+
+def test_companion_tray_action_queue_and_minimize_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gemininest.companion as comp_mod
+
+    ws_root = tmp_path / "ws_tray"
+    ws_root.mkdir()
+    local_cfg = tmp_path / "local.json"
+    local_cfg.write_text("{}", encoding="utf-8")
+    comp_lock = tmp_path / ".companion.lock"
+    ipc_dir = tmp_path / "ipc"
+
+    monkeypatch.setattr(
+        CompanionController,
+        "fetch_status_once",
+        lambda self: {"ok": True, "pipeline_mode": "audio_only"},
+    )
+
+    events: list[str] = []
+
+    class _FakeTray:
+        def __init__(self, *, action_queue: Any, icon_path: Any = None, tooltip: str = "") -> None:
+            self.action_queue = action_queue
+            self.icon_path = icon_path
+            events.append("tray_init")
+
+        def start(self) -> bool:
+            events.append("tray_start")
+            return True
+
+        def stop(self) -> None:
+            events.append("tray_stop")
+
+    monkeypatch.setattr(comp_mod, "Win32TrayIcon", _FakeTray)
+
+    class _FakeVar:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _FakeWidget:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def pack(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+    fake_tray_ref: list[_FakeTray] = []
+    orig_init = _FakeTray.__init__
+
+    def _capture_init(self: _FakeTray, **kwargs: Any) -> None:
+        orig_init(self, **kwargs)
+        fake_tray_ref.append(self)
+
+    monkeypatch.setattr(_FakeTray, "__init__", _capture_init)
+
+    class _FakeRoot:
+        def __init__(self) -> None:
+            self.after_callbacks: list[Any] = []
+            self.buttons: list[tuple[str, Any]] = []
+            self.bindings: dict[str, Any] = {}
+            self.withdrawn = False
+            self.deiconified = False
+            self.destroyed = False
+            self._state = "normal"
+
+        def title(self, _t: str) -> None:
+            pass
+
+        def resizable(self, _a: bool, _b: bool) -> None:
+            pass
+
+        def iconbitmap(self, path: str) -> None:
+            events.append(f"icon:{Path(path).name}")
+
+        def minsize(self, w: int, h: int) -> None:
+            assert w >= 580 and h >= 320
+
+        def winfo_reqwidth(self) -> int:
+            return 520
+
+        def winfo_reqheight(self) -> int:
+            return 280
+
+        def winfo_screenwidth(self) -> int:
+            return 1920
+
+        def winfo_screenheight(self) -> int:
+            return 1080
+
+        def geometry(self, g: str) -> None:
+            assert g.startswith("+"), f"Expected position-only geometry, got {g}"
+
+        def update_idletasks(self) -> None:
+            pass
+
+        def protocol(self, _name: str, _cb: Any) -> None:
+            pass
+
+        def bind(self, seq: str, cb: Any) -> None:
+            self.bindings[seq] = cb
+
+        def state(self, new_state: str | None = None) -> str:
+            if new_state is not None:
+                self._state = new_state
+            return self._state
+
+        def withdraw(self) -> None:
+            self.withdrawn = True
+
+        def deiconify(self) -> None:
+            self.deiconified = True
+
+        def lift(self) -> None:
+            pass
+
+        def focus_force(self) -> None:
+            pass
+
+        def after(self, _ms: int, cb: Any) -> None:
+            self.after_callbacks.append(cb)
+
+        def destroy(self) -> None:
+            self.destroyed = True
+
+        def mainloop(self) -> None:
+            tray_btn = next(cb for text, cb in self.buttons if text == "收进托盘")
+            tray_btn()
+            assert self.withdrawn is True
+
+            assert fake_tray_ref
+            fake_tray_ref[0].action_queue.put("show")
+            fake_tray_ref[0].action_queue.put("toggle_mode")
+            tick = self.after_callbacks.pop(0)
+            tick()
+            assert self.deiconified is True
+            assert comp_lock.is_file()
+            lock_data = json.loads(comp_lock.read_text(encoding="utf-8"))
+            assert lock_data["mode"] == "auto_default"
+
+            fake_tray_ref[0].action_queue.put("exit")
+            tick2 = self.after_callbacks.pop(0)
+            tick2()
+            assert self.destroyed is True
+
+    class _FakeTkMod:
+        TclError = RuntimeError
+
+        def __init__(self) -> None:
+            self.root = _FakeRoot()
+
+        def Tk(self) -> _FakeRoot:  # noqa: N802
+            return self.root
+
+        def Frame(self, *_a: Any, **_kw: Any) -> _FakeWidget:  # noqa: N802
+            return _FakeWidget()
+
+        def Label(self, *_a: Any, **_kw: Any) -> _FakeWidget:  # noqa: N802
+            return _FakeWidget()
+
+        def StringVar(self, value: str = "") -> _FakeVar:  # noqa: N802
+            return _FakeVar(value=value)
+
+        def Button(self, *_a: Any, **kw: Any) -> _FakeWidget:  # noqa: N802
+            self.root.buttons.append((kw.get("text", ""), kw.get("command")))
+            return _FakeWidget()
+
+        def Radiobutton(self, *_a: Any, **_kw: Any) -> _FakeWidget:  # noqa: N802
+            return _FakeWidget()
+
+    rc = run_companion_app(
+        config_path=REPO_CONFIG_PATH,
+        local_config_path=local_cfg,
+        companion_lock_path=comp_lock,
+        ipc_dir=ipc_dir,
+        workspace_root=ws_root,
+        tk_module=_FakeTkMod(),
+        use_win32_mutex=False,
+        use_win32_tray=True,
+    )
+    assert rc == 0
+    assert "tray_init" in events
+    assert "tray_start" in events
+    assert "tray_stop" in events
 
 
 def test_create_companion_shortcut_dry_run_resolves_paths_without_hardcoding(
@@ -450,6 +675,7 @@ def test_create_companion_shortcut_dry_run_resolves_paths_without_hardcoding(
     assert Path(out["working_directory"]) == REPO_ROOT.resolve()
     assert Path(out["target_path"]) == fake_pythonw.resolve()
     assert Path(out["shortcut_path"]) == custom_out.resolve()
+    assert Path(out["icon_path"]) == (REPO_ROOT / "assets" / "gemininest.ico").resolve()
     assert "PYTHONPATH" in out["arguments"]
     assert "gemininest.companion" in out["arguments"]
     assert not custom_out.exists()

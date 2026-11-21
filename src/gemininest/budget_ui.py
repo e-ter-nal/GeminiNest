@@ -1200,6 +1200,13 @@ def _populate_budget_window(
 
     window.title("GeminiNest 启动预算确认（4 条件联合上限）")
     window.resizable(False, False)
+    icon_candidate = Path(__file__).resolve().parents[2] / "assets" / "gemininest.ico"
+    iconbitmap_fn = getattr(window, "iconbitmap", None)
+    if callable(iconbitmap_fn) and icon_candidate.is_file():
+        try:
+            iconbitmap_fn(str(icon_candidate))
+        except Exception:  # noqa: BLE001
+            pass
 
     frame = tk.Frame(window, padx=16, pady=12)
     frame.pack(fill="both", expand=True)
@@ -1445,14 +1452,14 @@ def _populate_budget_window(
         _finish(plan, "timeout_default")
 
     btn_row = tk.Frame(frame)
-    btn_row.pack(fill="x", pady=(4, 0))
-    tk.Button(btn_row, text="确认出发", width=12, command=_on_confirm).pack(
+    btn_row.pack(fill="x", pady=(8, 2))
+    tk.Button(btn_row, text="确认出发", padx=12, pady=3, command=_on_confirm).pack(
         side="left", padx=(0, 8)
     )
-    tk.Button(btn_row, text="清空条件", width=12, command=_on_clear).pack(
+    tk.Button(btn_row, text="清空条件", padx=12, pady=3, command=_on_clear).pack(
         side="left", padx=(0, 8)
     )
-    tk.Button(btn_row, text="今日休息", width=12, command=_on_rest).pack(side="right")
+    tk.Button(btn_row, text="今日休息", padx=12, pady=3, command=_on_rest).pack(side="right")
 
     window.protocol("WM_DELETE_WINDOW", _on_close)
 
@@ -1471,15 +1478,21 @@ def _populate_budget_window(
         req_h = int(req_h_fn()) if callable(req_h_fn) else 0
     except Exception:  # noqa: BLE001
         req_w, req_h = 0, 0
-    width = max(540, req_w + 16)
-    height = max(415, req_h + 16)
+    width = max(560, req_w + 20)
+    height = max(420, req_h + 20)
+    minsize_fn = getattr(window, "minsize", None)
+    if callable(minsize_fn):
+        try:
+            minsize_fn(width, height)
+        except Exception:  # noqa: BLE001
+            pass
 
     try:
         screen_w = int(window.winfo_screenwidth())
         screen_h = int(window.winfo_screenheight())
         pos_x = max(20, screen_w - width - 32)
         pos_y = max(20, screen_h - height - 76)
-        window.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+        window.geometry(f"+{pos_x}+{pos_y}")
     except Exception:  # noqa: BLE001
         window.geometry(f"{width}x{height}")
 

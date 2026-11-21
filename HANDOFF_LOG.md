@@ -5,14 +5,14 @@
 ---
 
 ## 当前全局状态（Current Snapshot）
-* **当前阶段**：✅ **v3 桌面常驻轻量前端（`WinSta0\Default`）+ 三分支启动门禁 + 只读 `status` 接口完成开发与全离线验收**（离线单元测试 **161/161 全绿**，零网络、零真实数据触碰；保留提交于特性分支 `feat/v3-companion`，暂未合并 `main` 且未 `git push`）
+* **当前阶段**：✅ **v3 桌面常驻轻量前端（`WinSta0\Default`）+ 系统托盘收纳 + 三分支启动门禁 + 只读 `status` 接口完成开发与全离线验收**（离线单元测试 **163/163 全绿**，零网络、零真实数据触碰；保留提交于特性分支 `feat/v3-companion`，暂未合并 `main` 且未 `git push`）
 * **当前分支**：`feat/v3-companion`（基于 `main` 切出）
 * **当前激活模式**：`config.json` 默认保持 v1 `audio_only`、`wd_tagger_enabled: false`、4 条件公版安全默认预算（`0.4` / `100` / `0.30` / `30`），以及桌面前端与启动门禁默认配置（`companion_policy: "required"`、`ipc_dir: "data/budget_ipc"`、`ipc_ack_timeout_sec: 2.5`、`require_cloud_mount_on_start: true`）；未改动本机私有 `config.local.json`
 * **已落盘与核验基建**：
   * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已并列补充「桌面小窗交互模式」与「`--headless` 纯无头自动化模式」，并在第 3.3 节标准唤醒 Prompt 补充 `desktop_companion_offline` / `desktop_companion_aborted` / `cloud_drive_unmounted` 明确中文汇报与立即中止指令）
   * `.agent/rules/cat-soul.md`、`config.json`、`.gitignore`（新增屏蔽 `data/budget_ipc/`、`data/.companion.lock`、`data/*.lock`）、`.env.example`、`config.local.example.json`、`requirements.txt`、`requirements-v2.txt`、`requirements-dev.txt`、`pyproject.toml`
-  * 核心代码模块与脚本：`src/gemininest/{contracts,config,meta_filter,memory_store,fetcher,media_processor,safety_gate,agent_bridge,budget_ui,companion,sync_manager,runner}.py`、`scripts/create_companion_shortcut.py`、`scripts/download_wd_tagger.py`、`scripts/inbox_gdoc_exporter.gs`
-  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,companion,runner,sync_manager}.py`（`pytest` **161/161 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
+  * 核心代码模块与脚本：`src/gemininest/{contracts,config,meta_filter,memory_store,fetcher,media_processor,safety_gate,agent_bridge,budget_ui,companion,sync_manager,runner}.py`、`assets/gemininest.ico`、`scripts/create_companion_shortcut.py`、`scripts/download_wd_tagger.py`、`scripts/inbox_gdoc_exporter.gs`
+  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,companion,runner,sync_manager}.py`（`pytest` **163/163 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
   * 本地私有资产（均被 `.gitignore` 严格忽略）：`config.local.json`、`data/models/model.onnx`（`SmilingWolf/wd-vit-tagger-v3`，361.00 MB）与 `data/models/selected_tags.csv`（10,861 标签）、`data/cat_memory.db`（4 条真实巡逻记忆）、`data/exports/` 内独立隐藏 Git 仓库
   * Anaconda 环境 `gemininest`（Python 3.11.18 + SQLite 3.54.1 FTS5 `trigram` + `yt-dlp`、`httpx`、`python-dotenv`、`winotify`、`pytest`、`Pillow 10.4.0`、`numpy 2.4.6`、`onnxruntime-directml 1.24.4`）
   * Google Drive 云盘目录：`<YOUR_GOOGLE_DRIVE_NEST>\{0_active,1_yesterday_readonly,inbox,inbox_archived}` 均已建齐并通过双端实飞同步验证
@@ -48,19 +48,20 @@
   * **配置与契约扩展（`.gitignore` / `config.json` / `contracts.py` / `config.py`）**：
     * `.gitignore` 新增忽略 `data/budget_ipc/`、`data/.companion.lock`、`data/*.lock`。
     * `config.json` `budget_and_runtime` 新增公版默认值：`companion_policy: "required"`、`ipc_dir: "data/budget_ipc"`、`ipc_ack_timeout_sec: 2.5`、`require_cloud_mount_on_start: true`；`contracts.py`（`CompanionPolicy`、`BudgetAndRuntimeConfig`）与 `config.py` 完整向后兼容旧 `config.local.json` 并校验合法性；`budget_ui.py` `BudgetDecisionSource` 新增 `"companion_auto_default"`。
-  * **只读日记计数与 `runner status`（`memory_store.py` / `runner.py`）**：
-    * `MemoryStore.count_diary_entries()` 轻量只读计数；`python -m gemininest.runner status` 绝不持有 `.cat.lock` 且不创建缺失 DB 文件，返回 5h 窗口算力（`used_tokens`/`capacity_tokens`/`used_ratio`/`remaining_tokens`/`in_cooldown`）、`pipeline_mode`、`cloud_mounted`、`cat_lock_active`、`active_run_count`、`companion_online`、`diary_count` 及最近 3 条 `recent_diaries`。
+  * **只读日记/记忆计数与 `runner status`（`memory_store.py` / `runner.py`）**：
+    * `MemoryStore.count_diary_entries()` 与 `count_memories()` 轻量只读计数；`python -m gemininest.runner status` 绝不持有 `.cat.lock` 且不创建缺失 DB 文件，返回 5h 窗口算力（`window_bucket`/`used_tokens`/`capacity_tokens`/`used_ratio`/`remaining_tokens`/`in_cooldown`）、`pipeline_mode`、`cloud_mounted`、`cat_lock_active`、`active_run_count`、`companion_online`、`memory_count`、`diary_count` 及最近 3 条 `recent_diaries`。
   * **三分支启动门禁、原子 IPC 握手与 Toast 代发（`runner.py` / `budget_ui.py`）**：
     * 在 `prepare-feed`（及共用 `check-budget`）发起任何 B 站请求、吸收 `inbox/` 或写库建租约前执行：CLI 豁免（`--headless` 或显式预算参数）→ 分支 A（校验 `.companion.lock` 存活/工作区/心跳并完成 `req_` → `ack_` 原子 IPC 握手，未通过返回**退出码 `0`** + `desktop_companion_offline`）→ 分支 B（在线巡逻 `require_cloud_mount_on_start=true` 且非 `--offline`/`--skip-inbox` 时，**即便带 `--headless` 也在弹窗前**执行 `SyncManager.probe_cloud_nest()`，未挂载返回**退出码 `0`** + `cloud_drive_unmounted` / `E8001_CLOUD_DRIVE_UNMOUNTED`）→ 分支 C（轮询 `res_` 含中途退出检测 `desktop_companion_aborted` 与 60s 超时默认继续）。
     * 非 `--headless` 且前端在线时，`notify_high_score_video` 与 `notify_auth_expired` 通过原子 `toast_<id>.json`（120s TTL）交由桌面前端 `winotify` 在 `WinSta0\Default` 代发，无前端或失败时安全降级。
-  * **轻量 `tkinter` 桌面常驻小窗（`src/gemininest/companion.py` & `budget_ui.py`）**：
-    * 纯标准库 + 已有 `winotify`；Windows `CreateMutexW` 命名互斥锁 + 原子 `data/.companion.lock` 心跳防双开；严格单 `tk.Tk()` 实例，通过 `budget_ui.open_budget_toplevel()` 以 `tk.Toplevel(master=root)`（不设 `transient`，最小化到任务栏仍可弹窗）复用 4 条件联合上限面板；`root.after(250, ...)` 非阻塞 IPC 轮询 + daemon 线程定时调用 `runner status` 经 `queue.Queue` 回传渲染；启用 best-effort Win32 DPI 感知与自适应尺寸；支持「每次弹窗询问」/「自动默认值执行」单选切换与「退出」干净清理；严禁持有 `.cat.lock` 或直接写 SQLite。
+  * **轻量 `tkinter` 桌面常驻小窗与纯 Win32 系统托盘（`src/gemininest/companion.py`、`budget_ui.py`、`assets/gemininest.ico`）**：
+    * 纯标准库（`tkinter`/`ctypes`/`queue`/`threading`）+ 已有 `winotify`；Windows `CreateMutexW` 命名互斥锁 + 原子 `data/.companion.lock` 心跳防双开；严格单 `tk.Tk()` 实例，通过 `budget_ui.open_budget_toplevel()` 以 `tk.Toplevel(master=root)`（不设 `transient`，最小化/收纳托盘后仍可独立弹窗）复用 4 条件联合上限面板；使用仅坐标 `geometry(f"+{pos_x}+{pos_y}")`、`minsize` 与按钮自适应内边距彻底消除高 DPI 下文字换行导致的底部按钮裁切；状态面板清晰展示「本 5h 窗口（本地起点 HH:MM 起）」与「手账篇数 + 累计记忆条数」。
+    * 内置纯 Win32 `Shell_NotifyIconW`（`Win32TrayIcon`）系统托盘支持与 `assets/gemininest.ico` 自定义图标：点击「收进托盘」或窗口最小化即隐藏到 Windows 托盘「显示隐藏的图标」，支持左键点击/双击还原、右键菜单（打开主面板 / 立即刷新状态 / 切换运行模式 / 退出）与 `TaskbarCreated` 重建恢复；严禁持有 `.cat.lock` 或直接写 SQLite。
   * **桌面快捷方式生成器（`scripts/create_companion_shortcut.py`）**：
-    * 零硬编码动态探测仓库根、`gemininest` `pythonw.exe` 与本机桌面路径，支持 `--dry-run` 与 `--output`，通过 PowerShell `WScript.Shell` 创建无黑框 `PYTHONPATH=src` 启动快捷方式。
-  * **文档与回归**：同步更新 `README.md` 与 `docs/SETUP_AND_RUNTIME.md`（并列说明两种启动方式与 3.3 节唤醒 Prompt 门禁中止汇报）；新增/扩充 `tests/test_{companion,runner,budget_ui,config,memory_store}.py`。
+    * 零硬编码动态探测仓库根、`gemininest` `pythonw.exe`、自定义 `assets/gemininest.ico` 与本机桌面路径，支持 `--dry-run` 与 `--output`，通过 PowerShell `WScript.Shell` 创建无黑框 `PYTHONPATH=src`（显式重置 `sys.argv=['gemininest.companion']`）启动快捷方式。
+  * **文档与回归**：同步更新 `README.md` 与 `docs/SETUP_AND_RUNTIME.md`（并列说明两种启动方式、托盘交互与 3.3 节唤醒 Prompt 门禁中止汇报）；新增/扩充 `tests/test_{companion,runner,budget_ui,config,memory_store}.py`。
 * **回归验证**：
-  * `<YOUR_CONDA_PYTHON> -m pytest -v`：**161 passed**（100% 全绿，零网络、真实 `data/` 与 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）。
-  * `<YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py --dry-run` 解析验证通过；Git 跟踪文件与新增文件本机路径/用户名扫描 0 残留。
+  * `<YOUR_CONDA_PYTHON> -m pytest -v`：**163 passed in 48.69s**（100% 全绿，零网络、真实 `data/` 与 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）。
+  * `<YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py --dry-run` 与真实快捷方式生成及 `assets/gemininest.ico` 加载验证通过；Git 跟踪文件与新增文件本机路径/用户名扫描 0 残留。
 ### [Budget System Upgrade - 4 条件联合约束（交集上限，先触顶先停）] - 2026-11-21
 * **核心升级（留在 `main` 分支，暂不 `git push`）**：
   * **配置与契约升级（`config.json` / `contracts.py` / `config.py` / `memory_store.py`）**：

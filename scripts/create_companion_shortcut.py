@@ -36,6 +36,7 @@ class ShortcutSpec:
     arguments: str
     working_directory: Path
     description: str
+    icon_path: Path | None = None
 
 
 def detect_repo_root(start_file: Path | str | None = None) -> Path:
@@ -185,6 +186,7 @@ def build_shortcut_spec(
     eff_root = Path(repo_root).resolve() if repo_root is not None else detect_repo_root()
     pythonw = detect_pythonw_executable(explicit_pythonw=explicit_pythonw)
     shortcut_path = resolve_shortcut_output_path(output, shortcut_name=shortcut_name)
+    ico_candidate = eff_root / "assets" / "gemininest.ico"
     return ShortcutSpec(
         repo_root=eff_root,
         pythonw_path=pythonw,
@@ -193,6 +195,7 @@ def build_shortcut_spec(
         arguments=build_companion_launch_arguments(),
         working_directory=eff_root,
         description="GeminiNest 桌面常驻小窝助手（无黑框启动）",
+        icon_path=ico_candidate if ico_candidate.is_file() else None,
     )
 
 
@@ -209,6 +212,7 @@ def create_windows_shortcut(spec: ShortcutSpec) -> Path:
         "$sc.Arguments = $env:GN_LNK_ARGS; "
         "$sc.WorkingDirectory = $env:GN_LNK_WORKDIR; "
         "$sc.Description = $env:GN_LNK_DESC; "
+        "if ($env:GN_LNK_ICON) { $sc.IconLocation = $env:GN_LNK_ICON }; "
         "$sc.WindowStyle = 1; "
         "$sc.Save()"
     )
@@ -221,6 +225,10 @@ def create_windows_shortcut(spec: ShortcutSpec) -> Path:
     env["GN_LNK_ARGS"] = spec.arguments
     env["GN_LNK_WORKDIR"] = str(spec.working_directory)
     env["GN_LNK_DESC"] = spec.description
+    if spec.icon_path is not None and spec.icon_path.is_file():
+        env["GN_LNK_ICON"] = f"{spec.icon_path},0"
+    else:
+        env.pop("GN_LNK_ICON", None)
 
     ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or "powershell.exe"
     proc = subprocess.run(
