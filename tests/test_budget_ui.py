@@ -1,4 +1,4 @@
-"""Offline unit tests for gemininest.budget_ui (4-mode startup popup + Win32 visibility + Toast)."""
+"""Offline unit tests for gemininest.budget_ui (4-condition intersection popup + Win32 + Toast)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import gemininest.budget_ui as budget_ui_mod
 from gemininest.budget_ui import (
     budget_plan_from_dict,
     build_budget_plan,
+    compute_effective_allowed_ratio,
     decision_from_plan,
     notify_auth_expired,
     notify_high_score_video,
@@ -23,7 +24,7 @@ from gemininest.budget_ui import (
     prompt_startup_budget,
 )
 from gemininest.config import load_config
-from gemininest.contracts import BudgetStatus
+from gemininest.contracts import BudgetPlan, BudgetStatus
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPO_CONFIG_PATH = REPO_ROOT / "config.json"
@@ -36,12 +37,19 @@ class _FakeTclError(Exception):
 class _FakeStringVar:
     def __init__(self, value: str = "") -> None:
         self._val = value
+        self._traces: list[Any] = []
 
     def get(self) -> str:
         return self._val
 
     def set(self, value: str) -> None:
         self._val = value
+        for cb in list(self._traces):
+            cb()
+
+    def trace_add(self, _mode: str, cb: Any) -> str:
+        self._traces.append(cb)
+        return f"trace_{len(self._traces)}"
 
 
 class _FakeWidget:
@@ -67,8 +75,6 @@ class _FakeRadio(_FakeWidget):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.text = kwargs.get("text", "")
-        self.variable = kwargs.get("variable")
-        self.value = kwargs.get("value")
 
 
 class _FakeTkRoot:
@@ -76,23 +82,25 @@ class _FakeTkRoot:
         self,
         *,
         action_plan: str = "timeout",
-        selected_mode: str = "use_ratio",
-        custom_input: str = "",
+        entry_overrides: dict[int, str] | None = None,
+        clear_first: bool = False,
     ) -> None:
         self.action_plan = action_plan
-        self.selected_mode = selected_mode
-        self.custom_input = custom_input
+        self.entry_overrides = entry_overrides or {}
+        self.clear_first = clear_first
         self.destroyed = False
         self.after_callbacks: list[Any] = []
         self.buttons: list[_FakeButton] = []
         self.radios: list[_FakeRadio] = []
         self.labels: list[_FakeWidget] = []
         self.entry_vars: list[_FakeStringVar] = []
+        self.initial_entry_values: list[str] = []
         self.protocols: dict[str, Any] = {}
         self.focus_stolen = False
         self.deiconified = False
         self.idletasks_updated = 0
         self.topmost_value: bool | None = None
+        self.preview_after_clear: str = ""
 
     def title(self, _t: str) -> None:
         pass
@@ -134,37 +142,51 @@ class _FakeTkRoot:
     def destroy(self) -> None:
         self.destroyed = True
 
+    def _find_button(self, keyword: str) -> _FakeButton | None:
+        for btn in self.buttons:
+            if keyword in btn.text:
+                return btn
+        return None
+
     def mainloop(self) -> None:
-        mode_index = {
-            "use_ratio": 0,
-            "max_videos": 1,
-            "reserve_ratio": 2,
-            "max_minutes": 3,
-        }
+        self.initial_entry_values = [v.get() for v in self.entry_vars]
         if self.action_plan == "timeout":
             while not self.destroyed and self.after_callbacks:
                 cb = self.after_callbacks.pop(0)
                 cb()
         elif self.action_plan == "rest":
-            for btn in self.buttons:
-                if "休息" in btn.text and btn.command:
-                    btn.command()
-                    break
-        elif self.action_plan == "default":
-            for btn in self.buttons:
-                if "默认" in btn.text and btn.command:
-                    btn.command()
-                    break
-        elif self.action_plan == "custom":
-            if self.radios and self.radios[0].variable is not None:
-                self.radios[0].variable.set(self.selected_mode)
-            idx = mode_index[self.selected_mode]
-            assert idx < len(self.entry_vars)
-            self.entry_vars[idx].set(self.custom_input)
-            for btn in self.buttons:
-                if "确认出发" in btn.text and btn.command:
-                    btn.command()
-                    break
+            btn = self._find_button("休息")
+            if btn and btn.command:
+                btn.command()
+        elif self.action_plan == "confirm":
+            if self.clear_first:
+                clear_btn = self._find_button("清空条件")
+                assert clear_btn is not None and clear_btn.command is not None
+                clear_btn.command()
+                assert [v.get() for v in self.entry_vars] == ["", "", "", ""]
+                assert self.destroyed is False
+                # Capture preview text right after clear
+                for lbl in self.labels:
+                    tv = lbl.kwargs.get("textvariable")
+                    if tv is not None and "综合预览" in str(tv.get()):
+                        self.preview_after_clear = str(tv.get())
+                        break
+            for idx, val in self.entry_overrides.items():
+                assert idx < len(self.entry_vars)
+                self.entry_vars[idx].set(val)
+            confirm_btn = self._find_button("确认出发")
+            assert confirm_btn is not None and confirm_btn.command is not None
+            confirm_btn.command()
+        elif self.action_plan == "invalid_then_confirm":
+            # First enter invalid ratio -> popup must stay open with error message, then fix and confirm
+            self.entry_vars[0].set("not-a-number")
+            confirm_btn = self._find_button("确认出发")
+            assert confirm_btn is not None and confirm_btn.command is not None
+            confirm_btn.command()
+            assert self.destroyed is False
+            self.entry_vars[0].set("0.50")
+            confirm_btn.command()
+            assert self.destroyed is True
 
 
 class _FakeTkModule:
@@ -175,13 +197,13 @@ class _FakeTkModule:
         *,
         fail_tcl: bool = False,
         action_plan: str = "timeout",
-        selected_mode: str = "use_ratio",
-        custom_input: str = "",
+        entry_overrides: dict[int, str] | None = None,
+        clear_first: bool = False,
     ) -> None:
         self.fail_tcl = fail_tcl
         self.action_plan = action_plan
-        self.selected_mode = selected_mode
-        self.custom_input = custom_input
+        self.entry_overrides = entry_overrides
+        self.clear_first = clear_first
         self.last_root: _FakeTkRoot | None = None
 
     def Tk(self) -> _FakeTkRoot:  # noqa: N802
@@ -189,8 +211,8 @@ class _FakeTkModule:
             raise _FakeTclError("no display name and no $DISPLAY environment variable")
         root = _FakeTkRoot(
             action_plan=self.action_plan,
-            selected_mode=self.selected_mode,
-            custom_input=self.custom_input,
+            entry_overrides=self.entry_overrides,
+            clear_first=self.clear_first,
         )
         self.last_root = root
         return root
@@ -228,7 +250,7 @@ class _FakeTkModule:
 
 
 def test_parse_budget_inputs() -> None:
-    assert parse_budget_ratio_input("0.35") == 0.35
+    assert parse_budget_ratio_input("0.40") == 0.40
     assert parse_budget_ratio_input("0.0") == 0.0
     assert parse_budget_ratio_input("1") == 1.0
     assert parse_budget_ratio_input("45%") == 0.45
@@ -237,71 +259,137 @@ def test_parse_budget_inputs() -> None:
     assert parse_budget_ratio_input("abc") is None
     assert parse_budget_ratio_input("") is None
 
-    assert parse_positive_int_input("3") == 3
+    assert parse_positive_int_input("100") == 100
     assert parse_positive_int_input("0") is None
     assert parse_positive_int_input("-2") is None
     assert parse_positive_int_input("2.5") is None
     assert parse_positive_int_input("") is None
 
-    assert parse_positive_float_input("15") == 15.0
+    assert parse_positive_float_input("30") == 30.0
     assert parse_positive_float_input("7.5") == 7.5
     assert parse_positive_float_input("0") is None
     assert parse_positive_float_input("-5") is None
     assert parse_positive_float_input("abc") is None
 
 
-def test_build_budget_plan_all_four_modes_and_roundtrip() -> None:
-    # 1. use_ratio
-    p_use = build_budget_plan("use_ratio", value=0.35, current_window_used_ratio=0.10)
-    assert p_use.mode == "use_ratio"
-    assert p_use.allowed_ratio == 0.35
-    assert p_use.window_cap_ratio == 0.35
-    assert p_use.rest_today is False
+def test_4_condition_intersection_effective_allowed_ratio_and_roundtrip() -> None:
+    # 1. max_use_ratio stricter than reserve_ratio: min(0.40, 1 - 0.30 - 0.20 = 0.50) = 0.40
+    p_use_wins = build_budget_plan(
+        max_use_ratio=0.40,
+        max_videos=100,
+        reserve_ratio=0.30,
+        max_minutes=30,
+        current_window_used_ratio=0.20,
+        now_epoch=1_700_000_000.0,
+    )
+    assert p_use_wins.mode == "combined"
+    assert p_use_wins.max_use_ratio == 0.40
+    assert p_use_wins.max_videos == 100
+    assert p_use_wins.reserve_ratio == 0.30
+    assert p_use_wins.max_minutes == 30
+    assert p_use_wins.deadline_epoch == 1_700_001_800.0
+    assert p_use_wins.effective_allowed_ratio == 0.40
+    assert p_use_wins.allowed_ratio == 0.40
+    assert p_use_wins.window_cap_ratio == 0.60
+    assert p_use_wins.rest_today is False
 
-    # 2. max_videos
-    p_vid = build_budget_plan("max_videos", value=3, current_window_used_ratio=0.10)
-    assert p_vid.mode == "max_videos"
-    assert p_vid.max_videos == 3
-    assert p_vid.allowed_ratio == 1.0
-    assert p_vid.rest_today is False
+    # 2. reserve_ratio stricter than max_use_ratio: min(0.40, 1 - 0.30 - 0.50 = 0.20) = 0.20
+    p_res_wins = build_budget_plan(
+        max_use_ratio=0.40,
+        max_videos=100,
+        reserve_ratio=0.30,
+        max_minutes=30,
+        current_window_used_ratio=0.50,
+    )
+    assert p_res_wins.effective_allowed_ratio == 0.20
+    assert p_res_wins.allowed_ratio == 0.20
+    assert p_res_wins.window_cap_ratio == 0.70
 
-    # 3. reserve_ratio normal: allowed = max(0, 1 - 0.40 - 0.25) = 0.35, window_cap = 0.60
-    p_res = build_budget_plan("reserve_ratio", value=0.40, current_window_used_ratio=0.25)
-    assert p_res.mode == "reserve_ratio"
-    assert p_res.reserve_ratio == 0.40
-    assert p_res.allowed_ratio == 0.35
-    assert p_res.window_cap_ratio == 0.60
-    assert p_res.rest_today is False
-
-    # 3b. reserve_ratio already exceeded: allowed = 0.0, rest_today remains False
-    p_res_zero = build_budget_plan("reserve_ratio", value=0.40, current_window_used_ratio=0.70)
-    assert p_res_zero.allowed_ratio == 0.0
+    # 3. reserve_ratio already breached -> effective_allowed_ratio = 0.0 (not rest_today)
+    p_res_zero = build_budget_plan(
+        max_use_ratio=0.40,
+        reserve_ratio=0.40,
+        current_window_used_ratio=0.70,
+    )
+    assert p_res_zero.effective_allowed_ratio == 0.0
     assert p_res_zero.window_cap_ratio == 0.60
     assert p_res_zero.rest_today is False
 
-    # 4. max_minutes -> computes exact deadline_epoch
-    p_min = build_budget_plan("max_minutes", value=15, current_window_used_ratio=0.10, now_epoch=1_700_000_000.0)
-    assert p_min.mode == "max_minutes"
-    assert p_min.max_minutes == 15.0
-    assert p_min.started_epoch == 1_700_000_000.0
-    assert p_min.deadline_epoch == 1_700_000_900.0
-    assert p_min.allowed_ratio == 1.0
+    # 4. Only max_use_ratio set, exceeds window remaining -> capped by window remaining (1 - 0.75 = 0.25)
+    p_win_cap = build_budget_plan(
+        max_use_ratio=0.50,
+        current_window_used_ratio=0.75,
+    )
+    assert p_win_cap.effective_allowed_ratio == 0.25
+    assert p_win_cap.window_cap_ratio == 1.0
 
-    # Roundtrip serialization
-    assert budget_plan_from_dict(asdict(p_min)) == p_min
-    assert budget_plan_from_dict(asdict(p_res)) == p_res
+    # 5. All 4 conditions None (unlimited) -> falls back to window remaining max(0.0, 1 - used)
+    p_all_none = build_budget_plan(
+        max_use_ratio=None,
+        max_videos=None,
+        reserve_ratio=None,
+        max_minutes=None,
+        current_window_used_ratio=0.25,
+    )
+    assert p_all_none.max_use_ratio is None
+    assert p_all_none.max_videos is None
+    assert p_all_none.reserve_ratio is None
+    assert p_all_none.max_minutes is None
+    assert p_all_none.deadline_epoch is None
+    assert p_all_none.effective_allowed_ratio == 0.75
+    assert p_all_none.window_cap_ratio == 1.0
+    assert compute_effective_allowed_ratio(
+        max_use_ratio=None, reserve_ratio=None, current_window_used_ratio=0.25
+    ) == 0.75
+
+    # 6. Direct BudgetPlan construction auto-computes effective_allowed_ratio
+    direct_plan = BudgetPlan(
+        max_use_ratio=0.50,
+        reserve_ratio=0.30,
+        current_window_used_ratio=0.40,
+    )
+    assert direct_plan.effective_allowed_ratio == 0.30
+    assert direct_plan.window_cap_ratio == 0.70
+
+    # 7. Roundtrip serialization & legacy run_states JSON backward compatibility
+    assert budget_plan_from_dict(asdict(p_use_wins)) == p_use_wins
+    assert budget_plan_from_dict(asdict(p_all_none)) == p_all_none
+
+    legacy_dict = {
+        "mode": "use_ratio",
+        "allowed_ratio": 0.35,
+        "window_cap_ratio": 0.35,
+        "current_window_used_ratio": 0.0,
+        "use_ratio": 0.35,
+        "max_videos": None,
+        "reserve_ratio": None,
+        "max_minutes": None,
+        "started_epoch": None,
+        "deadline_epoch": None,
+        "rest_today": False,
+    }
+    restored_legacy = budget_plan_from_dict(legacy_dict)
+    assert restored_legacy.max_use_ratio == 0.35
+    assert restored_legacy.use_ratio == 0.35
+    assert restored_legacy.effective_allowed_ratio == 0.35
+    assert restored_legacy.max_videos is None
 
 
-def test_headless_and_disabled_popup_return_default_silently() -> None:
+def test_headless_and_disabled_popup_return_combined_defaults_silently() -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
 
-    # Headless must not touch tkinter at all
+    # Headless must not touch tkinter at all and must carry all 4 config defaults
     exploding_tk = _FakeTkModule(fail_tcl=True)
     decision = prompt_startup_budget(cfg, headless=True, tk_module=exploding_tk)
-    assert decision.budget_ratio == cfg.budget_and_runtime.default_window_budget_ratio
+    assert decision.budget_ratio == pytest.approx(0.4)
+    assert decision.max_use_ratio == pytest.approx(0.4)
+    assert decision.max_videos == 100
+    assert decision.reserve_ratio == pytest.approx(0.30)
+    assert decision.max_minutes == 30
+    assert decision.deadline_epoch is not None
     assert decision.source == "headless_default"
     assert decision.rest_today is False
-    assert decision.mode == "use_ratio"
+    assert decision.mode == "combined"
     assert decision.budget_plan is not None
 
     # Disabled in config
@@ -311,7 +399,8 @@ def test_headless_and_disabled_popup_return_default_silently() -> None:
     )
     decision2 = prompt_startup_budget(disabled_cfg, headless=False, tk_module=exploding_tk)
     assert decision2.source == "disabled_default"
-    assert decision2.budget_ratio == cfg.budget_and_runtime.default_window_budget_ratio
+    assert decision2.budget_ratio == pytest.approx(0.4)
+    assert decision2.max_videos == 100
 
 
 def test_tcl_error_session0_silently_falls_back_to_default() -> None:
@@ -319,24 +408,28 @@ def test_tcl_error_session0_silently_falls_back_to_default() -> None:
     failing_tk = _FakeTkModule(fail_tcl=True)
 
     decision = prompt_startup_budget(cfg, headless=False, tk_module=failing_tk)
-    assert decision.budget_ratio == cfg.budget_and_runtime.default_window_budget_ratio
+    assert decision.budget_ratio == pytest.approx(0.4)
+    assert decision.max_videos == 100
+    assert decision.reserve_ratio == pytest.approx(0.30)
+    assert decision.max_minutes == 30
     assert decision.source == "tcl_error_fallback"
     assert decision.rest_today is False
 
 
-def test_monotonic_countdown_timeout_custom_4_modes_and_rest_buttons() -> None:
+def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout() -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
     status = BudgetStatus(
-        window_bucket="2026-11-20T00:00:00Z_5h",
+        window_bucket="2026-11-21T00:00:00Z_5h",
         used_tokens=280_000,
         capacity_tokens=1_400_000,
         used_ratio=0.20,
-        allowed_ratio=0.35,
-        remaining_tokens=210_000,
+        allowed_ratio=0.40,
+        remaining_tokens=280_000,
         in_cooldown=False,
     )
 
-    # 1. Timeout via monotonic clock jump & topmost non-focus-stealing verification
+    # 1. Timeout via monotonic clock jump: verifies 4 independent inputs, NO radios, prefilled defaults,
+    #    top live preview, and non-focus-stealing topmost behavior.
     clock_values = iter([1000.0, 1030.0, 1061.5, 1061.6])
     tk_timeout = _FakeTkModule(action_plan="timeout")
     dec_timeout = prompt_startup_budget(
@@ -346,9 +439,15 @@ def test_monotonic_countdown_timeout_custom_4_modes_and_rest_buttons() -> None:
         budget_status=status,
         tk_module=tk_timeout,
         monotonic_fn=lambda: next(clock_values),
+        now_epoch_fn=lambda: 1_700_000_000.0,
     )
     assert dec_timeout.source == "timeout_default"
-    assert dec_timeout.budget_ratio == 0.35
+    assert dec_timeout.budget_ratio == pytest.approx(0.40)
+    assert dec_timeout.max_use_ratio == pytest.approx(0.40)
+    assert dec_timeout.max_videos == 100
+    assert dec_timeout.reserve_ratio == pytest.approx(0.30)
+    assert dec_timeout.max_minutes == 30
+    assert dec_timeout.deadline_epoch == 1_700_001_800.0
     assert dec_timeout.rest_today is False
     assert tk_timeout.last_root is not None
     assert tk_timeout.last_root.focus_stolen is False
@@ -356,11 +455,15 @@ def test_monotonic_countdown_timeout_custom_4_modes_and_rest_buttons() -> None:
     assert tk_timeout.last_root.topmost_value is True
     assert tk_timeout.last_root.idletasks_updated >= 1
     assert tk_timeout.last_root.destroyed is True
-    assert len(tk_timeout.last_root.radios) == 4
-    # Top status banner displays current 5h window usage percentage
+    assert len(tk_timeout.last_root.radios) == 0
+    assert len(tk_timeout.last_root.entry_vars) == 4
+    assert tk_timeout.last_root.initial_entry_values == ["0.40", "100", "0.30", "30"]
+    assert any("清空条件" in btn.text for btn in tk_timeout.last_root.buttons)
+    assert any("确认出发" in btn.text for btn in tk_timeout.last_root.buttons)
+    assert any("今日休息" in btn.text for btn in tk_timeout.last_root.buttons)
     assert any("20.0%" in str(lbl.kwargs.get("text", "")) for lbl in tk_timeout.last_root.labels)
 
-    # 2. User clicks "今日休息 (0.0)"
+    # 2. Click "今日休息"
     tk_rest = _FakeTkModule(action_plan="rest")
     dec_rest = prompt_startup_budget(
         cfg,
@@ -373,64 +476,83 @@ def test_monotonic_countdown_timeout_custom_4_modes_and_rest_buttons() -> None:
     assert dec_rest.rest_today is True
     assert dec_rest.mode == "rest"
 
-    # 3. Mode 1: custom use_ratio "0.60"
-    tk_use = _FakeTkModule(action_plan="custom", selected_mode="use_ratio", custom_input="0.60")
-    dec_use = prompt_startup_budget(
+    # 3. Click "清空条件" then fill ONLY max_videos = "5" -> other 3 dimensions become None (unlimited)
+    tk_only_one = _FakeTkModule(
+        action_plan="confirm",
+        clear_first=True,
+        entry_overrides={1: "5"},
+    )
+    dec_one = prompt_startup_budget(
         cfg,
         headless=False,
         budget_status=status,
-        tk_module=tk_use,
+        tk_module=tk_only_one,
         monotonic_fn=lambda: 500.0,
     )
-    assert dec_use.source == "user_custom"
-    assert dec_use.mode == "use_ratio"
-    assert dec_use.budget_ratio == 0.60
-    assert dec_use.rest_today is False
+    assert dec_one.source == "user_custom"
+    assert dec_one.max_use_ratio is None
+    assert dec_one.max_videos == 5
+    assert dec_one.reserve_ratio is None
+    assert dec_one.max_minutes is None
+    assert dec_one.deadline_epoch is None
+    # No token limits set -> effective_allowed_ratio equals 5h window remaining (1 - 0.20 = 0.80)
+    assert dec_one.budget_ratio == pytest.approx(0.80)
+    assert tk_only_one.last_root is not None
+    assert "4 项均留空" in tk_only_one.last_root.preview_after_clear
 
-    # 4. Mode 2: max_videos "4"
-    tk_vid = _FakeTkModule(action_plan="custom", selected_mode="max_videos", custom_input="4")
-    dec_vid = prompt_startup_budget(
+    # 4. Click "清空条件" and confirm with ALL 4 blank -> all 4 None, safe window remaining ceiling (0.80)
+    tk_all_blank = _FakeTkModule(action_plan="confirm", clear_first=True)
+    dec_blank = prompt_startup_budget(
         cfg,
         headless=False,
         budget_status=status,
-        tk_module=tk_vid,
+        tk_module=tk_all_blank,
         monotonic_fn=lambda: 500.0,
     )
-    assert dec_vid.source == "user_custom"
-    assert dec_vid.mode == "max_videos"
-    assert dec_vid.max_videos == 4
-    assert dec_vid.budget_plan is not None and dec_vid.budget_plan.max_videos == 4
+    assert dec_blank.source == "user_custom"
+    assert dec_blank.rest_today is False
+    assert dec_blank.max_use_ratio is None
+    assert dec_blank.max_videos is None
+    assert dec_blank.reserve_ratio is None
+    assert dec_blank.max_minutes is None
+    assert dec_blank.budget_ratio == pytest.approx(0.80)
+    assert dec_blank.budget_plan is not None and dec_blank.budget_plan.window_cap_ratio == 1.0
 
-    # 5. Mode 3: reserve_ratio "0.40" with 20% used -> allowed_ratio = 0.40, window_cap = 0.60
-    tk_res = _FakeTkModule(action_plan="custom", selected_mode="reserve_ratio", custom_input="40%")
-    dec_res = prompt_startup_budget(
-        cfg,
-        headless=False,
-        budget_status=status,
-        tk_module=tk_res,
-        monotonic_fn=lambda: 500.0,
+    # 5. Combined multi-condition custom edit where reserve_ratio (55%) is stricter than max_use_ratio (50%)
+    #    With used=20%, reserve allows 1 - 0.55 - 0.20 = 0.25 < 0.50 -> effective = 0.25
+    tk_combo = _FakeTkModule(
+        action_plan="confirm",
+        entry_overrides={0: "50%", 1: "12", 2: "55%", 3: "25"},
     )
-    assert dec_res.source == "user_custom"
-    assert dec_res.mode == "reserve_ratio"
-    assert dec_res.reserve_ratio == 0.40
-    assert dec_res.budget_ratio == 0.40
-    assert dec_res.budget_plan is not None and dec_res.budget_plan.window_cap_ratio == 0.60
-
-    # 6. Mode 4: max_minutes "12" -> computes deadline_epoch = now + 720s
-    tk_min = _FakeTkModule(action_plan="custom", selected_mode="max_minutes", custom_input="12")
-    dec_min = prompt_startup_budget(
+    dec_combo = prompt_startup_budget(
         cfg,
         headless=False,
         budget_status=status,
-        tk_module=tk_min,
+        tk_module=tk_combo,
         monotonic_fn=lambda: 500.0,
         now_epoch_fn=lambda: 1_800_000_000.0,
     )
-    assert dec_min.source == "user_custom"
-    assert dec_min.mode == "max_minutes"
-    assert dec_min.max_minutes == 12.0
-    assert dec_min.deadline_epoch == 1_800_000_720.0
-    assert dec_min.budget_plan is not None and dec_min.budget_plan.deadline_epoch == 1_800_000_720.0
+    assert dec_combo.source == "user_custom"
+    assert dec_combo.max_use_ratio == pytest.approx(0.50)
+    assert dec_combo.max_videos == 12
+    assert dec_combo.reserve_ratio == pytest.approx(0.55)
+    assert dec_combo.max_minutes == 25
+    assert dec_combo.deadline_epoch == 1_800_001_500.0
+    assert dec_combo.budget_ratio == pytest.approx(0.25)
+    assert dec_combo.budget_plan is not None
+    assert dec_combo.budget_plan.window_cap_ratio == pytest.approx(0.45)
+
+    # 6. Invalid input blocks submission until corrected
+    tk_invalid = _FakeTkModule(action_plan="invalid_then_confirm")
+    dec_fixed = prompt_startup_budget(
+        cfg,
+        headless=False,
+        budget_status=status,
+        tk_module=tk_invalid,
+        monotonic_fn=lambda: 500.0,
+    )
+    assert dec_fixed.source == "user_custom"
+    assert dec_fixed.max_use_ratio == pytest.approx(0.50)
 
 
 def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
@@ -438,7 +560,7 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
 ) -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
 
-    # 1. Non-Default isolated desktop (e.g. Antigravity exebox-*) -> fast graceful fallback
+    # 1. Non-Default isolated desktop (e.g. Antigravity exebox-*) -> fast graceful fallback to 4 defaults
     monkeypatch.setattr(budget_ui_mod.sys, "platform", "win32")
     monkeypatch.setattr(
         budget_ui_mod,
@@ -447,7 +569,10 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
     )
     dec_iso = prompt_startup_budget(cfg, headless=False, tk_module=None)
     assert dec_iso.source == "non_interactive_desktop_fallback"
-    assert dec_iso.budget_ratio == 0.35
+    assert dec_iso.budget_ratio == pytest.approx(0.4)
+    assert dec_iso.max_videos == 100
+    assert dec_iso.reserve_ratio == pytest.approx(0.30)
+    assert dec_iso.max_minutes == 30
     assert dec_iso.rest_today is False
 
     # 2. Normal WinSta0\Default desktop + parent SW_HIDE -> delegates to helper subprocess with wShowWindow=4
@@ -463,7 +588,7 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
     )
 
     captured_kwargs: dict[str, Any] = {}
-    helper_plan = build_budget_plan("max_videos", value=2, current_window_used_ratio=0.0)
+    helper_plan = build_budget_plan(max_videos=2, current_window_used_ratio=0.0)
     helper_dec = decision_from_plan(helper_plan, source="user_custom", elapsed_sec=1.5)
 
     def _fake_subproc_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -479,8 +604,9 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
     monkeypatch.setattr(budget_ui_mod.subprocess, "run", _fake_subproc_run)
     dec_helper = prompt_startup_budget(cfg, headless=False, tk_module=None)
     assert dec_helper.source == "user_custom"
-    assert dec_helper.mode == "max_videos"
+    assert dec_helper.mode == "combined"
     assert dec_helper.max_videos == 2
+    assert dec_helper.max_use_ratio is None
     assert "--popup-helper" in captured_kwargs["cmd"]
     si = captured_kwargs["kwargs"].get("startupinfo")
     if si is not None:

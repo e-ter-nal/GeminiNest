@@ -101,6 +101,8 @@ _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
 DEFAULT_RUN_LEASE_TTL_SEC = 7200
 DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC = 7200
+DEFAULT_MAX_SELECT = 4
+MAX_SELECT_PER_BATCH_GUARDRAIL = 30
 
 
 def _utc_now_iso() -> str:
@@ -351,14 +353,24 @@ def _effective_budget_plan(
 ) -> BudgetPlan:
     if decision.budget_plan is not None:
         return decision.budget_plan
-    if decision.rest_today or decision.budget_ratio <= 0.0:
+    if decision.rest_today or (
+        decision.max_use_ratio is not None and decision.max_use_ratio <= 0.0
+    ):
         return build_budget_plan(
             "rest",
             current_window_used_ratio=current_window_used_ratio,
         )
+    fallback_max_use = (
+        decision.max_use_ratio
+        if decision.max_use_ratio is not None
+        else (decision.budget_ratio if decision.budget_ratio > 0.0 else None)
+    )
     return build_budget_plan(
-        "use_ratio",
-        value=decision.budget_ratio,
+        "combined",
+        max_use_ratio=fallback_max_use,
+        max_videos=decision.max_videos,
+        reserve_ratio=decision.reserve_ratio,
+        max_minutes=decision.max_minutes,
         current_window_used_ratio=current_window_used_ratio,
     )
 
@@ -367,8 +379,14 @@ def _check_budget_status_for_plan(
     store: MemoryStore,
     plan: BudgetPlan,
 ) -> tuple[BudgetStatus, bool]:
-    if plan.rest_today or plan.allowed_ratio <= 0.0 or plan.window_cap_ratio <= 0.0:
-        status = store.get_budget_status()
+    if plan.rest_today or plan.effective_allowed_ratio <= 0.0 or plan.window_cap_ratio <= 0.0:
+        probe_ratio = plan.window_cap_ratio if plan.window_cap_ratio > 0.0 else 1.0
+        status = store.get_budget_status(allowed_ratio=probe_ratio)
+        status = replace(
+            status,
+            allowed_ratio=plan.effective_allowed_ratio,
+            remaining_tokens=0,
+        )
         return status, False
     status = store.get_budget_status(allowed_ratio=plan.window_cap_ratio)
     can_proceed = (not status.in_cooldown) and (status.remaining_tokens > 0)
@@ -381,7 +399,12 @@ def _resolve_cli_budget_decision(
     budget_status: BudgetStatus,
     now_epoch_fn: Callable[[], float] | None = None,
 ) -> BudgetDecision | None:
-    """Resolve explicit CLI budget flags (`--budget-ratio`, `--max-videos`, `--reserve-ratio`, `--max-minutes`)."""
+    """Resolve explicit CLI budget flags (`--budget-ratio`, `--max-videos`, `--reserve-ratio`, `--max-minutes`).
+
+    Any combination of the 4 flags may be passed together. Whenever 1 or more flags are
+    provided, the startup popup is skipped and ONLY the explicitly provided constraints
+    apply (all omitted dimensions are set to `None` = unlimited for this run).
+    """
     eff_now_fn = now_epoch_fn or _now_epoch
     budget_ratio = getattr(args, "budget_ratio", None)
     max_videos = getattr(args, "budget_max_videos", None)
@@ -390,29 +413,21 @@ def _resolve_cli_budget_decision(
     reserve_ratio = getattr(args, "reserve_ratio", None)
     max_minutes = getattr(args, "max_minutes", None)
 
-    provided: list[tuple[Literal["use_ratio", "max_videos", "reserve_ratio", "max_minutes"], Any]] = []
-    if budget_ratio is not None:
-        provided.append(("use_ratio", budget_ratio))
-    if max_videos is not None:
-        provided.append(("max_videos", max_videos))
-    if reserve_ratio is not None:
-        provided.append(("reserve_ratio", reserve_ratio))
-    if max_minutes is not None:
-        provided.append(("max_minutes", max_minutes))
-
-    if not provided:
+    if (
+        budget_ratio is None
+        and max_videos is None
+        and reserve_ratio is None
+        and max_minutes is None
+    ):
         return None
-    if len(provided) > 1:
-        raise GeminiNestError(
-            ErrorCode.E1001_CONFIG_INVALID,
-            "Only one of --budget-ratio, --max-videos, --reserve-ratio, --max-minutes may be specified at a time.",
-        )
 
-    mode, value = provided[0]
     try:
         plan = build_budget_plan(
-            mode,
-            value=value,
+            "combined",
+            max_use_ratio=budget_ratio,
+            max_videos=max_videos,
+            reserve_ratio=reserve_ratio,
+            max_minutes=max_minutes,
             current_window_used_ratio=budget_status.used_ratio,
             now_epoch=float(eff_now_fn()),
         )
@@ -420,6 +435,104 @@ def _resolve_cli_budget_decision(
         raise GeminiNestError(ErrorCode.E1001_CONFIG_INVALID, str(exc)) from exc
 
     return decision_from_plan(plan, source="cli_override", elapsed_sec=0.0)
+
+
+def _resolve_effective_max_select(
+    explicit_max_select: int | None,
+    plan: BudgetPlan,
+) -> int:
+    """Coordinate `--max-select` with `plan.max_videos` and the per-request anti-abuse guardrail."""
+    if explicit_max_select is not None:
+        if explicit_max_select < 1:
+            raise GeminiNestError(
+                ErrorCode.E1001_CONFIG_INVALID,
+                f"--max-select must be >= 1, got {explicit_max_select}",
+            )
+        guarded = min(int(explicit_max_select), MAX_SELECT_PER_BATCH_GUARDRAIL)
+        if plan.max_videos is not None:
+            return max(1, min(guarded, int(plan.max_videos)))
+        return guarded
+
+    if plan.max_videos is not None:
+        return max(1, min(MAX_SELECT_PER_BATCH_GUARDRAIL, int(plan.max_videos)))
+
+    return DEFAULT_MAX_SELECT
+
+
+def _evaluate_combined_budget_triggers(
+    plan: BudgetPlan,
+    *,
+    store: MemoryStore,
+    run_id: str,
+    now_epoch: float,
+    videos_processed: int,
+    next_bv_already_counted: bool = False,
+) -> tuple[list[str], dict[str, Any], BudgetStatus]:
+    """Evaluate all non-None intersection constraints simultaneously and return all triggered reasons."""
+    triggered_by: list[str] = []
+    details: dict[str, Any] = {}
+
+    if plan.rest_today:
+        triggered_by.append("rest_today")
+
+    if (
+        plan.max_videos is not None
+        and not next_bv_already_counted
+        and videos_processed >= plan.max_videos
+    ):
+        triggered_by.append("max_videos")
+        details["videos_processed"] = videos_processed
+        details["max_videos"] = plan.max_videos
+
+    if plan.deadline_epoch is not None and now_epoch >= plan.deadline_epoch:
+        triggered_by.append("max_minutes")
+        details["deadline_epoch"] = plan.deadline_epoch
+        details["now_epoch"] = round(now_epoch, 3)
+
+    full_status = store.get_budget_status(allowed_ratio=1.0)
+    capacity = full_status.capacity_tokens
+    cur_used_tokens = full_status.used_tokens
+    baseline_used_tokens = int(
+        round(capacity * max(0.0, min(1.0, float(plan.current_window_used_ratio))))
+    )
+    run_ledger_tokens = store.get_run_used_tokens(run_id)
+    window_delta_tokens = max(0, cur_used_tokens - baseline_used_tokens)
+    run_spent_tokens = max(run_ledger_tokens, window_delta_tokens)
+    run_spent_ratio = round(run_spent_tokens / capacity, 6)
+    window_remaining_ratio = round(max(0.0, 1.0 - (cur_used_tokens / capacity)), 6)
+
+    if full_status.in_cooldown:
+        triggered_by.append("cooldown_429")
+
+    if plan.max_use_ratio is not None:
+        max_use_tokens = int(round(capacity * plan.max_use_ratio))
+        if run_spent_tokens >= max_use_tokens:
+            triggered_by.append("max_use_ratio")
+            details["max_use_ratio"] = plan.max_use_ratio
+            details["run_spent_ratio"] = run_spent_ratio
+            details["run_spent_tokens"] = run_spent_tokens
+            details["max_use_tokens"] = max_use_tokens
+
+    if plan.reserve_ratio is not None:
+        reserve_cap_tokens = int(round(capacity * max(0.0, 1.0 - plan.reserve_ratio)))
+        if cur_used_tokens >= reserve_cap_tokens:
+            triggered_by.append("reserve_ratio")
+            details["reserve_ratio"] = plan.reserve_ratio
+            details["window_remaining_ratio"] = window_remaining_ratio
+            details["window_used_tokens"] = cur_used_tokens
+            details["reserve_cap_tokens"] = reserve_cap_tokens
+
+    if (
+        cur_used_tokens >= capacity
+        and "max_use_ratio" not in triggered_by
+        and "reserve_ratio" not in triggered_by
+    ):
+        triggered_by.append("window_exhausted")
+        details["window_used_tokens"] = cur_used_tokens
+        details["capacity_tokens"] = capacity
+
+    eff_status, _can_proceed = _check_budget_status_for_plan(store, plan)
+    return triggered_by, details, eff_status
 
 
 def _check_prepare_media_budget_limit(
@@ -430,7 +543,7 @@ def _check_prepare_media_budget_limit(
     bv_id: str,
     now_epoch: float,
 ) -> dict[str, Any] | None:
-    """Evaluate persisted `budget_plan` limits before preparing media for the next video."""
+    """Evaluate all persisted 4-condition intersection limits before preparing media."""
     if state is None:
         return None
     raw_plan = state.get("budget_plan")
@@ -438,55 +551,31 @@ def _check_prepare_media_budget_limit(
         return None
 
     plan = budget_plan_from_dict(raw_plan)
-    if plan.rest_today:
-        return {
-            "ok": True,
-            "run_id": run_id,
-            "bv_id": bv_id,
-            "stopped_reason": "budget_limit_reached",
-            "stop_detail": "rest_today",
-            "budget_plan": asdict(plan),
-        }
+    counted_bvs = set(state.get("prepared_bvs") or ()) | set(state.get("committed_bvs") or ())
+    triggered_by, details, eff_status = _evaluate_combined_budget_triggers(
+        plan,
+        store=store,
+        run_id=run_id,
+        now_epoch=now_epoch,
+        videos_processed=len(counted_bvs),
+        next_bv_already_counted=(bv_id in counted_bvs),
+    )
+    if not triggered_by:
+        return None
 
-    if plan.deadline_epoch is not None and now_epoch >= plan.deadline_epoch:
-        return {
-            "ok": True,
-            "run_id": run_id,
-            "bv_id": bv_id,
-            "stopped_reason": "budget_limit_reached",
-            "stop_detail": "max_minutes_deadline_reached",
-            "deadline_epoch": plan.deadline_epoch,
-            "now_epoch": round(now_epoch, 3),
-            "budget_plan": asdict(plan),
-        }
-
-    if plan.max_videos is not None:
-        counted_bvs = set(state.get("prepared_bvs") or ()) | set(state.get("committed_bvs") or ())
-        if bv_id not in counted_bvs and len(counted_bvs) >= plan.max_videos:
-            return {
-                "ok": True,
-                "run_id": run_id,
-                "bv_id": bv_id,
-                "stopped_reason": "budget_limit_reached",
-                "stop_detail": "max_videos_reached",
-                "videos_processed": len(counted_bvs),
-                "max_videos": plan.max_videos,
-                "budget_plan": asdict(plan),
-            }
-
-    status, can_proceed = _check_budget_status_for_plan(store, plan)
-    if not can_proceed:
-        return {
-            "ok": True,
-            "run_id": run_id,
-            "bv_id": bv_id,
-            "stopped_reason": "budget_limit_reached",
-            "stop_detail": "token_budget_exhausted_or_cooldown",
-            "budget_status": asdict(status),
-            "budget_plan": asdict(plan),
-        }
-
-    return None
+    stop_detail: dict[str, Any] = {
+        "triggered_by": triggered_by,
+        **details,
+    }
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "bv_id": bv_id,
+        "stopped_reason": "budget_limit_reached",
+        "stop_detail": stop_detail,
+        "budget_status": asdict(eff_status),
+        "budget_plan": asdict(plan),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1624,17 +1713,15 @@ def run_dry_run(
             # 6. Per-video appreciation loop (prepare audio/video -> safety gate -> appreciate -> commit -> burn)
             for item_idx, selected_item in enumerate(sel_response.selected_videos):
                 bv_id = selected_item.bv_id
-                if budget_plan.deadline_epoch is not None and float(eff_time_fn()) >= budget_plan.deadline_epoch:
-                    stopped_reason = "budget_limit_reached"
-                    break
-                if (
-                    budget_plan.max_videos is not None
-                    and (len(appreciated_bvs) + len(safety_blocked_bvs)) >= budget_plan.max_videos
-                ):
-                    stopped_reason = "budget_limit_reached"
-                    break
-                _cur_status, cur_can_proceed = _check_budget_status_for_plan(store, budget_plan)
-                if not cur_can_proceed:
+                triggered_by, _trigger_details, _cur_status = _evaluate_combined_budget_triggers(
+                    budget_plan,
+                    store=store,
+                    run_id=eff_run_id,
+                    now_epoch=float(eff_time_fn()),
+                    videos_processed=len(appreciated_bvs) + len(safety_blocked_bvs),
+                    next_bv_already_counted=False,
+                )
+                if triggered_by:
                     stopped_reason = "budget_limit_reached"
                     break
 
@@ -2079,11 +2166,7 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                     mark_recalled=True,
                 )
                 bridge = AgentBridge(cfg, persona_path=args.persona)
-                eff_max_select = (
-                    max(1, min(10, int(plan.max_videos)))
-                    if plan.max_videos is not None
-                    else args.max_select
-                )
+                eff_max_select = _resolve_effective_max_select(args.max_select, plan)
                 packet = bridge.build_selection_packet(
                     run_id=eff_run_id,
                     candidates=fresh,
@@ -2098,6 +2181,8 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                         "snapshot_path": snapshot_used,
                         "candidates_total": len(candidates),
                         "filtered_blacklist_count": len(rejected_results),
+                        "effective_max_select": eff_max_select,
+                        "max_select_guardrail": MAX_SELECT_PER_BATCH_GUARDRAIL,
                         "decision": asdict(decision),
                         "budget_plan": asdict(plan),
                         "run_state_path": str(run_state_path),
@@ -2721,10 +2806,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     p_budget = subparsers.add_parser("check-budget", help="Check 5h window compute budget")
-    p_budget.add_argument("--budget-ratio", type=float, default=None)
-    p_budget.add_argument("--max-videos", dest="budget_max_videos", type=int, default=None)
-    p_budget.add_argument("--reserve-ratio", type=float, default=None)
-    p_budget.add_argument("--max-minutes", type=float, default=None)
+    p_budget.add_argument(
+        "--budget-ratio",
+        type=float,
+        default=None,
+        help="Max 5h window ratio to consume this run (0.0-1.0); combinable with other flags; skips popup",
+    )
+    p_budget.add_argument(
+        "--max-videos",
+        dest="budget_max_videos",
+        type=int,
+        default=None,
+        help="Max distinct videos to watch this run (>=0); combinable with other flags; skips popup",
+    )
+    p_budget.add_argument(
+        "--reserve-ratio",
+        type=float,
+        default=None,
+        help="Min 5h window remaining ratio floor (0.0-1.0); combinable with other flags; skips popup",
+    )
+    p_budget.add_argument(
+        "--max-minutes",
+        type=float,
+        default=None,
+        help="Max patrol duration in minutes (>0); combinable with other flags; skips popup",
+    )
     p_budget.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
     p_budget.add_argument("--output", default=argparse.SUPPRESS)
 
@@ -2736,11 +2842,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("--snapshot", default=argparse.SUPPRESS)
     p_feed.add_argument("--offline", action="store_true")
     p_feed.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
-    p_feed.add_argument("--budget-ratio", type=float, default=None, help="Explicit use_ratio budget (0.0-1.0); skips popup")
-    p_feed.add_argument("--max-videos", dest="budget_max_videos", type=int, default=None, help="Explicit max_videos budget (>=1); skips popup")
-    p_feed.add_argument("--reserve-ratio", type=float, default=None, help="Explicit reserve_ratio budget (0.0-1.0); skips popup")
-    p_feed.add_argument("--max-minutes", type=float, default=None, help="Explicit max_minutes duration cap (>0); skips popup")
-    p_feed.add_argument("--max-select", type=int, default=5)
+    p_feed.add_argument(
+        "--budget-ratio",
+        type=float,
+        default=None,
+        help="Max 5h window ratio to consume this run (0.0-1.0); combinable; unpassed flags become unlimited",
+    )
+    p_feed.add_argument(
+        "--max-videos",
+        dest="budget_max_videos",
+        type=int,
+        default=None,
+        help="Max distinct videos to watch this run (>=0); combinable; unpassed flags become unlimited",
+    )
+    p_feed.add_argument(
+        "--reserve-ratio",
+        type=float,
+        default=None,
+        help="Min 5h window remaining ratio floor (0.0-1.0); combinable; unpassed flags become unlimited",
+    )
+    p_feed.add_argument(
+        "--max-minutes",
+        type=float,
+        default=None,
+        help="Max patrol duration in minutes (>0); combinable; unpassed flags become unlimited",
+    )
+    p_feed.add_argument(
+        "--max-select",
+        type=int,
+        default=None,
+        help=(
+            f"Per-batch selection cap (default {DEFAULT_MAX_SELECT} when max_videos is unlimited; "
+            f"auto-follows max_videos up to anti-abuse guardrail {MAX_SELECT_PER_BATCH_GUARDRAIL})"
+        ),
+    )
     p_feed.add_argument("--lease-ttl-sec", type=int, default=DEFAULT_RUN_LEASE_TTL_SEC)
     p_feed.add_argument("--export-dir", default=argparse.SUPPRESS)
     p_feed.add_argument("--cloud-dir", default=argparse.SUPPRESS)

@@ -132,7 +132,10 @@
     "recall_stability_boost": 0.5
   },
   "budget_and_runtime": {
-    "default_window_budget_ratio": 0.35,
+    "default_window_budget_ratio": 0.4,
+    "default_max_videos": 100,
+    "default_reserve_ratio": 0.30,
+    "default_max_minutes": 30,
     "startup_popup_timeout_sec": 60,
     "enable_startup_popup": true,
     "enable_toast_notification": true,

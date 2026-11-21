@@ -158,6 +158,7 @@ class MemoryConfig:
 
 
 BudgetControlMode = Literal[
+    "combined",
     "use_ratio",
     "max_videos",
     "reserve_ratio",
@@ -166,26 +167,121 @@ BudgetControlMode = Literal[
 ]
 
 
+def compute_effective_allowed_ratio(
+    *,
+    max_use_ratio: float | None,
+    reserve_ratio: float | None,
+    current_window_used_ratio: float = 0.0,
+    rest_today: bool = False,
+) -> float:
+    """Compute effective per-run allowed token ratio as the strictest intersection.
+
+    Formula:
+        min(
+            max(0.0, 1.0 - current_window_used_ratio),
+            max_use_ratio (if non-None),
+            max(0.0, 1.0 - reserve_ratio - current_window_used_ratio) (if non-None),
+        )
+    When both `max_use_ratio` and `reserve_ratio` are None, falls back to
+    `max(0.0, 1.0 - current_window_used_ratio)`. Returns `0.0` when `rest_today` is True.
+    """
+    if rest_today:
+        return 0.0
+    used = max(0.0, min(1.0, float(current_window_used_ratio)))
+    window_remaining = max(0.0, 1.0 - used)
+    limits: list[float] = [window_remaining]
+    if max_use_ratio is not None:
+        limits.append(max(0.0, min(1.0, float(max_use_ratio))))
+    if reserve_ratio is not None:
+        limits.append(max(0.0, 1.0 - float(reserve_ratio) - used))
+    return round(max(0.0, min(limits)), 4)
+
+
+def compute_window_cap_ratio(
+    *,
+    max_use_ratio: float | None,
+    reserve_ratio: float | None,
+    current_window_used_ratio: float = 0.0,
+    rest_today: bool = False,
+) -> float:
+    """Compute cumulative 5h-window usage ceiling corresponding to the intersection constraints."""
+    if rest_today:
+        return 0.0
+    used = max(0.0, min(1.0, float(current_window_used_ratio)))
+    caps: list[float] = [1.0]
+    if max_use_ratio is not None:
+        caps.append(min(1.0, used + max(0.0, min(1.0, float(max_use_ratio)))))
+    if reserve_ratio is not None:
+        caps.append(max(0.0, 1.0 - max(0.0, min(1.0, float(reserve_ratio)))))
+    return round(max(0.0, min(caps)), 4)
+
+
 @dataclass(frozen=True)
 class BudgetPlan:
-    """Unified 4-in-1 budget control plan persisted across prepare-feed -> prepare-media."""
+    """Unified 4-condition intersection budget plan persisted across prepare-feed -> prepare-media.
 
-    mode: BudgetControlMode
-    allowed_ratio: float
-    window_cap_ratio: float
-    current_window_used_ratio: float = 0.0
-    use_ratio: float | None = None
+    All non-None constraints apply simultaneously (strictest intersection; first limit hit stops).
+    """
+
+    mode: BudgetControlMode = "combined"
+    max_use_ratio: float | None = None
     max_videos: int | None = None
     reserve_ratio: float | None = None
-    max_minutes: float | None = None
+    max_minutes: int | float | None = None
+    current_window_used_ratio: float = 0.0
+    effective_allowed_ratio: float = -1.0
+    allowed_ratio: float = -1.0
+    window_cap_ratio: float = -1.0
+    use_ratio: float | None = None
     started_epoch: float | None = None
     deadline_epoch: float | None = None
     rest_today: bool = False
 
+    def __post_init__(self) -> None:
+        eff_max_use = self.max_use_ratio if self.max_use_ratio is not None else self.use_ratio
+        if self.max_use_ratio != eff_max_use:
+            object.__setattr__(self, "max_use_ratio", eff_max_use)
+        if self.use_ratio != eff_max_use:
+            object.__setattr__(self, "use_ratio", eff_max_use)
+
+        computed_eff = compute_effective_allowed_ratio(
+            max_use_ratio=eff_max_use,
+            reserve_ratio=self.reserve_ratio,
+            current_window_used_ratio=self.current_window_used_ratio,
+            rest_today=self.rest_today,
+        )
+        if self.effective_allowed_ratio < 0.0 and self.allowed_ratio < 0.0:
+            eff_ratio = computed_eff
+        elif self.effective_allowed_ratio < 0.0:
+            eff_ratio = round(max(0.0, min(1.0, float(self.allowed_ratio))), 4)
+        else:
+            eff_ratio = round(max(0.0, min(1.0, float(self.effective_allowed_ratio))), 4)
+
+        object.__setattr__(self, "effective_allowed_ratio", eff_ratio)
+        if self.allowed_ratio < 0.0:
+            object.__setattr__(self, "allowed_ratio", eff_ratio)
+        else:
+            object.__setattr__(
+                self, "allowed_ratio", round(max(0.0, min(1.0, float(self.allowed_ratio))), 4)
+            )
+
+        if self.window_cap_ratio < 0.0:
+            cap = compute_window_cap_ratio(
+                max_use_ratio=eff_max_use,
+                reserve_ratio=self.reserve_ratio,
+                current_window_used_ratio=self.current_window_used_ratio,
+                rest_today=self.rest_today,
+            )
+            object.__setattr__(self, "window_cap_ratio", cap)
+        else:
+            object.__setattr__(
+                self, "window_cap_ratio", round(max(0.0, min(1.0, float(self.window_cap_ratio))), 4)
+            )
+
 
 @dataclass(frozen=True)
 class BudgetAndRuntimeConfig:
-    default_window_budget_ratio: float
+    default_window_budget_ratio: float | None
     startup_popup_timeout_sec: int
     enable_startup_popup: bool
     enable_toast_notification: bool
@@ -194,10 +290,10 @@ class BudgetAndRuntimeConfig:
     token_calibration_k: float
     lock_file_path: str
     cooldown_hours_on_429: int
-    default_budget_mode: BudgetControlMode = "use_ratio"
-    default_max_videos: int = 3
-    default_reserve_ratio: float = 0.40
-    default_max_minutes: int = 15
+    default_budget_mode: BudgetControlMode = "combined"
+    default_max_videos: int | None = 100
+    default_reserve_ratio: float | None = 0.30
+    default_max_minutes: int | None = 30
 
 
 @dataclass(frozen=True)

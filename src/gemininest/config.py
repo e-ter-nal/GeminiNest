@@ -491,9 +491,17 @@ def _parse_memory(raw: Mapping[str, Any]) -> MemoryConfig:
 
 def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
     sec = _require_dict(raw, "budget_and_runtime", "root")
-    ratio = _require_float(sec, "default_window_budget_ratio", "budget_and_runtime")
-    if not (0.0 < ratio <= 1.0):
-        raise _config_error("'budget_and_runtime.default_window_budget_ratio' must be in (0.0, 1.0]")
+    if "default_window_budget_ratio" not in sec:
+        raise _config_error("Missing required field 'budget_and_runtime.default_window_budget_ratio'")
+    raw_ratio = sec["default_window_budget_ratio"]
+    ratio: float | None
+    if raw_ratio is None:
+        ratio = None
+    else:
+        ratio = _require_float(sec, "default_window_budget_ratio", "budget_and_runtime")
+        if not (0.0 < ratio <= 1.0):
+            raise _config_error("'budget_and_runtime.default_window_budget_ratio' must be in (0.0, 1.0] or null")
+
     popup_timeout = _require_int(sec, "startup_popup_timeout_sec", "budget_and_runtime")
     if popup_timeout <= 0:
         raise _config_error("'budget_and_runtime.startup_popup_timeout_sec' must be > 0")
@@ -510,33 +518,44 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
     if cooldown <= 0:
         raise _config_error("'budget_and_runtime.cooldown_hours_on_429' must be > 0")
 
-    default_budget_mode: Literal["use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"] = "use_ratio"
+    default_budget_mode: Literal[
+        "combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"
+    ] = "combined"
     if "default_budget_mode" in sec:
         raw_mode = _require_str(sec, "default_budget_mode", "budget_and_runtime")
-        if raw_mode not in ("use_ratio", "max_videos", "reserve_ratio", "max_minutes"):
+        if raw_mode not in ("combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes"):
             raise _config_error(
                 f"Invalid 'budget_and_runtime.default_budget_mode': {raw_mode!r}; "
-                "expected one of 'use_ratio', 'max_videos', 'reserve_ratio', 'max_minutes'"
+                "expected one of 'combined', 'use_ratio', 'max_videos', 'reserve_ratio', 'max_minutes'"
             )
         default_budget_mode = raw_mode  # type: ignore[assignment]
 
-    default_max_videos = 3
+    default_max_videos: int | None = 100
     if "default_max_videos" in sec:
-        default_max_videos = _require_int(sec, "default_max_videos", "budget_and_runtime")
-        if default_max_videos < 1:
-            raise _config_error("'budget_and_runtime.default_max_videos' must be >= 1")
+        if sec["default_max_videos"] is None:
+            default_max_videos = None
+        else:
+            default_max_videos = _require_int(sec, "default_max_videos", "budget_and_runtime")
+            if default_max_videos < 1:
+                raise _config_error("'budget_and_runtime.default_max_videos' must be >= 1 or null")
 
-    default_reserve_ratio = 0.40
+    default_reserve_ratio: float | None = 0.30
     if "default_reserve_ratio" in sec:
-        default_reserve_ratio = _require_float(sec, "default_reserve_ratio", "budget_and_runtime")
-        if not (0.0 <= default_reserve_ratio <= 1.0):
-            raise _config_error("'budget_and_runtime.default_reserve_ratio' must be in [0.0, 1.0]")
+        if sec["default_reserve_ratio"] is None:
+            default_reserve_ratio = None
+        else:
+            default_reserve_ratio = _require_float(sec, "default_reserve_ratio", "budget_and_runtime")
+            if not (0.0 <= default_reserve_ratio <= 1.0):
+                raise _config_error("'budget_and_runtime.default_reserve_ratio' must be in [0.0, 1.0] or null")
 
-    default_max_minutes = 15
+    default_max_minutes: int | None = 30
     if "default_max_minutes" in sec:
-        default_max_minutes = _require_int(sec, "default_max_minutes", "budget_and_runtime")
-        if default_max_minutes < 1:
-            raise _config_error("'budget_and_runtime.default_max_minutes' must be >= 1")
+        if sec["default_max_minutes"] is None:
+            default_max_minutes = None
+        else:
+            default_max_minutes = _require_int(sec, "default_max_minutes", "budget_and_runtime")
+            if default_max_minutes < 1:
+                raise _config_error("'budget_and_runtime.default_max_minutes' must be >= 1 or null")
 
     return BudgetAndRuntimeConfig(
         default_window_budget_ratio=ratio,

@@ -45,6 +45,10 @@ def test_load_repo_config_without_local_file(tmp_path: Path) -> None:
     assert cfg.safety_alignment.min_general_score == pytest.approx(0.20)
     assert cfg.safety_alignment.max_sensitive_score == pytest.approx(0.75)
     assert cfg.safety_alignment.max_unsafe_score == pytest.approx(0.05)
+    assert cfg.budget_and_runtime.default_window_budget_ratio == pytest.approx(0.4)
+    assert cfg.budget_and_runtime.default_max_videos == 100
+    assert cfg.budget_and_runtime.default_reserve_ratio == pytest.approx(0.30)
+    assert cfg.budget_and_runtime.default_max_minutes == 30
     assert "原神" in cfg.safety_alignment.blacklist.tags
     assert len(ErrorCode) == 18
 
@@ -255,3 +259,79 @@ def test_sync_export_private_thought_optional_switch(tmp_path: Path) -> None:
     with pytest.raises(GeminiNestError) as exc_info:
         load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
     assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID
+
+
+def test_budget_4_condition_defaults_null_overrides_and_legacy_compat(tmp_path: Path) -> None:
+    # 1. Local override with custom numeric values & null (unlimited)
+    local_custom = tmp_path / "local_budget_custom.json"
+    local_custom.write_text(
+        json.dumps(
+            {
+                "budget_and_runtime": {
+                    "default_window_budget_ratio": None,
+                    "default_max_videos": 200,
+                    "default_reserve_ratio": 0.25,
+                    "default_max_minutes": None,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_custom = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_custom)
+    assert cfg_custom.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg_custom.budget_and_runtime.default_max_videos == 200
+    assert cfg_custom.budget_and_runtime.default_reserve_ratio == pytest.approx(0.25)
+    assert cfg_custom.budget_and_runtime.default_max_minutes is None
+
+    # 2. All 4 budget defaults set to null in local override
+    local_all_null = tmp_path / "local_budget_all_null.json"
+    local_all_null.write_text(
+        json.dumps(
+            {
+                "budget_and_runtime": {
+                    "default_window_budget_ratio": None,
+                    "default_max_videos": None,
+                    "default_reserve_ratio": None,
+                    "default_max_minutes": None,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_null = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_all_null)
+    assert cfg_null.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg_null.budget_and_runtime.default_max_videos is None
+    assert cfg_null.budget_and_runtime.default_reserve_ratio is None
+    assert cfg_null.budget_and_runtime.default_max_minutes is None
+
+    # 3. Legacy config.json without new 3 fields and with legacy default_budget_mode still loads cleanly
+    legacy = copy.deepcopy(_load_base_dict())
+    legacy["budget_and_runtime"].pop("default_max_videos", None)
+    legacy["budget_and_runtime"].pop("default_reserve_ratio", None)
+    legacy["budget_and_runtime"].pop("default_max_minutes", None)
+    legacy["budget_and_runtime"]["default_budget_mode"] = "use_ratio"
+    legacy_file = tmp_path / "legacy_budget.json"
+    legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    cfg_legacy = load_config(config_path=legacy_file, local_config_path=None)
+    assert cfg_legacy.budget_and_runtime.default_max_videos == 100
+    assert cfg_legacy.budget_and_runtime.default_reserve_ratio == pytest.approx(0.30)
+    assert cfg_legacy.budget_and_runtime.default_max_minutes == 30
+    assert cfg_legacy.budget_and_runtime.default_budget_mode == "use_ratio"
+
+    # 4. Invalid budget values raise E1001_CONFIG_INVALID
+    for bad_patch in (
+        {"default_window_budget_ratio": 0.0},
+        {"default_window_budget_ratio": 1.2},
+        {"default_window_budget_ratio": True},
+        {"default_max_videos": 0},
+        {"default_max_videos": True},
+        {"default_reserve_ratio": -0.1},
+        {"default_reserve_ratio": 1.1},
+        {"default_max_minutes": 0},
+        {"default_max_minutes": False},
+    ):
+        bad_local = tmp_path / "bad_budget.json"
+        bad_local.write_text(json.dumps({"budget_and_runtime": bad_patch}), encoding="utf-8")
+        with pytest.raises(GeminiNestError) as exc_info:
+            load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
+        assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID

@@ -369,11 +369,11 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         t0 = datetime(2026, 11, 19, 10, 15, 0, tzinfo=timezone.utc)
         bucket_t0 = compute_window_bucket(t0)
 
-        # Default capacity=1,400,000, allowed_ratio=0.35 -> allowed=490,000
+        # Default capacity=1,400,000, allowed_ratio=0.4 -> allowed=560,000
         status0 = store.get_budget_status(now=t0)
         assert status0.window_bucket == bucket_t0
         assert status0.used_tokens == 0
-        assert status0.remaining_tokens == 490_000
+        assert status0.remaining_tokens == 560_000
         assert status0.in_cooldown is False
 
         # Record 200,000 tokens with calibration_k=1.2 -> 240,000 total_est_tokens
@@ -386,31 +386,33 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
             now=t0 + timedelta(minutes=10),
         )
         assert entry1.total_est_tokens == 240_000
+        assert store.get_run_used_tokens("run-001") == 240_000
 
-        # Record another 300,000 tokens in same 5h bucket -> used=540,000 (> 490,000 allowed)
+        # Record another 350,000 tokens in same 5h bucket -> used=590,000 (> 560,000 allowed)
         store.record_budget_usage(
             run_id="run-002",
-            est_audio_tokens=300_000,
+            est_audio_tokens=350_000,
             calibration_k=1.0,
             now=t0 + timedelta(minutes=20),
         )
         status_exceeded = store.get_budget_status(now=t0 + timedelta(minutes=30))
-        assert status_exceeded.used_tokens == 540_000
+        assert status_exceeded.used_tokens == 590_000
         assert status_exceeded.remaining_tokens == 0
+        assert store.get_run_used_tokens("run-002") == 350_000
 
         # Raising allowed_ratio via popup (e.g. 0.50 -> 700,000) restores remaining budget
         status_raised = store.get_budget_status(
             now=t0 + timedelta(minutes=30),
             allowed_ratio=0.50,
         )
-        assert status_raised.remaining_tokens == 160_000
+        assert status_raised.remaining_tokens == 110_000
 
         # Different 5h window bucket starts fresh
         t_next_window = t0 + timedelta(hours=5)
         assert compute_window_bucket(t_next_window) != bucket_t0
         status_next = store.get_budget_status(now=t_next_window)
         assert status_next.used_tokens == 0
-        assert status_next.remaining_tokens == 490_000
+        assert status_next.remaining_tokens == 560_000
 
         # Trigger 429 rate limit -> cooldown active for < 5h, expires at exact 5h boundary
         t_429 = t_next_window + timedelta(minutes=5)
@@ -427,6 +429,18 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         status_expired = store.get_budget_status(now=t_429 + timedelta(hours=5))
         assert status_expired.in_cooldown is False
         assert status_expired.remaining_tokens > 0
+
+    # When default_window_budget_ratio is None (unlimited), get_budget_status() falls back safely to 1.0
+    from dataclasses import replace as dc_replace
+
+    unlimited_cfg = dc_replace(
+        cfg,
+        budget_and_runtime=dc_replace(cfg.budget_and_runtime, default_window_budget_ratio=None),
+    )
+    with MemoryStore.from_config(unlimited_cfg, db_path=":memory:") as unlimited_store:
+        st_unlim = unlimited_store.get_budget_status(now=t0)
+        assert st_unlim.allowed_ratio == pytest.approx(1.0)
+        assert st_unlim.remaining_tokens == 1_400_000
 
 
 def test_legacy_db_migration_preserves_old_data_and_enables_new_features(tmp_path: Path) -> None:

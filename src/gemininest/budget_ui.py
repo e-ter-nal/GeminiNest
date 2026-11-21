@@ -1,4 +1,4 @@
-"""Startup non-intrusive 4-mode tkinter budget popup and Windows native Toast notifications."""
+"""Startup non-intrusive 4-condition intersection tkinter budget popup and Windows Toast notifications."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from gemininest.contracts import (
     BudgetControlMode,
     BudgetPlan,
     BudgetStatus,
+    compute_effective_allowed_ratio,
+    compute_window_cap_ratio,
 )
 
 __all__ = [
@@ -29,6 +31,8 @@ __all__ = [
     "BudgetDecisionSource",
     "budget_plan_from_dict",
     "build_budget_plan",
+    "compute_effective_allowed_ratio",
+    "compute_window_cap_ratio",
     "decision_from_plan",
     "notify_auth_expired",
     "notify_high_score_video",
@@ -76,10 +80,11 @@ class BudgetDecision:
     source: BudgetDecisionSource
     elapsed_sec: float
     rest_today: bool
-    mode: BudgetControlMode = "use_ratio"
+    mode: BudgetControlMode = "combined"
+    max_use_ratio: float | None = None
     max_videos: int | None = None
     reserve_ratio: float | None = None
-    max_minutes: float | None = None
+    max_minutes: int | float | None = None
     deadline_epoch: float | None = None
     budget_plan: BudgetPlan | None = None
 
@@ -95,12 +100,12 @@ def _extract_budget_cfg(cfg: AppConfig | BudgetAndRuntimeConfig) -> BudgetAndRun
 
 
 # ---------------------------------------------------------------------------
-# Input Parsers & Unified 4-in-1 BudgetPlan Builders
+# Input Parsers & Unified 4-Condition Intersection BudgetPlan Builders
 # ---------------------------------------------------------------------------
 
 
 def parse_budget_ratio_input(raw_text: str) -> float | None:
-    """Parse user-entered ratio string in [0.0, 1.0] (also accepts '35%' -> 0.35)."""
+    """Parse user-entered ratio string in [0.0, 1.0] (also accepts '40%' -> 0.40)."""
     cleaned = raw_text.strip()
     if not cleaned:
         return None
@@ -119,7 +124,7 @@ def parse_budget_ratio_input(raw_text: str) -> float | None:
 
 
 def parse_positive_int_input(raw_text: str) -> int | None:
-    """Parse a positive integer string (e.g. '3' for max_videos)."""
+    """Parse a positive integer string (e.g. '100' for max_videos)."""
     cleaned = raw_text.strip()
     if not cleaned:
         return None
@@ -133,7 +138,7 @@ def parse_positive_int_input(raw_text: str) -> int | None:
 
 
 def parse_positive_float_input(raw_text: str) -> float | None:
-    """Parse a positive float string (e.g. '15' or '7.5' for max_minutes)."""
+    """Parse a positive float string (e.g. '30' or '7.5' for max_minutes)."""
     cleaned = raw_text.strip()
     if not cleaned:
         return None
@@ -146,132 +151,228 @@ def parse_positive_float_input(raw_text: str) -> float | None:
     return round(val, 2)
 
 
+def _normalize_minutes_value(val: int | float) -> int | float:
+    fval = round(float(val), 2)
+    if fval.is_integer():
+        return int(fval)
+    return fval
+
+
 def build_budget_plan(
-    mode: BudgetControlMode,
+    mode: BudgetControlMode | None = None,
     *,
     value: float | int | None = None,
+    max_use_ratio: float | None = None,
+    max_videos: int | None = None,
+    reserve_ratio: float | None = None,
+    max_minutes: int | float | None = None,
+    rest_today: bool = False,
     current_window_used_ratio: float = 0.0,
     now_epoch: float | None = None,
 ) -> BudgetPlan:
-    """Build a normalized frozen `BudgetPlan` for any of the 4 control modes or `rest`."""
-    used = round(max(0.0, min(1.0, float(current_window_used_ratio))), 6)
+    """Build a normalized frozen `BudgetPlan` using 4-condition strictest intersection.
 
-    if mode == "rest":
+    Supports both:
+    - Combined 4-condition calls (`mode=None` or `mode="combined"`): any combination of
+      `max_use_ratio`, `max_videos`, `reserve_ratio`, `max_minutes` (each `None` = unlimited).
+    - Legacy single-mode calls (`mode="use_ratio"|"max_videos"|"reserve_ratio"|"max_minutes"|"rest"`,
+      with `value=...`) for full backward compatibility.
+    """
+    used = round(max(0.0, min(1.0, float(current_window_used_ratio))), 6)
+    eff_mode: BudgetControlMode = "combined" if mode is None else mode
+
+    if eff_mode == "rest" or rest_today:
         return BudgetPlan(
             mode="rest",
+            max_use_ratio=0.0 if max_use_ratio == 0.0 else None,
+            use_ratio=0.0 if max_use_ratio == 0.0 else None,
+            max_videos=0,
+            reserve_ratio=None,
+            max_minutes=None,
+            current_window_used_ratio=used,
+            effective_allowed_ratio=0.0,
             allowed_ratio=0.0,
             window_cap_ratio=0.0,
-            current_window_used_ratio=used,
-            max_videos=0,
+            started_epoch=None,
+            deadline_epoch=None,
             rest_today=True,
         )
 
-    if mode == "use_ratio":
+    # Map legacy single-mode positional/value invocations into the combined parameters.
+    if eff_mode == "use_ratio" and max_use_ratio is None:
         if value is None:
             raise ValueError("use_ratio mode requires a numeric ratio in [0.0, 1.0]")
-        ratio = round(float(value), 4)
-        if not (0.0 <= ratio <= 1.0):
-            raise ValueError(f"use_ratio must be in [0.0, 1.0], got {ratio}")
-        if ratio <= 0.0:
-            return BudgetPlan(
-                mode="rest",
-                allowed_ratio=0.0,
-                window_cap_ratio=0.0,
-                current_window_used_ratio=used,
-                use_ratio=0.0,
-                max_videos=0,
-                rest_today=True,
-            )
-        return BudgetPlan(
-            mode="use_ratio",
-            allowed_ratio=ratio,
-            window_cap_ratio=ratio,
-            current_window_used_ratio=used,
-            use_ratio=ratio,
-            rest_today=False,
-        )
-
-    if mode == "max_videos":
+        max_use_ratio = float(value)
+    elif eff_mode == "max_videos" and max_videos is None:
         if value is None or isinstance(value, bool):
             raise ValueError("max_videos mode requires a non-negative integer")
-        count = int(value)
-        if count < 0 or float(value) != float(count):
+        if float(value) != float(int(value)):
             raise ValueError(f"max_videos must be a non-negative integer, got {value!r}")
+        max_videos = int(value)
+    elif eff_mode == "reserve_ratio" and reserve_ratio is None:
+        if value is None:
+            raise ValueError("reserve_ratio mode requires a numeric ratio in [0.0, 1.0]")
+        reserve_ratio = float(value)
+    elif eff_mode == "max_minutes" and max_minutes is None:
+        if value is None:
+            raise ValueError("max_minutes mode requires a positive duration in minutes")
+        max_minutes = value
+    elif eff_mode not in ("combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes"):
+        raise ValueError(f"Unsupported budget control mode: {eff_mode!r}")
+
+    # Validate each non-None constraint independently.
+    norm_use: float | None = None
+    if max_use_ratio is not None:
+        if isinstance(max_use_ratio, bool):
+            raise ValueError("max_use_ratio must be a number in [0.0, 1.0]")
+        norm_use = round(float(max_use_ratio), 4)
+        if not (0.0 <= norm_use <= 1.0):
+            raise ValueError(f"max_use_ratio must be in [0.0, 1.0], got {norm_use}")
+        if norm_use <= 0.0:
+            return BudgetPlan(
+                mode="rest",
+                max_use_ratio=0.0,
+                use_ratio=0.0,
+                max_videos=0,
+                reserve_ratio=None,
+                max_minutes=None,
+                current_window_used_ratio=used,
+                effective_allowed_ratio=0.0,
+                allowed_ratio=0.0,
+                window_cap_ratio=0.0,
+                started_epoch=None,
+                deadline_epoch=None,
+                rest_today=True,
+            )
+
+    norm_videos: int | None = None
+    if max_videos is not None:
+        if isinstance(max_videos, bool):
+            raise ValueError("max_videos must be a non-negative integer")
+        count = int(max_videos)
+        if count < 0 or float(max_videos) != float(count):
+            raise ValueError(f"max_videos must be a non-negative integer, got {max_videos!r}")
         if count == 0:
             return BudgetPlan(
                 mode="rest",
+                max_use_ratio=norm_use,
+                use_ratio=norm_use,
+                max_videos=0,
+                reserve_ratio=None,
+                max_minutes=None,
+                current_window_used_ratio=used,
+                effective_allowed_ratio=0.0,
                 allowed_ratio=0.0,
                 window_cap_ratio=0.0,
-                current_window_used_ratio=used,
-                max_videos=0,
+                started_epoch=None,
+                deadline_epoch=None,
                 rest_today=True,
             )
-        return BudgetPlan(
-            mode="max_videos",
-            allowed_ratio=1.0,
-            window_cap_ratio=1.0,
-            current_window_used_ratio=used,
-            max_videos=count,
-            rest_today=False,
-        )
+        norm_videos = count
 
-    if mode == "reserve_ratio":
-        if value is None:
-            raise ValueError("reserve_ratio mode requires a numeric ratio in [0.0, 1.0]")
-        reserve = round(float(value), 4)
-        if not (0.0 <= reserve <= 1.0):
-            raise ValueError(f"reserve_ratio must be in [0.0, 1.0], got {reserve}")
-        allowed = round(max(0.0, 1.0 - reserve - used), 4)
-        window_cap = round(max(0.0, min(1.0, 1.0 - reserve)), 4)
-        return BudgetPlan(
-            mode="reserve_ratio",
-            allowed_ratio=allowed,
-            window_cap_ratio=window_cap,
-            current_window_used_ratio=used,
-            reserve_ratio=reserve,
-            rest_today=False,
-        )
+    norm_reserve: float | None = None
+    if reserve_ratio is not None:
+        if isinstance(reserve_ratio, bool):
+            raise ValueError("reserve_ratio must be a number in [0.0, 1.0]")
+        norm_reserve = round(float(reserve_ratio), 4)
+        if not (0.0 <= norm_reserve <= 1.0):
+            raise ValueError(f"reserve_ratio must be in [0.0, 1.0], got {norm_reserve}")
 
-    if mode == "max_minutes":
-        if value is None:
-            raise ValueError("max_minutes mode requires a positive duration in minutes")
-        minutes = round(float(value), 2)
-        if minutes <= 0.0:
-            raise ValueError(f"max_minutes must be > 0, got {minutes}")
+    norm_minutes: int | float | None = None
+    started: float | None = None
+    deadline: float | None = None
+    if max_minutes is not None:
+        if isinstance(max_minutes, bool):
+            raise ValueError("max_minutes must be > 0")
+        m_float = round(float(max_minutes), 2)
+        if m_float <= 0.0:
+            raise ValueError(f"max_minutes must be > 0, got {m_float}")
+        norm_minutes = _normalize_minutes_value(m_float)
         started = round(time.time() if now_epoch is None else float(now_epoch), 3)
-        deadline = round(started + minutes * 60.0, 3)
-        return BudgetPlan(
-            mode="max_minutes",
-            allowed_ratio=1.0,
-            window_cap_ratio=1.0,
-            current_window_used_ratio=used,
-            max_minutes=minutes,
-            started_epoch=started,
-            deadline_epoch=deadline,
-            rest_today=False,
-        )
+        deadline = round(started + float(m_float) * 60.0, 3)
 
-    raise ValueError(f"Unsupported budget control mode: {mode!r}")
+    effective_allowed = compute_effective_allowed_ratio(
+        max_use_ratio=norm_use,
+        reserve_ratio=norm_reserve,
+        current_window_used_ratio=used,
+        rest_today=False,
+    )
+    window_cap = compute_window_cap_ratio(
+        max_use_ratio=norm_use,
+        reserve_ratio=norm_reserve,
+        current_window_used_ratio=used,
+        rest_today=False,
+    )
+
+    return BudgetPlan(
+        mode=eff_mode,
+        max_use_ratio=norm_use,
+        use_ratio=norm_use,
+        max_videos=norm_videos,
+        reserve_ratio=norm_reserve,
+        max_minutes=norm_minutes,
+        current_window_used_ratio=used,
+        effective_allowed_ratio=effective_allowed,
+        allowed_ratio=effective_allowed,
+        window_cap_ratio=window_cap,
+        started_epoch=started,
+        deadline_epoch=deadline,
+        rest_today=False,
+    )
 
 
 def budget_plan_from_dict(data: Mapping[str, Any]) -> BudgetPlan:
-    """Deserialize a persisted `BudgetPlan` JSON mapping."""
-    raw_mode = str(data.get("mode", "use_ratio"))
-    if raw_mode not in ("use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"):
-        raw_mode = "use_ratio"
+    """Deserialize a persisted `BudgetPlan` JSON mapping (supports new & legacy run_states)."""
+    raw_mode = str(data.get("mode", "combined"))
+    if raw_mode not in ("combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"):
+        raw_mode = "combined"
     typed_mode: BudgetControlMode = raw_mode  # type: ignore[assignment]
+
+    raw_max_use = data["max_use_ratio"] if "max_use_ratio" in data else data.get("use_ratio")
+    max_use_ratio = None if raw_max_use is None else float(raw_max_use)
+    max_videos = None if data.get("max_videos") is None else int(data["max_videos"])
+    reserve_ratio = None if data.get("reserve_ratio") is None else float(data["reserve_ratio"])
+    raw_minutes = data.get("max_minutes")
+    max_minutes = None if raw_minutes is None else _normalize_minutes_value(float(raw_minutes))
+    used = float(data.get("current_window_used_ratio", 0.0))
+    rest_today = bool(data.get("rest_today", typed_mode == "rest"))
+
+    if "effective_allowed_ratio" in data and data["effective_allowed_ratio"] is not None:
+        eff_allowed = float(data["effective_allowed_ratio"])
+    elif "allowed_ratio" in data and data["allowed_ratio"] is not None:
+        eff_allowed = float(data["allowed_ratio"])
+    else:
+        eff_allowed = compute_effective_allowed_ratio(
+            max_use_ratio=max_use_ratio,
+            reserve_ratio=reserve_ratio,
+            current_window_used_ratio=used,
+            rest_today=rest_today,
+        )
+
+    if "window_cap_ratio" in data and data["window_cap_ratio"] is not None:
+        window_cap = float(data["window_cap_ratio"])
+    else:
+        window_cap = compute_window_cap_ratio(
+            max_use_ratio=max_use_ratio,
+            reserve_ratio=reserve_ratio,
+            current_window_used_ratio=used,
+            rest_today=rest_today,
+        )
+
     return BudgetPlan(
         mode=typed_mode,
-        allowed_ratio=float(data.get("allowed_ratio", 0.0)),
-        window_cap_ratio=float(data.get("window_cap_ratio", data.get("allowed_ratio", 0.0))),
-        current_window_used_ratio=float(data.get("current_window_used_ratio", 0.0)),
-        use_ratio=None if data.get("use_ratio") is None else float(data["use_ratio"]),
-        max_videos=None if data.get("max_videos") is None else int(data["max_videos"]),
-        reserve_ratio=None if data.get("reserve_ratio") is None else float(data["reserve_ratio"]),
-        max_minutes=None if data.get("max_minutes") is None else float(data["max_minutes"]),
+        max_use_ratio=max_use_ratio,
+        use_ratio=max_use_ratio,
+        max_videos=max_videos,
+        reserve_ratio=reserve_ratio,
+        max_minutes=max_minutes,
+        current_window_used_ratio=used,
+        effective_allowed_ratio=eff_allowed,
+        allowed_ratio=eff_allowed,
+        window_cap_ratio=window_cap,
         started_epoch=None if data.get("started_epoch") is None else float(data["started_epoch"]),
         deadline_epoch=None if data.get("deadline_epoch") is None else float(data["deadline_epoch"]),
-        rest_today=bool(data.get("rest_today", False)),
+        rest_today=rest_today,
     )
 
 
@@ -283,11 +384,12 @@ def decision_from_plan(
 ) -> BudgetDecision:
     """Construct a backward-compatible `BudgetDecision` wrapping a `BudgetPlan`."""
     return BudgetDecision(
-        budget_ratio=plan.allowed_ratio,
+        budget_ratio=plan.effective_allowed_ratio,
         source=source,
         elapsed_sec=max(0.0, round(float(elapsed_sec), 3)),
         rest_today=plan.rest_today,
         mode=plan.mode,
+        max_use_ratio=plan.max_use_ratio,
         max_videos=plan.max_videos,
         reserve_ratio=plan.reserve_ratio,
         max_minutes=plan.max_minutes,
@@ -299,51 +401,118 @@ def decision_from_plan(
 def _build_default_plan(
     budget_cfg: BudgetAndRuntimeConfig,
     *,
-    eff_default_ratio: float,
+    eff_default_ratio: float | None,
     current_window_used_ratio: float,
     now_epoch: float | None = None,
 ) -> BudgetPlan:
-    mode = budget_cfg.default_budget_mode
-    if mode == "max_videos":
-        return build_budget_plan(
-            "max_videos",
-            value=budget_cfg.default_max_videos,
-            current_window_used_ratio=current_window_used_ratio,
-            now_epoch=now_epoch,
-        )
-    if mode == "reserve_ratio":
-        return build_budget_plan(
-            "reserve_ratio",
-            value=budget_cfg.default_reserve_ratio,
-            current_window_used_ratio=current_window_used_ratio,
-            now_epoch=now_epoch,
-        )
-    if mode == "max_minutes":
-        return build_budget_plan(
-            "max_minutes",
-            value=budget_cfg.default_max_minutes,
-            current_window_used_ratio=current_window_used_ratio,
-            now_epoch=now_epoch,
-        )
     return build_budget_plan(
-        "use_ratio",
-        value=eff_default_ratio,
+        "combined",
+        max_use_ratio=eff_default_ratio,
+        max_videos=budget_cfg.default_max_videos,
+        reserve_ratio=budget_cfg.default_reserve_ratio,
+        max_minutes=budget_cfg.default_max_minutes,
         current_window_used_ratio=current_window_used_ratio,
         now_epoch=now_epoch,
     )
 
 
+def _format_minutes_display(val: int | float) -> str:
+    return str(int(val)) if float(val).is_integer() else f"{float(val):g}"
+
+
 def _format_plan_short_label(plan: BudgetPlan) -> str:
-    if plan.mode == "use_ratio":
-        return f"{plan.allowed_ratio:.2f}"
-    if plan.mode == "max_videos":
-        return f"{plan.max_videos}个"
-    if plan.mode == "reserve_ratio" and plan.reserve_ratio is not None:
-        return f"留{int(round(plan.reserve_ratio * 100))}%"
-    if plan.mode == "max_minutes" and plan.max_minutes is not None:
-        val = int(plan.max_minutes) if float(plan.max_minutes).is_integer() else plan.max_minutes
-        return f"{val}分钟"
-    return "休息"
+    if plan.rest_today or plan.mode == "rest":
+        return "休息"
+    parts: list[str] = []
+    if plan.max_use_ratio is not None:
+        parts.append(f"用≤{int(round(plan.max_use_ratio * 100))}%")
+    if plan.max_videos is not None:
+        parts.append(f"≤{plan.max_videos}片")
+    if plan.reserve_ratio is not None:
+        parts.append(f"留≥{int(round(plan.reserve_ratio * 100))}%")
+    if plan.max_minutes is not None:
+        parts.append(f"≤{_format_minutes_display(plan.max_minutes)}分")
+    if not parts:
+        return f"不限(窗余{int(round(plan.effective_allowed_ratio * 100))}%)"
+    return " / ".join(parts)
+
+
+def _compute_live_preview_text(
+    use_raw: str,
+    vid_raw: str,
+    res_raw: str,
+    min_raw: str,
+    *,
+    used_ratio: float,
+) -> str:
+    """Compute real-time preview banner text for the 4-condition intersection popup."""
+    use_s = use_raw.strip()
+    vid_s = vid_raw.strip()
+    res_s = res_raw.strip()
+    min_s = min_raw.strip()
+
+    parsed_use: float | None = None
+    if use_s:
+        parsed_use = parse_budget_ratio_input(use_s)
+        if parsed_use is None:
+            return "预览：请输入有效的「最多消耗比例」（0.0–1.0 或 %，留空=不限）"
+
+    parsed_vid: int | None = None
+    if vid_s:
+        parsed_vid = parse_positive_int_input(vid_s)
+        if parsed_vid is None:
+            return "预览：请输入大于 0 的整数「最多观看视频」（留空=不限）"
+
+    parsed_res: float | None = None
+    if res_s:
+        parsed_res = parse_budget_ratio_input(res_s)
+        if parsed_res is None:
+            return "预览：请输入有效的「至少保留底线」（0.0–1.0 或 %，留空=不限）"
+
+    parsed_min: float | None = None
+    if min_s:
+        parsed_min = parse_positive_float_input(min_s)
+        if parsed_min is None:
+            return "预览：请输入大于 0 的「最长玩耍时长」分钟数（留空=不限）"
+
+    if parsed_use is not None and parsed_use <= 0.0:
+        return "综合预览：本次可用额度 0.0%（等价「今日休息」）"
+
+    eff_allow = compute_effective_allowed_ratio(
+        max_use_ratio=parsed_use,
+        reserve_ratio=parsed_res,
+        current_window_used_ratio=used_ratio,
+        rest_today=False,
+    )
+    window_rem = max(0.0, 1.0 - used_ratio)
+
+    token_terms: list[str] = []
+    if parsed_use is not None:
+        token_terms.append(f"消耗上限 {parsed_use * 100:.1f}%")
+    if parsed_res is not None:
+        res_avail = max(0.0, 1.0 - parsed_res - used_ratio)
+        token_terms.append(f"底线余量 {res_avail * 100:.1f}%")
+    if not token_terms:
+        token_note = f"未设 Token 限额，按窗口剩余 {window_rem * 100:.1f}%"
+    elif len(token_terms) == 2:
+        token_note = f"取 min[{token_terms[0]}, {token_terms[1]}]"
+    else:
+        token_note = token_terms[0]
+
+    extra_caps: list[str] = []
+    if parsed_vid is not None:
+        extra_caps.append(f"视频≤{parsed_vid}")
+    if parsed_min is not None:
+        extra_caps.append(f"时长≤{_format_minutes_display(parsed_min)}分钟")
+
+    if parsed_use is None and parsed_vid is None and parsed_res is None and parsed_min is None:
+        return (
+            f"综合预览：本次可用 {eff_allow * 100:.1f}%"
+            f"（4 项均留空：不限个数与时长，仅以 5h 窗口剩余为硬底线）"
+        )
+
+    suffix = f" ｜ {' · '.join(extra_caps)}" if extra_caps else ""
+    return f"综合预览：本次可用 {eff_allow * 100:.1f}%（{token_note}）{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +685,7 @@ def _deserialize_decision(data: Mapping[str, Any]) -> BudgetDecision:
             elapsed_sec=float(data.get("elapsed_sec", 0.0)),
         )
     return BudgetDecision(
-        budget_ratio=float(data.get("budget_ratio", 0.35)),
+        budget_ratio=float(data.get("budget_ratio", 0.4)),
         source=typed_source,
         elapsed_sec=float(data.get("elapsed_sec", 0.0)),
         rest_today=bool(data.get("rest_today", False)),
@@ -526,7 +695,7 @@ def _deserialize_decision(data: Mapping[str, Any]) -> BudgetDecision:
 def _run_popup_via_helper_subprocess(
     budget_cfg: BudgetAndRuntimeConfig,
     *,
-    eff_default: float,
+    eff_default: float | None,
     eff_timeout: int,
     budget_status: BudgetStatus | None,
     allow_non_default_desktop: bool = False,
@@ -591,7 +760,7 @@ def _run_popup_via_helper_subprocess(
 
 
 # ---------------------------------------------------------------------------
-# Main 4-in-1 Startup Budget Popup
+# Main 4-Condition Combined Intersection Startup Budget Popup
 # ---------------------------------------------------------------------------
 
 
@@ -608,11 +777,14 @@ def prompt_startup_budget(
     use_helper_subprocess: bool = True,
     allow_non_default_desktop: bool = False,
 ) -> BudgetDecision:
-    """Show a 60-second non-intrusive 4-in-1 tkinter startup budget popup.
+    """Show a 60-second non-intrusive 4-condition intersection tkinter startup budget popup.
 
-    - Supports 4 mutually exclusive modes: `use_ratio`, `max_videos`, `reserve_ratio`,
-      `max_minutes`, plus a "今日休息" button.
-    - Uses `time.monotonic()` for countdown so system sleep/resume cannot hang the timer.
+    - Displays 4 independent inputs (`max_use_ratio`, `max_videos`, `reserve_ratio`, `max_minutes`);
+      leaving any field blank means unlimited (`None`) for that dimension.
+    - Prefills all 4 inputs from effective config defaults and offers a "清空条件" quick-clear
+      button so users can blank all fields and fill just 1 condition effortlessly.
+    - Shows real-time intersection preview of effective available Token ratio and a
+      `time.monotonic()` countdown at the top banner so sleep/resume cannot hang the timer.
     - Never steals desktop focus (no `focus_force()` / `grab_set()`; uses `-topmost` +
       Win32 `SW_SHOWNOACTIVATE` + `SetWindowPos(..., SWP_NOACTIVATE | SWP_SHOWWINDOW)`).
     - Automatically delegates to a clean helper subprocess (`wShowWindow=4`) if the parent
@@ -622,13 +794,13 @@ def prompt_startup_budget(
       `tk.TclError`.
     """
     budget_cfg = _extract_budget_cfg(cfg)
-    eff_default = (
-        budget_cfg.default_window_budget_ratio
-        if default_ratio is None
-        else float(default_ratio)
-    )
-    if not (0.0 < eff_default <= 1.0):
-        raise ValueError(f"default_ratio must be in (0.0, 1.0], got {eff_default}")
+    eff_default: float | None
+    if default_ratio is None:
+        eff_default = budget_cfg.default_window_budget_ratio
+    else:
+        eff_default = float(default_ratio)
+        if not (0.0 < eff_default <= 1.0):
+            raise ValueError(f"default_ratio must be in (0.0, 1.0], got {eff_default}")
 
     eff_timeout = (
         budget_cfg.startup_popup_timeout_sec
@@ -722,11 +894,11 @@ def prompt_startup_budget(
 
     try:
         root = tk.Tk()
-        root.title("GeminiNest 启动预算确认")
+        root.title("GeminiNest 启动预算确认（4 条件联合上限）")
         root.resizable(False, False)
 
         # Position unobtrusively near bottom-right without stealing focus.
-        width, height = 470, 365
+        width, height = 540, 415
         try:
             screen_w = int(root.winfo_screenwidth())
             screen_h = int(root.winfo_screenheight())
@@ -741,8 +913,8 @@ def prompt_startup_budget(
 
         header = tk.Label(
             frame,
-            text="GeminiNest 冲浪窗口即将出发",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            text="GeminiNest 冲浪窗口即将出发 · 4 条件联合上限（先触顶先停，留空 = 不限）",
+            font=("Microsoft YaHei UI", 10, "bold"),
             anchor="w",
         )
         header.pack(fill="x", pady=(0, 4))
@@ -765,112 +937,98 @@ def prompt_startup_budget(
             anchor="w",
             fg="#1f4e79",
         )
-        info_label.pack(fill="x", pady=(0, 8))
+        info_label.pack(fill="x", pady=(0, 3))
 
-        initial_mode = (
-            budget_cfg.default_budget_mode
-            if budget_cfg.default_budget_mode in ("use_ratio", "max_videos", "reserve_ratio", "max_minutes")
-            else "use_ratio"
+        init_use = "" if eff_default is None else f"{eff_default:.2f}"
+        init_vid = "" if budget_cfg.default_max_videos is None else str(budget_cfg.default_max_videos)
+        init_res = (
+            ""
+            if budget_cfg.default_reserve_ratio is None
+            else f"{budget_cfg.default_reserve_ratio:.2f}"
         )
-        mode_var = tk.StringVar(value=initial_mode)
-        use_ratio_var = tk.StringVar(value=f"{eff_default:.2f}")
-        max_videos_var = tk.StringVar(value=str(budget_cfg.default_max_videos))
-        reserve_ratio_var = tk.StringVar(value=f"{budget_cfg.default_reserve_ratio:.2f}")
-        max_minutes_var = tk.StringVar(value=str(budget_cfg.default_max_minutes))
+        init_min = "" if budget_cfg.default_max_minutes is None else str(budget_cfg.default_max_minutes)
 
-        reserve_preview_allowed = max(0.0, 1.0 - budget_cfg.default_reserve_ratio - used_ratio)
-        reserve_hint_var = tk.StringVar(
-            value=f"→ 本次可用 {reserve_preview_allowed * 100:.1f}%"
+        use_ratio_var = tk.StringVar(value=init_use)
+        max_videos_var = tk.StringVar(value=init_vid)
+        reserve_ratio_var = tk.StringVar(value=init_res)
+        max_minutes_var = tk.StringVar(value=init_min)
+
+        preview_var = tk.StringVar(
+            value=_compute_live_preview_text(
+                init_use, init_vid, init_res, init_min, used_ratio=used_ratio
+            )
         )
+        preview_label = tk.Label(
+            frame,
+            textvariable=preview_var,
+            justify="left",
+            anchor="w",
+            fg="#1b5e20",
+        )
+        preview_label.pack(fill="x", pady=(0, 3))
 
-        def _update_reserve_hint(*_args: Any) -> None:
-            parsed_res = parse_budget_ratio_input(reserve_ratio_var.get())
-            if parsed_res is None:
-                reserve_hint_var.set("（请输入 0.0–1.0）")
-                return
-            eff_allow = max(0.0, 1.0 - parsed_res - used_ratio)
-            reserve_hint_var.set(f"→ 本次可用 {eff_allow * 100:.1f}%")
+        countdown_var = tk.StringVar(
+            value=f"剩余 {eff_timeout} 秒，超时将自动按默认（{default_short}）出发"
+        )
+        countdown_label = tk.Label(frame, textvariable=countdown_var, fg="#555555", anchor="w")
+        countdown_label.pack(fill="x", pady=(0, 10))
 
-        trace_add = getattr(reserve_ratio_var, "trace_add", None)
-        if callable(trace_add):
-            try:
-                trace_add("write", _update_reserve_hint)
-            except Exception:  # noqa: BLE001
-                pass
-
-        radio_cls = getattr(tk, "Radiobutton", None)
-
-        def _add_mode_row(
-            *,
-            mode_key: str,
-            label_text: str,
-            var: Any,
-            hint_text: str | None = None,
-            hint_var: Any = None,
-        ) -> None:
-            row = tk.Frame(frame)
-            row.pack(fill="x", pady=3)
-            if callable(radio_cls):
-                rb = radio_cls(
-                    row,
-                    text=label_text,
-                    variable=mode_var,
-                    value=mode_key,
-                    anchor="w",
-                    width=24,
+        def _refresh_preview(*_args: Any) -> None:
+            preview_var.set(
+                _compute_live_preview_text(
+                    use_ratio_var.get(),
+                    max_videos_var.get(),
+                    reserve_ratio_var.get(),
+                    max_minutes_var.get(),
+                    used_ratio=used_ratio,
                 )
-                rb.pack(side="left")
-            else:
-                tk.Label(row, text=label_text, anchor="w", width=24).pack(side="left")
+            )
 
-            entry = tk.Entry(row, textvariable=var, width=9)
-            entry.pack(side="left", padx=(4, 6))
-            bind_fn = getattr(entry, "bind", None)
-            if callable(bind_fn):
+        for var_item in (use_ratio_var, max_videos_var, reserve_ratio_var, max_minutes_var):
+            trace_add = getattr(var_item, "trace_add", None)
+            if callable(trace_add):
                 try:
-                    bind_fn("<FocusIn>", lambda _e, mk=mode_key: mode_var.set(mk))
+                    trace_add("write", _refresh_preview)
                 except Exception:  # noqa: BLE001
                     pass
 
-            if hint_var is not None:
-                tk.Label(row, textvariable=hint_var, fg="#555555", anchor="w").pack(side="left")
-            elif hint_text:
-                tk.Label(row, text=hint_text, fg="#555555", anchor="w").pack(side="left")
+        def _add_condition_row(
+            *,
+            label_text: str,
+            var: Any,
+            hint_text: str,
+        ) -> None:
+            row = tk.Frame(frame)
+            row.pack(fill="x", pady=4)
+            tk.Label(row, text=label_text, anchor="w", width=24).pack(side="left")
+            entry = tk.Entry(row, textvariable=var, width=10)
+            entry.pack(side="left", padx=(4, 8))
+            tk.Label(row, text=hint_text, fg="#555555", anchor="w").pack(side="left")
 
-        _add_mode_row(
-            mode_key="use_ratio",
-            label_text="1. 本次用量百分比 (0–1)",
+        _add_condition_row(
+            label_text="1. 最多消耗 5h 窗口比例",
             var=use_ratio_var,
-            hint_text="如 0.35 或 35%",
+            hint_text="0–1 或 %（如 0.40，留空 = 不限）",
         )
-        _add_mode_row(
-            mode_key="max_videos",
-            label_text="2. 观看视频个数上限",
+        _add_condition_row(
+            label_text="2. 最多观看视频个数",
             var=max_videos_var,
-            hint_text="个（如 3）",
+            hint_text="正整数（如 100，留空 = 不限）",
         )
-        _add_mode_row(
-            mode_key="reserve_ratio",
-            label_text="3. 保留剩余用量底线",
+        _add_condition_row(
+            label_text="3. 5h 窗口至少保留底线",
             var=reserve_ratio_var,
-            hint_var=reserve_hint_var,
+            hint_text="0–1 或 %（如 0.30，留空 = 不限）",
         )
-        _add_mode_row(
-            mode_key="max_minutes",
-            label_text="4. 玩耍时长上限",
+        _add_condition_row(
+            label_text="4. 最长玩耍时长（分钟）",
             var=max_minutes_var,
-            hint_text="分钟（如 15）",
+            hint_text="分钟（如 30，留空 = 不限）",
         )
 
         error_var = tk.StringVar(value="")
         error_label = tk.Label(frame, textvariable=error_var, fg="#c62828", anchor="w")
-        error_label.pack(fill="x", pady=(6, 2))
-
-        countdown_var = tk.StringVar(
-            value=f"剩余 {eff_timeout} 秒，超时将自动按默认 ({default_short}) 出发"
-        )
-        countdown_label = tk.Label(frame, textvariable=countdown_var, fg="#555555", anchor="w")
-        countdown_label.pack(fill="x", pady=(0, 10))
+        error_label.pack(fill="x", pady=(8, 4))
 
         def _finish(plan: BudgetPlan, source: BudgetDecisionSource) -> None:
             if result_holder["decided"]:
@@ -883,101 +1041,84 @@ def prompt_startup_budget(
             except Exception:  # noqa: BLE001
                 pass
 
-        def _is_same_as_default(plan: BudgetPlan) -> bool:
-            if plan.mode != default_preview_plan.mode:
+        def _opt_float_equal(a: float | None, b: float | None) -> bool:
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
                 return False
-            if plan.mode == "use_ratio":
-                return abs(plan.allowed_ratio - default_preview_plan.allowed_ratio) < 1e-6
-            if plan.mode == "max_videos":
-                return plan.max_videos == default_preview_plan.max_videos
-            if plan.mode == "reserve_ratio":
-                return (
-                    plan.reserve_ratio is not None
-                    and default_preview_plan.reserve_ratio is not None
-                    and abs(plan.reserve_ratio - default_preview_plan.reserve_ratio) < 1e-6
+            return abs(float(a) - float(b)) < 1e-6
+
+        def _is_same_as_default(plan: BudgetPlan) -> bool:
+            return (
+                not plan.rest_today
+                and not default_preview_plan.rest_today
+                and _opt_float_equal(plan.max_use_ratio, default_preview_plan.max_use_ratio)
+                and plan.max_videos == default_preview_plan.max_videos
+                and _opt_float_equal(plan.reserve_ratio, default_preview_plan.reserve_ratio)
+                and _opt_float_equal(
+                    None if plan.max_minutes is None else float(plan.max_minutes),
+                    None if default_preview_plan.max_minutes is None else float(default_preview_plan.max_minutes),
                 )
-            if plan.mode == "max_minutes":
-                return (
-                    plan.max_minutes is not None
-                    and default_preview_plan.max_minutes is not None
-                    and abs(plan.max_minutes - default_preview_plan.max_minutes) < 1e-6
-                )
-            return False
+            )
+
+        def _on_clear() -> None:
+            use_ratio_var.set("")
+            max_videos_var.set("")
+            reserve_ratio_var.set("")
+            max_minutes_var.set("")
+            error_var.set("")
+            _refresh_preview()
 
         def _on_confirm() -> None:
-            chosen_mode = (mode_var.get() or "use_ratio").strip()
             now_ep = float(now_epoch_fn())
-            if chosen_mode == "use_ratio":
-                parsed = parse_budget_ratio_input(use_ratio_var.get())
-                if parsed is None:
-                    error_var.set("请输入 0.0 到 1.0 之间的有效比例（例如 0.35 或 35%）")
+            raw_use = use_ratio_var.get().strip()
+            raw_vid = max_videos_var.get().strip()
+            raw_res = reserve_ratio_var.get().strip()
+            raw_min = max_minutes_var.get().strip()
+
+            parsed_use: float | None = None
+            if raw_use:
+                parsed_use = parse_budget_ratio_input(raw_use)
+                if parsed_use is None:
+                    error_var.set("「最多消耗比例」请输入 0.0–1.0 或百分比（如 0.40 / 40%），或留空=不限")
                     return
-                plan = build_budget_plan(
-                    "use_ratio",
-                    value=parsed,
-                    current_window_used_ratio=used_ratio,
-                    now_epoch=now_ep,
-                )
-                if plan.rest_today:
-                    _finish(plan, "user_rest")
-                elif _is_same_as_default(plan):
-                    _finish(plan, "user_confirmed")
-                else:
-                    _finish(plan, "user_custom")
-                return
 
-            if chosen_mode == "max_videos":
-                parsed_v = parse_positive_int_input(max_videos_var.get())
-                if parsed_v is None:
-                    error_var.set("请输入大于 0 的整数视频个数（例如 3）")
+            parsed_vid: int | None = None
+            if raw_vid:
+                parsed_vid = parse_positive_int_input(raw_vid)
+                if parsed_vid is None:
+                    error_var.set("「最多观看视频」请输入大于 0 的整数（如 100），或留空=不限")
                     return
-                plan = build_budget_plan(
-                    "max_videos",
-                    value=parsed_v,
-                    current_window_used_ratio=used_ratio,
-                    now_epoch=now_ep,
-                )
-                _finish(plan, "user_confirmed" if _is_same_as_default(plan) else "user_custom")
-                return
 
-            if chosen_mode == "reserve_ratio":
-                parsed_r = parse_budget_ratio_input(reserve_ratio_var.get())
-                if parsed_r is None:
-                    error_var.set("请输入 0.0 到 1.0 之间的保留底线比例（例如 0.40 或 40%）")
+            parsed_res: float | None = None
+            if raw_res:
+                parsed_res = parse_budget_ratio_input(raw_res)
+                if parsed_res is None:
+                    error_var.set("「至少保留底线」请输入 0.0–1.0 或百分比（如 0.30 / 30%），或留空=不限")
                     return
-                plan = build_budget_plan(
-                    "reserve_ratio",
-                    value=parsed_r,
-                    current_window_used_ratio=used_ratio,
-                    now_epoch=now_ep,
-                )
-                _finish(plan, "user_confirmed" if _is_same_as_default(plan) else "user_custom")
-                return
 
-            if chosen_mode == "max_minutes":
-                parsed_m = parse_positive_float_input(max_minutes_var.get())
-                if parsed_m is None:
-                    error_var.set("请输入大于 0 的玩耍时长（分钟，例如 15）")
+            parsed_min: float | None = None
+            if raw_min:
+                parsed_min = parse_positive_float_input(raw_min)
+                if parsed_min is None:
+                    error_var.set("「最长玩耍时长」请输入大于 0 的分钟数（如 30），或留空=不限")
                     return
-                plan = build_budget_plan(
-                    "max_minutes",
-                    value=parsed_m,
-                    current_window_used_ratio=used_ratio,
-                    now_epoch=now_ep,
-                )
-                _finish(plan, "user_confirmed" if _is_same_as_default(plan) else "user_custom")
-                return
 
-            error_var.set(f"不支持的预算模式：{chosen_mode}")
-
-        def _on_default() -> None:
-            plan = _build_default_plan(
-                budget_cfg,
-                eff_default_ratio=eff_default,
+            plan = build_budget_plan(
+                "combined",
+                max_use_ratio=parsed_use,
+                max_videos=parsed_vid,
+                reserve_ratio=parsed_res,
+                max_minutes=parsed_min,
                 current_window_used_ratio=used_ratio,
-                now_epoch=float(now_epoch_fn()),
+                now_epoch=now_ep,
             )
-            _finish(plan, "user_confirmed")
+            if plan.rest_today:
+                _finish(plan, "user_rest")
+            elif _is_same_as_default(plan):
+                _finish(plan, "user_confirmed")
+            else:
+                _finish(plan, "user_custom")
 
         def _on_rest() -> None:
             plan = build_budget_plan(
@@ -997,17 +1138,14 @@ def prompt_startup_budget(
             _finish(plan, "timeout_default")
 
         btn_row = tk.Frame(frame)
-        btn_row.pack(fill="x", pady=(2, 0))
+        btn_row.pack(fill="x", pady=(4, 0))
         tk.Button(btn_row, text="确认出发", width=12, command=_on_confirm).pack(
             side="left", padx=(0, 8)
         )
-        tk.Button(
-            btn_row,
-            text=f"默认 ({default_short})",
-            width=13,
-            command=_on_default,
-        ).pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="今日休息 (0.0)", width=14, command=_on_rest).pack(side="right")
+        tk.Button(btn_row, text="清空条件", width=12, command=_on_clear).pack(
+            side="left", padx=(0, 8)
+        )
+        tk.Button(btn_row, text="今日休息", width=12, command=_on_rest).pack(side="right")
 
         root.protocol("WM_DELETE_WINDOW", _on_close)
 
@@ -1035,7 +1173,7 @@ def prompt_startup_budget(
                     return
                 sec_left = max(1, int(remaining + 0.999))
                 countdown_var.set(
-                    f"剩余 {sec_left} 秒，超时将自动按默认 ({default_short}) 出发"
+                    f"剩余 {sec_left} 秒，超时将自动按默认（{default_short}）出发"
                 )
                 root.after(_POLL_INTERVAL_MS, _tick)
 
@@ -1204,12 +1342,14 @@ def _run_popup_helper_cli() -> int:
     budget_cfg = BudgetAndRuntimeConfig(**cfg_dict)
     raw_status = payload.get("budget_status")
     status = BudgetStatus(**raw_status) if isinstance(raw_status, dict) else None
+    raw_default_ratio = payload.get("default_ratio", budget_cfg.default_window_budget_ratio)
+    eff_default_ratio = None if raw_default_ratio is None else float(raw_default_ratio)
 
     decision = prompt_startup_budget(
         budget_cfg,
         headless=False,
         timeout_sec=int(payload.get("timeout_sec", budget_cfg.startup_popup_timeout_sec)),
-        default_ratio=float(payload.get("default_ratio", budget_cfg.default_window_budget_ratio)),
+        default_ratio=eff_default_ratio,
         budget_status=status,
         use_helper_subprocess=False,
         allow_non_default_desktop=bool(payload.get("allow_non_default_desktop", False)),
@@ -1236,7 +1376,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--test-popup",
         action="store_true",
-        help="Launch a standalone interactive 4-in-1 budget popup test.",
+        help="Launch a standalone interactive 4-condition intersection budget popup test.",
     )
     parser.add_argument("--timeout", type=int, default=15, help="Popup timeout in seconds")
     parser.add_argument("--used-ratio", type=float, default=0.18, help="Simulated 5h window used ratio")
@@ -1252,7 +1392,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.test_popup:
         budget_cfg = BudgetAndRuntimeConfig(
-            default_window_budget_ratio=0.35,
+            default_window_budget_ratio=0.4,
+            default_max_videos=100,
+            default_reserve_ratio=0.30,
+            default_max_minutes=30,
             startup_popup_timeout_sec=max(1, int(args.timeout)),
             enable_startup_popup=True,
             enable_toast_notification=True,
@@ -1269,8 +1412,8 @@ def _main(argv: list[str] | None = None) -> int:
             used_tokens=used_tok,
             capacity_tokens=1_400_000,
             used_ratio=used_r,
-            allowed_ratio=0.35,
-            remaining_tokens=max(0, int(round(1_400_000 * 0.35)) - used_tok),
+            allowed_ratio=0.4,
+            remaining_tokens=max(0, int(round(1_400_000 * 0.4)) - used_tok),
             in_cooldown=False,
         )
         decision = prompt_startup_budget(

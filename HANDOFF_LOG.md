@@ -5,14 +5,14 @@
 ---
 
 ## 当前全局状态（Current Snapshot）
-* **当前阶段**：✅ **外部代码审计 5 项可靠性修复（3×P1 + 2×P2）全部完成并提交至 `main`**（离线单元测试 **149/149 全绿**，零网络、零真实数据触碰；暂未 `git push`）
+* **当前阶段**：✅ **预算系统重构升级为「4 条件联合约束（交集上限，先触顶先停）」并提交至 `main`**（离线单元测试 **151/151 全绿**，零网络、零真实数据触碰；暂未 `git push`）
 * **当前分支**：`main`
-* **当前激活模式**：`config.json` 默认保持 v1 `audio_only` 与 `wd_tagger_enabled: false`（校准后默认安检阈值 `min_general_score=0.20`、`max_sensitive_score=0.75`、`max_unsafe_score=0.05`；`sync.export_private_thought=true`）；本机私有 `config.local.json` 可随时热切换启用 `sanitized_video` + `wd_tagger_enabled: true` + `wd_tagger_device: "auto"`（DirectML 优先）
+* **当前激活模式**：`config.json` 默认保持 v1 `audio_only`、`wd_tagger_enabled: false` 与 4 条件公版安全默认预算（`default_window_budget_ratio=0.4`、`default_max_videos=100`、`default_reserve_ratio=0.30`、`default_max_minutes=30`，均支持 `null` 不限）；本机私有 `config.local.json` 可随时热切换 v2 与自定义预算组合（未改动现有私有 `config.local.json`）
 * **已落盘与核验基建**：
-  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已全面升级为 v1/v2 自适应通用版、脱敏占位符、隔离 `burn-temp --run-id <run_id>` 与无硬编码 `--cache-hit`）
+  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已同步更新 4 条件联合上限预算、GUI 独立输入框与清空按钮、CLI 灵活组合与单次选片防滥用护栏 `30`、以及公版默认 vs `config.local.json` 自定义说明）
   * `.agent/rules/cat-soul.md`、`config.json`、`.gitignore`（屏蔽 `.env`、`config.local.json`、`.agent/rules/cat-soul.local.md`、`data/models/`、`data/temp/`、`data/exports/` 等）、`.env.example`、`config.local.example.json`、`requirements.txt`、`requirements-v2.txt`、`requirements-dev.txt`、`pyproject.toml`
   * 核心代码模块与脚本：`src/gemininest/{contracts,config,meta_filter,memory_store,fetcher,media_processor,safety_gate,agent_bridge,budget_ui,sync_manager,runner}.py`、`scripts/download_wd_tagger.py`、`scripts/inbox_gdoc_exporter.gs`
-  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,runner,sync_manager}.py`（`pytest` **149/149 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
+  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,runner,sync_manager}.py`（`pytest` **151/151 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
   * 本地私有资产（均被 `.gitignore` 严格忽略）：`config.local.json`、`data/models/model.onnx`（`SmilingWolf/wd-vit-tagger-v3`，361.00 MB）与 `data/models/selected_tags.csv`（10,861 标签）、`data/cat_memory.db`（4 条真实巡逻记忆）、`data/exports/` 内独立隐藏 Git 仓库
   * Anaconda 环境 `gemininest`（Python 3.11.18 + SQLite 3.54.1 FTS5 `trigram` + `yt-dlp`、`httpx`、`python-dotenv`、`winotify`、`pytest`、`Pillow 10.4.0`、`numpy 2.4.6`、`onnxruntime-directml 1.24.4`）
   * Google Drive 云盘目录：`<YOUR_GOOGLE_DRIVE_NEST>\{0_active,1_yesterday_readonly,inbox,inbox_archived}` 均已建齐并通过双端实飞同步验证
@@ -41,6 +41,20 @@
 ---
 
 ## 历史对话交接记录（按时间倒序追加）
+### [Budget System Upgrade - 4 条件联合约束（交集上限，先触顶先停）] - 2026-11-21
+* **核心升级（留在 `main` 分支，暂不 `git push`）**：
+  * **配置与契约升级（`config.json` / `contracts.py` / `config.py` / `memory_store.py`）**：
+    * 在 `config.json` 的 `budget_and_runtime` 显式暴露公版保守默认 4 条件：`default_window_budget_ratio: 0.4`、`default_max_videos: 100`、`default_reserve_ratio: 0.30`、`default_max_minutes: 30`（四项均支持在 `config.local.json` 覆写为数值或 `null` 表示不限；未触碰本地已有 `config.local.json`）。
+    * 更新 `BudgetPlan` 与 `BudgetAndRuntimeConfig` 同时持有 `max_use_ratio`、`max_videos`、`reserve_ratio`、`max_minutes`、`deadline_epoch` 及交集换算字段 `effective_allowed_ratio = min(窗口当前剩余, 非空 max_use_ratio, 非空时 max(0.0, 1.0 - reserve_ratio - current_window_used_ratio))`（两项均空时按窗口剩余）；完整兼容旧配置字段与旧 `run_states` JSON；`MemoryStore` 新增 `get_run_used_tokens()` 并兼容 `default_window_budget_ratio=None`。
+  * **GUI 弹窗升级（`budget_ui.py`）**：
+    * 移除 4 选 1 互斥单选按钮，改为 **4 个独立输入框**（明确标注「留空 = 不限」，默认回填生效配置 4 项默认值），新增 **「清空条件」** 快捷按钮（一键清零 4 框方便只填 1 项），保留 **「确认出发」** 与 **「今日休息」**，顶部实时预览综合换算后的本次可用 Token 比例与 60 秒 `time.monotonic()` 单调时钟倒计时；完整保留隔离桌面（`exebox-*`）快退、锁屏 `TclError` 兜底、`SW_HIDE` 辅助子进程与非抢占置顶显示。
+  * **CLI 参数与逐条交集熔断升级（`runner.py`）**：
+    * 移除 `prepare-feed` 与 `check-budget` 间 4 个预算参数的互斥校验，支持任意组合同时传入；只要显式传入任意 1 个或多个参数，即自动跳过弹窗且**仅生效传入项、其余未传项本轮自动设为 `None`（不限）**；4 项均未传且走超时/`--headless`/隔离桌面兜底时采用配置 4 项默认值联合组合。
+    * 优化 `--max-select` 与 `max_videos` 协同（未传 `--max-select` 时，指定 `max_videos` 后单轮选片随 `min(max_videos, 30)` 推进不再被默认 `4` 卡死；保留单次请求防滥用护栏 `MAX_SELECT_PER_BATCH_GUARDRAIL = 30`）。
+    * `prepare-media`（及 `run_dry_run`）每次执行前同时校验全部非空条件（`rest_today`、去重视频数 `>= max_videos`、`now >= deadline_epoch`、本轮消耗触及 `max_use_ratio`、窗口剩余触及 `reserve_ratio` 底线、429 冷却、以及 4 项全留空时的 5h 窗口 100% 物理上限 `window_exhausted`），任一先触顶即返回退出码 0 + `{"ok": true, "stopped_reason": "budget_limit_reached", "stop_detail": {"triggered_by": [...]}}`。
+  * **文档与测试同步**：同步更新 `docs/SETUP_AND_RUNTIME.md`、`README.md` 与 `HANDOFF_LOG.md`；扩充 `tests/test_config.py`、`tests/test_budget_ui.py`、`tests/test_runner.py`、`tests/test_memory_store.py`。
+* **回归验证**：`<YOUR_CONDA_PYTHON> -m pytest -v` **151 passed**（100% 全绿，零网络、零真实数据触碰）。
+* **提交记录**：`main` 分支提交 `feat(budget): upgrade to 4-condition combined intersection budget limits`。
 ### [Core Reliability Hardening - 外部审计 3×P1 + 2×P2 修复] - 2026-11-20
 * **修复内容（留在 `main` 分支，暂不 `git push`）**：
   * **P1-1（持久化完整手账）**：在 `memory_store.py` 新增向后兼容平滑迁移逻辑与 `diary_entries` 表（及可重入原子 `transaction()`），`commit-appreciation` 将完整 `public_diary`、`private_thought`、`pipeline_used`、`run_id` 随鉴赏事务原子入库；`sync_manager.py` 导出 `diary_latest.md` 时直接从 SQLite 读取最新完整手账，并按 `config.json` 新增开关 `sync.export_private_thought`（默认 `true`）控制是否渲染 `private_thought`。

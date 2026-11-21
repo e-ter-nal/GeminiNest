@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/badge/version-v2.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB.svg)](#user--ai-agent-通用快速部署清单quickstart-checklist)
-[![Tests](https://img.shields.io/badge/pytest-149%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-149-条单元测试)
+[![Tests](https://img.shields.io/badge/pytest-151%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-151-条单元测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -73,7 +73,7 @@
 flowchart TD
     subgraph Step1["阶段 1：本地控制层批处理 (prepare-feed)"]
         A["启动 .cat.lock PID 防撞车锁 & 清扫残留 temp"] --> B["Step 1: 吸收云盘 inbox/ 反向 [MEMORY_PATCH]"]
-        B --> C["60s 非抢占 tkinter 预算小窗 (锁屏 TclError 静默兜底 0.35)"]
+        B --> C["60s 非抢占 tkinter 4 条件联合预算小窗 (交集上限·先触顶先停，锁屏/隔离桌面静默兜底默认配置)"]
         C --> D["B 站只读 WBI 心跳 & 推荐流 / 30% 好奇心搜索"]
         D --> E["meta_filter 前置黑名单硬过滤 (二游/敏感分区零下载)"]
         E --> F["SQLite FTS5 四列 BM25 + 艾宾浩斯 Top-8 记忆召回"]
@@ -139,10 +139,10 @@ GeminiNest/
 │   ├── media_processor.py            # FFmpeg v1 音频裁剪 / v2 抽帧与严格帧一致净版 MP4 重封 / 用完即焚
 │   ├── safety_gate.py                # v1 Passthrough 桩 / v2 wd-tagger ONNX (DirectML/CUDA/CPU + Early-Exit)
 │   ├── agent_bridge.py               # 静态前缀缓存拼装 / Packet 打包 / JSON Schema 校验 / 账本估算
-│   ├── budget_ui.py                  # 60s 非抢占 tkinter 预算小窗（含 TclError 兜底）+ Windows Toast
+│   ├── budget_ui.py                  # 60s 非抢占 tkinter 4 条件联合预算小窗（含清空条件/实时预览/隔离桌面快退）+ Toast
 │   ├── sync_manager.py               # 纯文本扩展名防火墙 + exports 独立隐藏 Git + 轮转 + inbox 补丁吸收
 │   └── runner.py                     # .cat.lock PID 锁、宿主驱动 CLI 子命令与 --dry-run 离线回放
-└── tests/                            # 149 条全离线单元测试（零网络、零真实数据触碰）
+└── tests/                            # 151 条全离线单元测试（零网络、零真实数据触碰）
 ```
 
 ### 2. `.gitignore` 严格屏蔽的本地私有文件（严禁提交至 Git）
@@ -167,7 +167,7 @@ GeminiNest/
 
 如果你正在使用 Google Antigravity、Cursor、Claude Code 等 Coding Agent，克隆仓库后可直接把下面这段话发给它：
 
-> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 149/149 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
+> 请阅读当前仓库的 `README.md` 和 `docs/SETUP_AND_RUNTIME.md`，严格按照「User / AI Agent 通用快速部署清单」帮我完成部署：先检查本机 `conda` / `python`（3.11）与 `ffmpeg` 可用性，创建 `gemininest` 环境并安装我指定的依赖（默认 v1，若我要启用 v2 视觉模式请安装 `requirements-v2.txt` + `onnxruntime-directml` 并下载 `wd-tagger` 权重），拷贝缺失的 `.env` 与 `config.local.json`（不覆盖已有文件），然后运行 `--dry-run` 离线验货和 `pytest` 确认 151/151 通过；遇到需要填写 B 站小号 Cookie、本机路径或 Google Drive 目录时请暂停并列出待填项交给我手动填写，严禁将任何凭据写入 Git。
 
 ---
 
@@ -235,7 +235,7 @@ Copy-Item config.local.example.json config.local.json
   - 若需启用 v2 视觉安检，按上方「热插拔切换方式」补充 `pipeline_mode: "sanitized_video"` 与 `wd_tagger_enabled: true`。
 - [ ] 确认代理分流：B 站域名（`bilibili.com`、`bilivideo.com`、`hdslb.com`）走 `DIRECT` 直连，Google / Antigravity 走单一稳定节点。
 
-### Step 4：离线验货（`--dry-run`）与 149 条单元测试
+### Step 4：离线验货（`--dry-run`）与 151 条单元测试
 
 在接入真实小号与定时任务前，先运行全离线演练与单元测试（全程使用隔离临时沙箱，**零网络请求、零额度消耗、绝不触碰真实数据库与云盘**）：
 
@@ -251,7 +251,7 @@ python -m gemininest.runner --dry-run --headless
 python -m gemininest.runner --dry-run --mode sanitized_video --headless
 ```
 
-- [ ] 运行全量离线单元测试（确认 **149/149** 全部通过）：
+- [ ] 运行全量离线单元测试（确认 **151/151** 全部通过）：
 
 ```powershell
 python -m pytest -v
@@ -260,7 +260,7 @@ python -m pytest -v
 ### Step 5：配置 Antigravity 定时巡逻与跨端云盘联动
 
 - [ ] 阅读 [`docs/SETUP_AND_RUNTIME.md`](docs/SETUP_AND_RUNTIME.md)，完成以下生产落地配置：
-  1. 在 Antigravity 左侧 **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴「v1 / v2 自适应通用版唤醒 Prompt」（默认不带 `--headless`，保留 60 秒非抢占预算弹窗；锁屏或无桌面自动捕获 `TclError` 静默兜底 `0.35`）；
+  1. 在 Antigravity 左侧 **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴「v1 / v2 自适应通用版唤醒 Prompt」（默认不带 `--headless`，保留 60 秒非抢占 **4 条件联合上限**预算弹窗——公版默认 `max_use_ratio=0.4` / `max_videos=100` / `reserve_ratio=0.30` / `max_minutes=30`，可在 `config.local.json` 按需覆写或设为 `null` 不限；锁屏或隔离桌面自动静默兜底默认组合）；
   2. *(可选)* 部署 [`scripts/inbox_gdoc_exporter.gs`](scripts/inbox_gdoc_exporter.gs) 至 Google Apps Script（每 15 分钟将 `inbox/` 中的 `.gdoc` 转存为同名 `.txt`）；
   3. *(可选)* 配置 Gemini Web 端常驻 Gem 与每日 `Scheduled Actions`，实现手机/网页端与本地记忆的纯文本双向闭环。
 

@@ -65,7 +65,7 @@ _DEFAULT_MEMORY_CONFIG = MemoryConfig(
 )
 
 _DEFAULT_BUDGET_CONFIG = BudgetAndRuntimeConfig(
-    default_window_budget_ratio=0.35,
+    default_window_budget_ratio=0.4,
     startup_popup_timeout_sec=60,
     enable_startup_popup=True,
     enable_toast_notification=True,
@@ -1472,7 +1472,11 @@ class MemoryStore:
         bucket = window_bucket if window_bucket is not None else compute_window_bucket(now_dt)
         capacity = self._budget_cfg.est_5h_window_token_capacity
         eff_allowed_ratio = (
-            self._budget_cfg.default_window_budget_ratio
+            (
+                1.0
+                if self._budget_cfg.default_window_budget_ratio is None
+                else float(self._budget_cfg.default_window_budget_ratio)
+            )
             if allowed_ratio is None
             else float(allowed_ratio)
         )
@@ -1520,6 +1524,36 @@ class MemoryStore:
             remaining_tokens=remaining_tokens,
             in_cooldown=in_cooldown,
         )
+
+    def get_run_used_tokens(
+        self,
+        run_id: str,
+        *,
+        window_bucket: str | None = None,
+    ) -> int:
+        """Sum `total_est_tokens` spent by a specific `run_id` (optionally scoped to a window bucket)."""
+        cleaned = run_id.strip()
+        if not cleaned:
+            return 0
+        if window_bucket is not None:
+            row = self._conn.execute(
+                """
+                SELECT COALESCE(SUM(total_est_tokens), 0) AS used_tokens
+                FROM budget_ledger
+                WHERE run_id = ? AND window_bucket = ?
+                """,
+                (cleaned, window_bucket),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT COALESCE(SUM(total_est_tokens), 0) AS used_tokens
+                FROM budget_ledger
+                WHERE run_id = ?
+                """,
+                (cleaned,),
+            ).fetchone()
+        return int(row["used_tokens"]) if row is not None else 0
 
     def list_budget_entries(
         self,

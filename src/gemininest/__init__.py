@@ -48,6 +48,8 @@ from gemininest.contracts import (
     VideoMeta,
     WatchHistoryRecord,
     WorldbookEntry,
+    compute_effective_allowed_ratio,
+    compute_window_cap_ratio,
 )
 from gemininest.fetcher import (
     BilibiliFetcher,
@@ -202,9 +204,11 @@ __all__ = [
     "commit_appreciation_result",
     "compute_canonical_patch_hash",
     "compute_canonical_patch_id",
+    "compute_effective_allowed_ratio",
     "compute_keep_intervals",
     "compute_segment_window",
     "compute_window_bucket",
+    "compute_window_cap_ratio",
     "create_safety_gate",
     "decision_from_plan",
     "estimate_audio_tokens",
