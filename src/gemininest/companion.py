@@ -785,6 +785,20 @@ def run_companion_app(
         logger.warning("%s", exc)
         if sys.stderr is not None:
             print(str(exc), file=sys.stderr)
+        elif tk_module is None:
+            try:
+                import tkinter as tk_err
+                from tkinter import messagebox
+
+                err_root = tk_err.Tk()
+                err_root.withdraw()
+                messagebox.showinfo(
+                    "GeminiNest 桌面小窝助手",
+                    "GeminiNest 桌面小窝助手已经在运行中（请查看任务栏窗口）。",
+                )
+                err_root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
         return 1
 
     if tk_module is None:

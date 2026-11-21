@@ -453,3 +453,27 @@ def test_create_companion_shortcut_dry_run_resolves_paths_without_hardcoding(
     assert "PYTHONPATH" in out["arguments"]
     assert "gemininest.companion" in out["arguments"]
     assert not custom_out.exists()
+
+    # Verify the generated `-c "..."` arguments actually execute cleanly without argparse errors
+    import shlex
+    import subprocess
+
+    parsed_args = shlex.split(out["arguments"], posix=True)
+    assert parsed_args[0] == "-c"
+    probe_code = parsed_args[1].replace(
+        "sys.argv=['gemininest.companion']",
+        "sys.argv=['gemininest.companion','--help']",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe_code],
+        cwd=str(REPO_ROOT),
+        shell=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15.0,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Shortcut bootstrap failed: {proc.stderr}"
+    assert "gemininest.companion" in proc.stdout

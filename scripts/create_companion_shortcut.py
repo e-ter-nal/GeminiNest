@@ -164,13 +164,13 @@ def resolve_shortcut_output_path(
 def build_companion_launch_arguments() -> str:
     """Build `pythonw.exe` arguments that set `PYTHONPATH=src` and run `gemininest.companion`."""
     inline_bootstrap = (
-        "import os, runpy, sys; "
-        "src = os.path.abspath('src'); "
-        "old = os.environ.get('PYTHONPATH', ''); "
-        "os.environ['PYTHONPATH'] = src + (os.pathsep + old if old else ''); "
-        "sys.path.insert(0, src); "
-        "sys.argv = ['-m', 'gemininest.companion']; "
-        "runpy.run_module('gemininest.companion', run_name='__main__', alter_sys=True)"
+        "import os,runpy,sys;"
+        "s=os.path.abspath('src');"
+        "old=os.environ.get('PYTHONPATH','');"
+        "os.environ['PYTHONPATH']=s+(os.pathsep+old if old else '');"
+        "sys.path.insert(0,s);"
+        "sys.argv=['gemininest.companion'];"
+        "runpy.run_module('gemininest.companion',run_name='__main__')"
     )
     return f'-c "{inline_bootstrap}"'
 
