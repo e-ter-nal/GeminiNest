@@ -983,6 +983,10 @@ class MemoryStore:
         ).fetchone()
         return self._row_to_diary(row) if row is not None else None
 
+    def count_diary_entries(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS cnt FROM diary_entries").fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
     def list_recent_diary_entries(
         self,
         *,

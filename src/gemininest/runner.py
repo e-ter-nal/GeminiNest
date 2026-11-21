@@ -11,7 +11,6 @@ Implements:
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import logging
 import os
@@ -36,12 +35,20 @@ from gemininest.agent_bridge import (
 )
 from gemininest.budget_ui import (
     BudgetDecision,
+    _deserialize_decision,
+    atomic_write_json,
     budget_plan_from_dict,
     build_budget_plan,
     decision_from_plan,
+    is_pid_alive,
     notify_auth_expired,
     notify_high_score_video,
+    probe_companion_lock,
     prompt_startup_budget,
+    read_json_safe,
+    resolve_companion_lock_path,
+    resolve_ipc_dir,
+    resolve_workspace_root,
 )
 from gemininest.config import load_runtime_config
 from gemininest.contracts import (
@@ -96,13 +103,13 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_STILL_ACTIVE = 259
-_ERROR_ACCESS_DENIED = 5
 DEFAULT_RUN_LEASE_TTL_SEC = 7200
 DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC = 7200
 DEFAULT_MAX_SELECT = 4
 MAX_SELECT_PER_BATCH_GUARDRAIL = 30
+_IPC_ACK_POLL_INTERVAL_SEC = 0.05
+_IPC_RES_POLL_INTERVAL_SEC = 0.5
+_IPC_STALE_MAX_AGE_SEC = 600.0
 
 
 def _utc_now_iso() -> str:
@@ -581,39 +588,6 @@ def _check_prepare_media_budget_limit(
 # ---------------------------------------------------------------------------
 # PID Lockfile (.cat.lock)
 # ---------------------------------------------------------------------------
-
-
-def is_pid_alive(pid: int) -> bool:
-    """Check whether a process ID is currently alive (Windows Kernel32 + POSIX fallback)."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-
-    if sys.platform == "win32":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            last_err = ctypes.get_last_error()
-            return last_err == _ERROR_ACCESS_DENIED
-        try:
-            exit_code = ctypes.c_ulong(0)
-            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            if not ok:
-                return False
-            return int(exit_code.value) == _STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
 
 
 def _read_lock_pid(lock_path: Path) -> int | None:
@@ -1212,6 +1186,9 @@ def commit_appreciation_result(
     cache_status: Literal["hit", "miss", "unknown"] | None = None,
     headless: bool = False,
     notifier_factory: Callable[..., Any] | None = None,
+    ipc_dir: Path | str | None = None,
+    companion_lock_path: Path | str | None = None,
+    workspace_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Validate host appreciation output, persist memory/diary/history/ledger atomically, and ALWAYS burn temp dir."""
     burned = False
@@ -1357,6 +1334,9 @@ def commit_appreciation_result(
             summary=response.memory_summary,
             headless=headless,
             notifier_factory=notifier_factory,
+            ipc_dir=ipc_dir,
+            companion_lock_path=companion_lock_path,
+            workspace_root=workspace_root,
         )
 
         return {
@@ -1937,18 +1917,405 @@ def _load_config_from_args(args: argparse.Namespace, *, offline: bool) -> tuple[
     )
 
 
+def _count_active_run_leases(
+    run_states_dir: Path,
+    *,
+    now_ts: float | None = None,
+) -> int:
+    """Count currently active (non-expired) run lease files in `run_states_dir` (read-only)."""
+    if not run_states_dir.is_dir():
+        return 0
+    eff_now = _now_epoch() if now_ts is None else float(now_ts)
+    count = 0
+    for state_file in sorted(run_states_dir.glob("*.json")):
+        state = _load_run_state(state_file)
+        if state is None:
+            continue
+        if str(state.get("status") or "active").strip().lower() != "active":
+            continue
+        expires = state.get("lease_expires_epoch")
+        if (
+            isinstance(expires, (int, float))
+            and not isinstance(expires, bool)
+            and float(expires) > eff_now
+        ):
+            count += 1
+    return count
+
+
+def _cleanup_ipc_run_files(ipc_dir: Path, run_id: str) -> None:
+    if not ipc_dir.is_dir():
+        return
+    for prefix in ("req", "ack", "res"):
+        target = ipc_dir / f"{prefix}_{run_id}.json"
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _sweep_stale_ipc_files(
+    ipc_dir: Path,
+    *,
+    now_epoch: float | None = None,
+    max_age_sec: float = _IPC_STALE_MAX_AGE_SEC,
+) -> None:
+    del now_epoch
+    if not ipc_dir.is_dir():
+        return
+    fs_now = time.time()
+    for entry in ipc_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if not (
+            entry.name.startswith(("req_", "ack_", "res_", "toast_"))
+            or entry.name.endswith(".tmp")
+        ):
+            continue
+        try:
+            if (fs_now - entry.stat().st_mtime) > max_age_sec:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _probe_cloud_nest_on_start(
+    cfg: AppConfig,
+    *,
+    cloud_dir: Path | str | None = None,
+) -> bool:
+    sync_mgr = SyncManager(
+        cfg,
+        cloud_nest_dir=cloud_dir,
+        probe_retries=2,
+        probe_retry_delay_sec=0.05,
+    )
+    return sync_mgr.probe_cloud_nest()
+
+
+def _resolve_startup_budget_with_gate(
+    cfg: AppConfig,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    budget_status: BudgetStatus,
+    offline: bool,
+    skip_inbox: bool,
+    cloud_dir: Path | str | None,
+    eff_lock_path: Path,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    now_epoch_fn: Callable[[], float] | None = None,
+    pid_checker: Callable[[int], bool] | None = None,
+) -> tuple[BudgetDecision | None, dict[str, Any] | None]:
+    """Execute the 3-branch startup gate in strict priority order.
+
+    1. CLI exemption (`--headless` or any explicit `--budget-ratio`/`--max-videos`/`--reserve-ratio`/`--max-minutes`).
+    2. Branch A: Companion online & IPC handshake (`req_` -> `ack_`) when not exempt and `companion_policy` applies.
+    3. Branch B: Google Drive cloud mount check (before GUI popup) when `require_cloud_mount_on_start` and online.
+    4. Branch C: Poll `res_<run_id>.json` with continuous companion liveness check (`desktop_companion_aborted` / 60s timeout).
+    """
+    eff_now_fn = now_epoch_fn or _now_epoch
+    eff_checker = pid_checker or is_pid_alive
+    budget_cfg = cfg.budget_and_runtime
+    eff_ws_root = resolve_workspace_root(
+        config_path=args.config,
+        workspace_root=getattr(args, "workspace_root", None),
+    )
+    eff_comp_lock = resolve_companion_lock_path(
+        cfg,
+        lock_file_path=eff_lock_path,
+        companion_lock_path=getattr(args, "companion_lock", None),
+    )
+    eff_ipc_dir = resolve_ipc_dir(cfg, ipc_dir=getattr(args, "ipc_dir", None))
+
+    cli_decision = _resolve_cli_budget_decision(
+        args,
+        budget_status=budget_status,
+        now_epoch_fn=eff_now_fn,
+    )
+    is_exempt = bool(getattr(args, "headless", False)) or (cli_decision is not None)
+    policy = budget_cfg.companion_policy
+
+    def _run_branch_b_cloud_check() -> dict[str, Any] | None:
+        if (
+            budget_cfg.require_cloud_mount_on_start
+            and (not offline)
+            and (not skip_inbox)
+            and not _probe_cloud_nest_on_start(cfg, cloud_dir=cloud_dir)
+        ):
+            target_dir = cloud_dir if cloud_dir is not None else cfg.sync.cloud_nest_dir
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "stopped_reason": "cloud_drive_unmounted",
+                "error_code": ErrorCode.E8001_CLOUD_DRIVE_UNMOUNTED.value,
+                "message": (
+                    f"Google Drive 云盘小窝目录未挂载或不可访问：{target_dir}。"
+                    "请先启动 Google Drive 客户端并确认同步目录可访问后再开始巡逻。"
+                ),
+            }
+        return None
+
+    def _run_legacy_popup() -> BudgetDecision:
+        return prompt_startup_budget(
+            cfg,
+            headless=bool(getattr(args, "headless", False)),
+            budget_status=budget_status,
+            now_epoch_fn=eff_now_fn,
+        )
+
+    if is_exempt:
+        cloud_stop = _run_branch_b_cloud_check()
+        if cloud_stop is not None:
+            return None, cloud_stop
+        if cli_decision is not None:
+            return cli_decision, None
+        return _run_legacy_popup(), None
+
+    use_companion = policy in ("required", "optional")
+    if use_companion:
+        now_ep = float(eff_now_fn())
+        _sweep_stale_ipc_files(eff_ipc_dir, now_epoch=now_ep)
+        online, _lock_info, lock_reason = probe_companion_lock(
+            eff_comp_lock,
+            expected_workspace_root=eff_ws_root,
+            now_epoch=now_ep,
+            pid_checker=eff_checker,
+        )
+        if not online:
+            if policy == "required":
+                return None, {
+                    "ok": True,
+                    "run_id": run_id,
+                    "stopped_reason": "desktop_companion_offline",
+                    "message": (
+                        f"桌面常驻小窗未在线（{lock_reason}），请先在本地桌面双击启动 GeminiNest 小窗后再试，"
+                        "或使用 `--headless` / 显式预算参数运行。"
+                    ),
+                }
+            # policy == "optional": check cloud mount then fall back to legacy popup
+            cloud_stop = _run_branch_b_cloud_check()
+            if cloud_stop is not None:
+                return None, cloud_stop
+            return _run_legacy_popup(), None
+
+        # Branch B runs BEFORE writing req_<run_id>.json so GUI does not pop up when cloud drive is unmounted.
+        cloud_stop = _run_branch_b_cloud_check()
+        if cloud_stop is not None:
+            return None, cloud_stop
+
+        # Branch A step 2: atomic req_<run_id>.json + wait for ack_<run_id>.json
+        req_path = eff_ipc_dir / f"req_{run_id}.json"
+        ack_path = eff_ipc_dir / f"ack_{run_id}.json"
+        res_path = eff_ipc_dir / f"res_{run_id}.json"
+        _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+
+        req_payload = {
+            "type": "budget_request",
+            "run_id": run_id,
+            "created_at": _utc_now_iso(),
+            "created_epoch": round(float(eff_now_fn()), 3),
+            "timeout_sec": int(budget_cfg.startup_popup_timeout_sec),
+            "budget_cfg": asdict(budget_cfg),
+            "budget_status": asdict(budget_status),
+        }
+        atomic_write_json(req_path, req_payload)
+
+        ack_received = False
+        ack_deadline = float(monotonic_fn()) + float(budget_cfg.ipc_ack_timeout_sec)
+        while True:
+            if read_json_safe(ack_path) is not None or read_json_safe(res_path) is not None:
+                ack_received = True
+                break
+            still_on, _, _ = probe_companion_lock(
+                eff_comp_lock,
+                expected_workspace_root=eff_ws_root,
+                now_epoch=float(eff_now_fn()),
+                pid_checker=eff_checker,
+            )
+            if not still_on:
+                break
+            now_m = float(monotonic_fn())
+            if now_m >= ack_deadline:
+                break
+            sleep_fn(min(_IPC_ACK_POLL_INTERVAL_SEC, max(0.005, ack_deadline - now_m)))
+
+        if not ack_received:
+            _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+            if policy == "required":
+                return None, {
+                    "ok": True,
+                    "run_id": run_id,
+                    "stopped_reason": "desktop_companion_offline",
+                    "message": (
+                        f"桌面常驻小窗未在 {budget_cfg.ipc_ack_timeout_sec:.1f}s 内响应 IPC 握手，"
+                        "请检查桌面小窗是否正常运行。"
+                    ),
+                }
+            return _run_legacy_popup(), None
+
+        # Branch C: Wait for res_<run_id>.json up to startup_popup_timeout_sec with continuous liveness check
+        res_deadline = float(monotonic_fn()) + float(budget_cfg.startup_popup_timeout_sec)
+        while True:
+            res_data = read_json_safe(res_path)
+            if res_data is not None and isinstance(res_data.get("decision"), Mapping):
+                decision = _deserialize_decision(res_data["decision"])
+                _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+                return decision, None
+
+            still_on, _, _ = probe_companion_lock(
+                eff_comp_lock,
+                expected_workspace_root=eff_ws_root,
+                now_epoch=float(eff_now_fn()),
+                pid_checker=eff_checker,
+            )
+            if not still_on:
+                _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+                return None, {
+                    "ok": True,
+                    "run_id": run_id,
+                    "stopped_reason": "desktop_companion_aborted",
+                    "message": "桌面常驻小窗在预算确认期间退出或失联，本次巡逻已安全中止。",
+                }
+
+            now_m = float(monotonic_fn())
+            if now_m >= res_deadline:
+                _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+                default_plan = build_budget_plan(
+                    "combined",
+                    max_use_ratio=budget_cfg.default_window_budget_ratio,
+                    max_videos=budget_cfg.default_max_videos,
+                    reserve_ratio=budget_cfg.default_reserve_ratio,
+                    max_minutes=budget_cfg.default_max_minutes,
+                    current_window_used_ratio=budget_status.used_ratio,
+                    now_epoch=float(eff_now_fn()),
+                )
+                return decision_from_plan(
+                    default_plan,
+                    source="timeout_default",
+                    elapsed_sec=float(budget_cfg.startup_popup_timeout_sec),
+                ), None
+
+            sleep_fn(min(_IPC_RES_POLL_INTERVAL_SEC, max(0.01, res_deadline - now_m)))
+
+    # policy == "disabled"
+    cloud_stop = _run_branch_b_cloud_check()
+    if cloud_stop is not None:
+        return None, cloud_stop
+    return _run_legacy_popup(), None
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Strictly read-only status aggregator (NEVER acquires `.cat.lock` or creates a missing DB)."""
+    cfg, _secrets = _load_config_from_args(args, offline=True)
+    eff_temp_root = Path(args.temp_root)
+    eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
+    run_states_dir = _resolve_run_states_dir(cfg, db_path=args.db, temp_root=eff_temp_root)
+    eff_db_path = args.db if args.db is not None else cfg.memory.db_path
+    db_exists = eff_db_path == ":memory:" or Path(eff_db_path).is_file()
+
+    if db_exists:
+        store_cm = MemoryStore.from_config(cfg, db_path=eff_db_path)
+    else:
+        store_cm = MemoryStore(
+            ":memory:",
+            memory_config=cfg.memory,
+            budget_config=cfg.budget_and_runtime,
+        )
+
+    with store_cm as store:
+        window_status = store.get_budget_status(allowed_ratio=1.0)
+        diary_count = store.count_diary_entries()
+        recent_entries = store.list_recent_diary_entries(limit=3)
+
+    recent_diaries = [
+        {
+            "created_at": entry.created_at,
+            "title": entry.title,
+            "bv_id": entry.bv_id,
+            "impression_score": entry.impression_score,
+        }
+        for entry in recent_entries
+    ]
+
+    cloud_mounted = SyncManager(
+        cfg,
+        persona_path=args.persona,
+        local_export_dir=getattr(args, "export_dir", None),
+        cloud_nest_dir=getattr(args, "cloud_dir", None),
+        probe_retries=1,
+        probe_retry_delay_sec=0.0,
+    ).probe_cloud_nest()
+
+    lock_pid = _read_lock_pid(eff_lock_path) if eff_lock_path.is_file() else None
+    cat_lock_active = bool(lock_pid is not None and is_pid_alive(lock_pid))
+    active_run_count = _count_active_run_leases(run_states_dir, now_ts=_now_epoch())
+
+    eff_ws_root = resolve_workspace_root(
+        config_path=args.config,
+        workspace_root=getattr(args, "workspace_root", None),
+    )
+    eff_comp_lock = resolve_companion_lock_path(
+        cfg,
+        lock_file_path=eff_lock_path,
+        companion_lock_path=getattr(args, "companion_lock", None),
+    )
+    companion_online, _, companion_status = probe_companion_lock(
+        eff_comp_lock,
+        expected_workspace_root=eff_ws_root,
+        now_epoch=_now_epoch(),
+    )
+
+    _emit_json(
+        {
+            "ok": True,
+            "pipeline_mode": cfg.project.pipeline_mode,
+            "window_bucket": window_status.window_bucket,
+            "used_tokens": window_status.used_tokens,
+            "capacity_tokens": window_status.capacity_tokens,
+            "used_ratio": window_status.used_ratio,
+            "remaining_tokens": window_status.remaining_tokens,
+            "in_cooldown": window_status.in_cooldown,
+            "budget_status": asdict(window_status),
+            "cloud_mounted": cloud_mounted,
+            "cat_lock_active": cat_lock_active,
+            "active_run_count": active_run_count,
+            "companion_online": companion_online,
+            "companion_status": companion_status,
+            "diary_count": diary_count,
+            "recent_diaries": recent_diaries,
+        },
+        output_path=getattr(args, "output", None),
+    )
+    return 0
+
+
 def _cmd_check_budget(args: argparse.Namespace) -> int:
     cfg, _secrets = _load_config_from_args(args, offline=True)
+    eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
+    eff_run_id = sanitize_temp_segment(args.run_id or _generate_run_id("budget"), field_name="run_id")
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         default_status = store.get_budget_status()
-        decision = _resolve_cli_budget_decision(args, budget_status=default_status)
-        if decision is None:
-            decision = prompt_startup_budget(
-                cfg,
-                headless=args.headless,
-                budget_status=default_status,
-                now_epoch_fn=_now_epoch,
+        decision, stop_payload = _resolve_startup_budget_with_gate(
+            cfg,
+            args,
+            run_id=eff_run_id,
+            budget_status=default_status,
+            offline=True,
+            skip_inbox=True,
+            cloud_dir=getattr(args, "cloud_dir", None),
+            eff_lock_path=eff_lock_path,
+        )
+        if stop_payload is not None or decision is None:
+            _emit_json(
+                {
+                    **(stop_payload or {"ok": True, "run_id": eff_run_id}),
+                    "can_proceed": False,
+                },
+                output_path=args.output,
             )
+            return 0
         plan = _effective_budget_plan(
             decision,
             current_window_used_ratio=default_status.used_ratio,
@@ -1988,25 +2355,39 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
     eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
     run_states_dir = _resolve_run_states_dir(cfg, db_path=args.db, temp_root=eff_temp_root)
     lease_ttl_sec = int(getattr(args, "lease_ttl_sec", DEFAULT_RUN_LEASE_TTL_SEC) or DEFAULT_RUN_LEASE_TTL_SEC)
+    skip_inbox = bool(getattr(args, "skip_inbox", False))
+    explicit_cloud_dir = getattr(args, "cloud_dir", None)
+    explicit_export_dir = getattr(args, "export_dir", None)
+    eff_ws_root = resolve_workspace_root(
+        config_path=args.config,
+        workspace_root=getattr(args, "workspace_root", None),
+    )
+    eff_comp_lock = resolve_companion_lock_path(
+        cfg,
+        lock_file_path=eff_lock_path,
+        companion_lock_path=getattr(args, "companion_lock", None),
+    )
+    eff_ipc_dir = resolve_ipc_dir(cfg, ipc_dir=getattr(args, "ipc_dir", None))
 
     with PidLockFile(eff_lock_path, run_id=eff_run_id):
-        # Safe startup sweep: ONLY reclaim expired/released or old orphan temp dirs not belonging to active runs.
-        sweep_stale_temp(
-            eff_temp_root,
-            max_age_sec=DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC,
-            now_ts=_now_epoch(),
-            run_states_dir=run_states_dir,
-        )
         with MemoryStore.from_config(cfg, db_path=args.db) as store:
             default_status = store.get_budget_status()
-            decision = _resolve_cli_budget_decision(args, budget_status=default_status)
-            if decision is None:
-                decision = prompt_startup_budget(
-                    cfg,
-                    headless=args.headless,
-                    budget_status=default_status,
-                    now_epoch_fn=_now_epoch,
+            decision, stop_payload = _resolve_startup_budget_with_gate(
+                cfg,
+                args,
+                run_id=eff_run_id,
+                budget_status=default_status,
+                offline=offline,
+                skip_inbox=skip_inbox,
+                cloud_dir=explicit_cloud_dir,
+                eff_lock_path=eff_lock_path,
+            )
+            if stop_payload is not None or decision is None:
+                _emit_json(
+                    stop_payload or {"ok": True, "run_id": eff_run_id},
+                    output_path=args.output,
                 )
+                return 0
             plan = _effective_budget_plan(
                 decision,
                 current_window_used_ratio=default_status.used_ratio,
@@ -2038,6 +2419,14 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                     output_path=args.output,
                 )
                 return 0
+
+            # Safe startup sweep: ONLY reclaim expired/released or old orphan temp dirs not belonging to active runs.
+            sweep_stale_temp(
+                eff_temp_root,
+                max_age_sec=DEFAULT_ORPHAN_TEMP_MAX_AGE_SEC,
+                now_ts=_now_epoch(),
+                run_states_dir=run_states_dir,
+            )
 
             run_state_path = _resolve_run_state_path(
                 cfg,
@@ -2071,9 +2460,6 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                 # In offline mode, only touch cloud inbox when `--cloud-dir` is explicitly provided so
                 # offline tests never touch the user's real cloud drive or real data/exports/.
                 inbox_sync_dict: dict[str, Any] | None = None
-                skip_inbox = bool(getattr(args, "skip_inbox", False))
-                explicit_cloud_dir = getattr(args, "cloud_dir", None)
-                explicit_export_dir = getattr(args, "export_dir", None)
                 if not skip_inbox and (not offline or explicit_cloud_dir is not None):
                     temp_export_sandbox: Path | None = None
                     try:
@@ -2119,7 +2505,14 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                             )
                         except GeminiNestError as exc:
                             if exc.error_code == ErrorCode.E2001_BILI_AUTH_EXPIRED:
-                                notify_auth_expired(cfg, detail=exc.message, headless=args.headless)
+                                notify_auth_expired(
+                                    cfg,
+                                    detail=exc.message,
+                                    headless=args.headless,
+                                    ipc_dir=eff_ipc_dir,
+                                    companion_lock_path=eff_comp_lock,
+                                    workspace_root=eff_ws_root,
+                                )
                             raise
                         if batch.aborted:
                             raise GeminiNestError(
@@ -2553,6 +2946,17 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
 
     bridge = AgentBridge(cfg, persona_path=args.persona)
     meta_filter = MetaFilter(cfg)
+    eff_lock_path = Path(args.lock_file or cfg.budget_and_runtime.lock_file_path)
+    eff_ws_root = resolve_workspace_root(
+        config_path=args.config,
+        workspace_root=getattr(args, "workspace_root", None),
+    )
+    eff_comp_lock = resolve_companion_lock_path(
+        cfg,
+        lock_file_path=eff_lock_path,
+        companion_lock_path=getattr(args, "companion_lock", None),
+    )
+    eff_ipc_dir = resolve_ipc_dir(cfg, ipc_dir=getattr(args, "ipc_dir", None))
 
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         outcome = commit_appreciation_result(
@@ -2577,6 +2981,9 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
             cache_hit=(eff_cache_status == "hit"),
             cache_status=eff_cache_status,
             headless=args.headless,
+            ipc_dir=eff_ipc_dir,
+            companion_lock_path=eff_comp_lock,
+            workspace_root=eff_ws_root,
         )
         outcome["token_estimate_reused"] = persisted_token_est is not None
         _record_run_state_bv(run_state_path, bv_id=safe_bv, field="committed_bvs", run_id=safe_run_id)
@@ -2781,6 +3188,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=None, help="Override SQLite db_path")
     parser.add_argument("--temp-root", default=str(DEFAULT_TEMP_ROOT), help="Temp media root dir")
     parser.add_argument("--lock-file", default=None, help="Override .cat.lock path")
+    parser.add_argument("--companion-lock", default=None, help="Override .companion.lock path")
+    parser.add_argument("--ipc-dir", default=None, help="Override budget IPC directory")
+    parser.add_argument("--workspace-root", default=None, help="Override workspace root for companion check")
     parser.add_argument("--persona", default=str(DEFAULT_PERSONA_PATH), help="Path to cat-soul.md")
     parser.add_argument("--export-dir", default=None, help="Override local pure-text export dir")
     parser.add_argument("--cloud-dir", default=None, help="Override cloud_nest_dir path")
@@ -2804,6 +3214,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=None, help="Optional JSON output file path")
 
     subparsers = parser.add_subparsers(dest="command")
+
+    p_status = subparsers.add_parser(
+        "status",
+        help="Read-only status summary (5h window, pipeline_mode, cloud_mounted, locks, diaries)",
+    )
+    p_status.add_argument("--cloud-dir", default=argparse.SUPPRESS)
+    p_status.add_argument("--export-dir", default=argparse.SUPPRESS)
+    p_status.add_argument("--ipc-dir", default=argparse.SUPPRESS)
+    p_status.add_argument("--companion-lock", default=argparse.SUPPRESS)
+    p_status.add_argument("--workspace-root", default=argparse.SUPPRESS)
+    p_status.add_argument("--output", default=argparse.SUPPRESS)
 
     p_budget = subparsers.add_parser("check-budget", help="Check 5h window compute budget")
     p_budget.add_argument(
@@ -2832,6 +3253,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max patrol duration in minutes (>0); combinable with other flags; skips popup",
     )
     p_budget.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
+    p_budget.add_argument("--ipc-dir", default=argparse.SUPPRESS)
+    p_budget.add_argument("--companion-lock", default=argparse.SUPPRESS)
+    p_budget.add_argument("--workspace-root", default=argparse.SUPPRESS)
     p_budget.add_argument("--output", default=argparse.SUPPRESS)
 
     p_feed = subparsers.add_parser(
@@ -2879,6 +3303,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("--lease-ttl-sec", type=int, default=DEFAULT_RUN_LEASE_TTL_SEC)
     p_feed.add_argument("--export-dir", default=argparse.SUPPRESS)
     p_feed.add_argument("--cloud-dir", default=argparse.SUPPRESS)
+    p_feed.add_argument("--ipc-dir", default=argparse.SUPPRESS)
+    p_feed.add_argument("--companion-lock", default=argparse.SUPPRESS)
+    p_feed.add_argument("--workspace-root", default=argparse.SUPPRESS)
     p_feed.add_argument("--skip-inbox", action="store_true")
     p_feed.add_argument("--output", default=argparse.SUPPRESS)
 
@@ -2926,6 +3353,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Explicit cache status override (default: unknown unless --cache-hit is set)",
     )
     p_commit.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
+    p_commit.add_argument("--ipc-dir", default=argparse.SUPPRESS)
+    p_commit.add_argument("--companion-lock", default=argparse.SUPPRESS)
+    p_commit.add_argument("--workspace-root", default=argparse.SUPPRESS)
     p_commit.add_argument("--output", default=argparse.SUPPRESS)
 
     p_burn = subparsers.add_parser(
@@ -2984,6 +3414,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
+        if args.command == "status":
+            return _cmd_status(args)
         if args.command == "check-budget":
             return _cmd_check_budget(args)
         if args.command == "prepare-feed":

@@ -146,10 +146,26 @@ Copy-Item config.local.example.json config.local.json
   * `prepare-feed` 与 `check-budget` 支持同时传入 `--budget-ratio`、`--max-videos`、`--reserve-ratio`、`--max-minutes` 的任意组合。
   * **关键规则**：只要命令行显式传入了上述 4 个参数中的**任意 1 个或多个**，系统会自动跳过弹窗，且**仅生效显式传入的那几项，未传入的其余项本轮自动设为 `null`（不限）**（例如只传 `--max-videos 5` 时，本轮仅限看 5 片，不额外受默认比例/时长限制）。当 4 个参数均未传入且走超时 / `--headless` / 隔离桌面兜底时，自动启用配置里的 4 项默认值联合组合。
   * **`--max-select` 与 `max_videos` 协同及防滥用护栏**：未显式传 `--max-select` 时，若 `max_videos` 明确指定（例如 `12` 或 `100`），单轮选片上限会自动按 `min(max_videos, 30)` 推进（不再被默认 `4` 卡死）；若 `max_videos` 为不限（`null`），单轮选片默认为 `4`。为防止单次上下文请求过度膨胀或误刷接口，程序内置单次选片防滥用护栏 **`MAX_SELECT_PER_BATCH_GUARDRAIL = 30`**（即使显式传更大的 `--max-select` 也会被钳制在 `30` 以内；当 `max_videos > 30` 时，宿主可按分段波次在同一预算约束下稳步推进）。
-* **Windows 桌面弹窗与无头 / 隔离桌面兜底机制**：
-  * **交互式桌面（`WinSta0\Default`）**：不带 `--headless` 且未传 CLI 预算覆盖参数时，`budget_ui.py` 会在桌面前置（`-topmost` + Win32 `SW_SHOWNOACTIVATE` / `SWP_NOACTIVATE`）弹出不抢占键盘焦点的 60 秒 **4 条件联合上限 `tkinter` 小窗**——顶部实时预览综合换算后的本次可用 Token 比例与 60 秒 `time.monotonic()` 单调时钟倒计时，下方提供 **4 个独立输入框**（默认填入当前生效配置值，均标注「留空 = 不限」），按钮区提供 **「确认出发」**、**「清空条件」**（一键清空全部 4 框，只填 1 项即实现其余 3 项不限）与 **「今日休息」**；若父进程携带 `SW_HIDE` 隐藏标志，会自动通过干净辅助子进程拉起可见小窗。60 秒无操作自动按当前配置 4 项默认值联合出发。
-  * **无交互/隔离桌面自动快退兜底**：在锁屏、Session 0，或 Antigravity 命令沙箱隔离桌面（如 `WinSta0\exebox-*`）下运行时，`budget_ui.py` 会自动检测当前 Windows 桌面非 `Default`（或捕获 `TclError`），**不再空等 60 秒隐身窗口**，而是立即静默回退至默认 4 项配置组合继续执行；需要定制本次预算时，直接在 `prepare-feed` 命令追加上述 CLI 参数即可。
-  * 仅当你明确希望“即使在交互桌面也完全不弹预算小窗与 Toast”时，才需手动在 `prepare-feed` 和 `commit-appreciation` 后追加 `--headless`。
+* **两种启动运行方式（并列支持，按需选择）**：
+  由于 Antigravity 定时任务命令终端通常运行在隔离桌面（`WinSta0\exebox-*`），直接拉起的 GUI 窗口对当前用户桌面不可见，因此 v3 引入「**跨桌面文件 IPC + 常驻轻量桌面小窗**」架构：
+
+  * **方式 ①：桌面小窗交互模式（推荐，真实桌面 `WinSta0\Default`）**
+    1. **一键生成桌面快捷方式（零黑框，仅需执行一次）**：
+       ```powershell
+       <YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py
+       # 可先加 --dry-run 预演确认 pythonw.exe 与仓库路径
+       ```
+    2. **双击桌面「GeminiNest 桌面小窝助手」**（或运行 `pythonw -m gemininest.companion`）：常驻轻量 `tkinter` 小窗在 `WinSta0\Default` 监听 `data/budget_ipc/`，不持有 `.cat.lock`、不并发写库，后台线程定时调用只读 `python -m gemininest.runner status` 刷新 **当前管线模式、5h 窗口算力、云盘挂载、手账总数与最新时间**。
+    3. **小窗运行策略单选切换**：
+       * **「每次弹窗询问」**（默认）：收到巡逻请求时以 `tk.Toplevel` 非抢占弹出 60 秒 **4 条件联合上限**确认窗（含实时预览、清空条件、确认出发、今日休息），支持小窗最小化到任务栏并在高分/失效时通过 `winotify` 代发 120s TTL 原生 Toast；
+       * **「自动默认值执行」**：收到请求后不弹窗，立即按配置 4 项默认值回传继续巡逻。
+    4. **三分支启动门禁（`config.json` `budget_and_runtime`）**：
+       * `companion_policy: "required"`（默认）：未传 `--headless` 且未传 CLI 预算参数时，先校验 `data/.companion.lock` 存活与 `ack` 握手（`ipc_ack_timeout_sec: 2.5`），未启动小窗则**退出码 0** 返回 `stopped_reason: "desktop_companion_offline"`；等待确认中途用户点「退出」小窗则返回 `stopped_reason: "desktop_companion_aborted"`；60s 超时按配置 4 项默认值继续。
+       * `require_cloud_mount_on_start: true`（默认）：在线巡逻（非 `--offline` 且非 `--skip-inbox`）在弹窗之前校验 Google Drive 云盘挂载（`SyncManager.probe_cloud_nest()`），**即使显式传了 `--headless` 也会执行此校验**；未挂载时**退出码 0** 返回 `stopped_reason: "cloud_drive_unmounted"`（`E8001_CLOUD_DRIVE_UNMOUNTED`），绝不半途白跑 B 站拉取或弹窗。`--offline` / `--dry-run` 保留本地兜底不强退。
+
+  * **方式 ②：`--headless` 纯无头自动化模式（或显式 CLI 预算覆盖）**
+    * 无需启动桌面小窗：在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按配置 4 项默认值执行，不弹小窗、不发 Toast），或在 `prepare-feed` 传入 `--budget-ratio` / `--max-videos` / `--reserve-ratio` / `--max-minutes` 任意组合（跳过前端检查与交互弹窗，未传维度本轮自动不限）。
+    * 注意：在线巡逻即便传入 `--headless`，若 `require_cloud_mount_on_start: true` 仍会在开跑前校验 Google Drive 云盘是否已挂载。
 
 ### 3.2 使用 `Create With Prompt` 快捷创建定时任务
 
@@ -159,7 +175,7 @@ Copy-Item config.local.example.json config.local.json
 2. 在弹窗中用自然语言写明触发时间与工作区，并将下节「v1 / v2 自适应通用版唤醒 Prompt」作为任务指令粘贴填入，例如：
    > “每天 11:30 和 20:30 在工作目录 `<YOUR_PROJECT_DIR>` 自动执行以下 GeminiNest 巡逻协议：[粘贴 3.3 节完整 Prompt]”
 3. 核对 Antigravity 生成的 Cron 表达式（如 `30 11,20 * * *`）、目标工作目录与执行权限设置后保存启用。
-4. 建议先点击任务旁的 **Run Now** 手动试触发一次，确认预算弹窗、小号心跳、媒体制备与云盘同步全链路畅通。
+4. 建议先双击桌面「GeminiNest 桌面小窝助手」，再点击任务旁的 **Run Now** 手动试触发一次，确认跨桌面 IPC 预算弹窗、云盘挂载门禁、小号心跳、媒体制备与云盘同步全链路畅通。
 
 ### 3.3 标准唤醒 Prompt（v1 / v2 自适应通用版，直接复制使用）
 
@@ -171,12 +187,16 @@ Copy-Item config.local.example.json config.local.json
 
 请严格使用 Python 解释器 `<YOUR_CONDA_PYTHON>`（设置环境变量 `PYTHONPATH=src`），按以下三阶段协议顺序执行，严禁跳过安全校验或残留临时媒体文件：
 
-【阶段 1：吸收反向补丁 + 预算确认 + 准备今日菜单（小脑选片）】
-1. 执行命令（默认不带 `--headless`，交互桌面自动弹出 60 秒 4 条件联合上限预算确认窗；锁屏/隔离桌面自动静默回退当前配置的 4 项默认值组合；也可按需显式传入 `--budget-ratio`、`--max-videos`、`--reserve-ratio`、`--max-minutes` 中的任意 1 项或多项组合，跳过弹窗且未传维度自动不限；同时自动完成 `.cat.lock` 锁校验、仅回收过期孤儿目录的安全清扫、Step 1 幂等吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心轮换拉取、黑名单硬过滤、Top-8 记忆召回，并在 `data/run_states/<run_id>.json` 落盘 `budget_plan` 与活跃运行租约）：
+【阶段 1：启动门禁校验 + 预算确认 + 吸收反向补丁 + 准备今日菜单（小脑选片）】
+1. 执行命令（默认不带 `--headless`，经桌面小窗 IPC 弹出 60 秒 4 条件联合上限预算确认窗；也可按需显式传入 `--budget-ratio`、`--max-videos`、`--reserve-ratio`、`--max-minutes` 中的任意 1 项或多项组合跳过弹窗，或追加 `--headless` 走纯无头默认模式；程序会按优先级完成：桌面小窗在线门禁、Google Drive 云盘挂载门禁、`.cat.lock` 锁校验、仅回收过期孤儿目录的安全清扫、Step 1 幂等吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心轮换拉取、黑名单硬过滤、Top-8 记忆召回，并在 `data/run_states/<run_id>.json` 落盘 `budget_plan` 与活跃运行租约）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-feed`
    （如需固定每波次选片条数，可追加 `--max-select 4`；单次请求防滥用护栏上限为 `30`。）
 2. 解析标准输出的 JSON：
-   - 若出现 `stopped_reason`（如 `rest_today` / `cooldown_or_budget_exhausted`）或错误码 `E2001_BILI_AUTH_EXPIRED` / `E2002_BILI_RATE_LIMIT_412` / `E7002_LOCKFILE_CONFLICT`，立即停止本轮巡逻并简短汇报原因，严禁继续拉取或重试。
+   - **关键中止门禁（立即用中文向用户说明原因并直接结束本次对话，严禁重试或继续拉取）**：
+     * 若 `stopped_reason` 为 `"desktop_companion_offline"`：立即用中文明确告知用户「桌面常驻小窗（GeminiNest 桌面小窝助手）未运行或 IPC 未响应，请先双击桌面快捷方式启动小窗（或改用 `--headless` 模式）后再触发巡逻」并结束对话。
+     * 若 `stopped_reason` 为 `"desktop_companion_aborted"`：立即用中文明确告知用户「桌面常驻小窗在等待预算确认期间已被关闭/退出，本次巡逻已安全中止」并结束对话。
+     * 若 `stopped_reason` 为 `"cloud_drive_unmounted"`（或 `error_code` 为 `E8001_CLOUD_DRIVE_UNMOUNTED`）：立即用中文明确告知用户「Google Drive 云盘小窝目录当前未挂载或不可访问，请先启动 Google Drive 客户端确认同步盘就绪后再重新巡逻」并结束对话。
+   - 若出现其他 `stopped_reason`（如 `rest_today` / `cooldown_or_budget_exhausted`）或错误码 `E2001_BILI_AUTH_EXPIRED` / `E2002_BILI_RATE_LIMIT_412` / `E7002_LOCKFILE_CONFLICT`，同样立即停止本轮巡逻并用中文简短汇报原因后结束对话，严禁继续拉取或重试。
    - 若成功获得 `packet`（包含 `static_prefix_prompt` 与 `dynamic_menu_prompt`）、`effective_max_select` 与 `budget_plan`，请你严格按 `static_prefix_prompt` 中的 `cat-soul.md` 与 `SelectionResponse` JSON Schema 选出不超过 `effective_max_select` 条最有灵魂、高信息密度或高视听价值的候选视频（`target_mode` 与 `dynamic_menu_prompt` 指示的当前管线模式保持一致），记住 `run_id` 与选中 BV 列表。
 
 【阶段 2：逐条制备媒体 -> 原生 `read_file` 鉴赏 -> 提交回写并物理焚毁】
@@ -308,7 +328,9 @@ reason: Web 端讨论后确认更喜欢这种轻松有趣的总结节奏
 | `E2002_BILI_RATE_LIMIT_412` | 连续 2 次触发 B 站 `-412` 风控 | 确认代理已将 B 站走 `DIRECT`，稍等数小时再试 |
 | `E5001_SAFETY_GATE_DOWNGRADED` | v2 视觉安检抹黑帧占比 `> 15%` | 正常安全保护：已提前熔断并自动降级为 `downgraded_audio` 纯音频，宿主按纯听觉红线继续鉴赏 |
 | `E7002_LOCKFILE_CONFLICT` | `.cat.lock` 检测到存活进程 | 防止休眠补发撞车，正常静默退出；崩溃残留的死 PID 锁会自动回收 |
-| `E8001_CLOUD_DRIVE_UNMOUNTED` | `<YOUR_GOOGLE_DRIVE_NEST>` 未挂载 | 本地 `data/exports/` 导出与独立隐藏 Git 提交均已完整保留；恢复 Google Drive 挂载后补跑 `python -m gemininest.runner sync` |
+| `E8001_CLOUD_DRIVE_UNMOUNTED` | `<YOUR_GOOGLE_DRIVE_NEST>` 未挂载 | 若在启动门禁（`require_cloud_mount_on_start: true`）触发 `stopped_reason: "cloud_drive_unmounted"`，先启动 Google Drive 客户端后再巡逻；若在 Stage 3 `sync` 阶段断开，本地 `data/exports/` 与独立隐藏 Git 提交均已完整保留，挂载恢复后补跑 `python -m gemininest.runner sync` |
+| `desktop_companion_offline` | 桌面常驻小窗未启动或 IPC 超时 | 在本地桌面双击「GeminiNest 桌面小窝助手」快捷方式（或运行 `pythonw -m gemininest.companion`），或改用 `--headless` 模式 |
+| `desktop_companion_aborted` | 等待预算确认期间用户退出了桌面小窗 | 正常主动中止保护（退出码 0），需要巡逻时重新启动桌面小窗后再触发 |
 | `E8002_SYNC_EXT_VIOLATION` | 非白名单文件试图入云 | 检查 `data/exports/` 是否误放了 `.mp4`/`.m4a`/`.db`/`.png` 等非纯文本文件并移出 |
 | `E8003_PATCH_PARSE_FAILED` | `inbox/` 补丁语法非法 | 原文件与 `*_rejected.txt` 已归档至 `inbox_archived/`，按第 6 节修正格式后重放 |
 | `E8004_PATCH_POLICY_REJECTED` | 补丁越权、超长或触发安全/黑名单红线 | 已拒绝合并并连同拒因日志归档至 `inbox_archived/` |

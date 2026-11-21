@@ -49,6 +49,10 @@ def test_load_repo_config_without_local_file(tmp_path: Path) -> None:
     assert cfg.budget_and_runtime.default_max_videos == 100
     assert cfg.budget_and_runtime.default_reserve_ratio == pytest.approx(0.30)
     assert cfg.budget_and_runtime.default_max_minutes == 30
+    assert cfg.budget_and_runtime.companion_policy == "required"
+    assert cfg.budget_and_runtime.ipc_dir == "data/budget_ipc"
+    assert cfg.budget_and_runtime.ipc_ack_timeout_sec == pytest.approx(2.5)
+    assert cfg.budget_and_runtime.require_cloud_mount_on_start is True
     assert "原神" in cfg.safety_alignment.blacklist.tags
     assert len(ErrorCode) == 18
 
@@ -331,6 +335,60 @@ def test_budget_4_condition_defaults_null_overrides_and_legacy_compat(tmp_path: 
         {"default_max_minutes": False},
     ):
         bad_local = tmp_path / "bad_budget.json"
+        bad_local.write_text(json.dumps({"budget_and_runtime": bad_patch}), encoding="utf-8")
+        with pytest.raises(GeminiNestError) as exc_info:
+            load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
+        assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID
+
+
+def test_companion_and_ipc_config_defaults_overrides_and_validation(tmp_path: Path) -> None:
+    # 1. Legacy config without companion/ipc fields still loads with safe defaults
+    legacy = copy.deepcopy(_load_base_dict())
+    for key in (
+        "companion_policy",
+        "ipc_dir",
+        "ipc_ack_timeout_sec",
+        "require_cloud_mount_on_start",
+    ):
+        legacy["budget_and_runtime"].pop(key, None)
+    legacy_file = tmp_path / "legacy_companion.json"
+    legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    cfg_legacy = load_config(config_path=legacy_file, local_config_path=None)
+    assert cfg_legacy.budget_and_runtime.companion_policy == "required"
+    assert cfg_legacy.budget_and_runtime.ipc_dir == "data/budget_ipc"
+    assert cfg_legacy.budget_and_runtime.ipc_ack_timeout_sec == pytest.approx(2.5)
+    assert cfg_legacy.budget_and_runtime.require_cloud_mount_on_start is True
+
+    # 2. Local overrides work cleanly
+    local_override = tmp_path / "local_companion.json"
+    local_override.write_text(
+        json.dumps(
+            {
+                "budget_and_runtime": {
+                    "companion_policy": "optional",
+                    "ipc_dir": str(tmp_path / "custom_ipc"),
+                    "ipc_ack_timeout_sec": 4.0,
+                    "require_cloud_mount_on_start": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_over = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_override)
+    assert cfg_over.budget_and_runtime.companion_policy == "optional"
+    assert cfg_over.budget_and_runtime.ipc_dir == str(tmp_path / "custom_ipc")
+    assert cfg_over.budget_and_runtime.ipc_ack_timeout_sec == pytest.approx(4.0)
+    assert cfg_over.budget_and_runtime.require_cloud_mount_on_start is False
+
+    # 3. Invalid values raise E1001_CONFIG_INVALID
+    for bad_patch in (
+        {"companion_policy": "always"},
+        {"ipc_dir": "   "},
+        {"ipc_ack_timeout_sec": 0},
+        {"ipc_ack_timeout_sec": True},
+        {"require_cloud_mount_on_start": "false"},
+    ):
+        bad_local = tmp_path / "bad_companion.json"
         bad_local.write_text(json.dumps({"budget_and_runtime": bad_patch}), encoding="utf-8")
         with pytest.raises(GeminiNestError) as exc_info:
             load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
