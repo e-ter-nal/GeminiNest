@@ -29,14 +29,14 @@ GeminiNest/
 │   └── gemininest/
 │       ├── __init__.py
 │       ├── config.py                 # [模块1] 配置加载、合并与校验
-│       ├── fetcher.py                # [模块2] B 站只读 Web API (httpx+WBI) / yt-dlp / 空降助手
+│       ├── fetcher.py                # [模块2] B 站 WBI Web API (httpx+WBI) / yt-dlp / 空降助手 / 默认关闭的受控自用交互
 │       ├── meta_filter.py            # [模块3] 前置黑名单硬过滤防火墙
 │       ├── media_processor.py        # [模块4] 本地 FFmpeg 音频提取 / v2 抽帧与净版 MP4 重封
 │       ├── safety_gate.py            # [模块5] 本地视觉安检门（v1 直通桩 / v2 wd-tagger ONNX）
 │       ├── agent_bridge.py           # [模块6] Antigravity 宿主桥接层（前缀拼装/媒体清单/JSON校验/账本估算）
 │       ├── memory_store.py           # [模块7] SQLite FTS5 + 艾宾浩斯 Top-8 引擎 + 账本
 │       ├── sync_manager.py           # [模块8] Google Drive 纯文本正反向同步 + exports 独立隐藏 Git
-│       ├── budget_ui.py              # 4 条件联合预算面板（Tk/Toplevel）+ 原子文件 IPC + 120s Toast 转发
+│       ├── budget_ui.py              # 3 条件联合预算面板与主动限额设置（Tk/Toplevel）+ 原子文件 IPC + 120s Toast 转发
 │       ├── companion.py              # WinSta0\Default 桌面常驻轻量小窗 + Win32 系统托盘 + 状态看板
 │       └── runner.py                 # 顶层调度入口（进程锁、三分支启动门禁、只读 status、--dry-run 离线回放）
 ├── data/                             # [全目录受控，均由主仓库 Git 忽略]
@@ -169,7 +169,7 @@ Gemini_Nest/
 3. **`data/exports/` 独立隐藏 Git 仓库**：
    * 主工程 `.gitignore` 严格忽略 `data/exports/`；`data/exports/` 内部初始化独立本地 Git 仓库（`git -C data/exports commit`），彻底隔离私人冲浪日记历史与未来可开源的工程代码库。
 4. **`tkinter` 无头 / 隔离桌面与跨桌面前端**：
-   * `budget_ui.py` 与 `companion.py` 支持 4 条件联合交集上限（公版默认 `0.4` / `100` / `0.30` / `30`）及 `--headless` / CLI 参数覆盖；当隔离桌面（`WinSta0\exebox-*`）直接弹窗不可见时，通过 `data/budget_ipc/` 原子文件 IPC 交由真实桌面 `WinSta0\Default` 常驻小窗以 `tk.Toplevel` 弹窗并代发 120s TTL Toast，锁屏 `tk.TclError` 或 60s `time.monotonic()` 超时自动静默按当前有效交集默认值继续。
+   * `budget_ui.py` 与 `companion.py` 支持 3 条件联合交集上限（公版默认 `150000` Token / `100` 视频 / `30` 分钟）及 `--headless` / CLI 参数覆盖；桌面小窗新增「限额设置」弹窗（「设为默认值」原子改写 `config.local.json`，「单次使用」写 `next_run_override.json` 并在下一轮自动预填+核销，「取消」）；当隔离桌面（`WinSta0\exebox-*`）直接弹窗不可见时，通过 `data/budget_ipc/` 原子文件 IPC 交由真实桌面 `WinSta0\Default` 常驻小窗以 `tk.Toplevel` 弹窗并代发 120s TTL Toast，锁屏 `tk.TclError` 或 60s `time.monotonic()` 超时自动静默按当前有效交集设定继续。
 
 ---
 
@@ -228,3 +228,8 @@ Gemini_Nest/
 - [x] 升级 `budget_ui.py` / `config.py` / `contracts.py` / `runner.py`：实现 4 条件联合交集上限（`max_use_ratio` / `max_videos` / `reserve_ratio` / `max_minutes`）、CLI「仅传 1 项其余不限」与 `MAX_SELECT_PER_BATCH_GUARDRAIL = 30` 防滥用护栏。
 - [x] 实现 `companion.py`、`assets/gemininest.ico` 与 `scripts/create_companion_shortcut.py`：真实桌面 `WinSta0\Default` 常驻轻量 `tkinter` 小窗（单实例互斥锁 + `.companion.lock` 心跳）、纯 Win32 `Shell_NotifyIconW` 系统托盘收纳/还原、高 DPI 自适应布局、5h 窗口起点与日记/记忆计数展示。
 - [x] 实现三分支启动门禁与只读接口：扩展 `runner.py status` 只读看板接口；在 `prepare-feed` 接入小窗 IPC 握手（`desktop_companion_offline` / `desktop_companion_aborted`）、云盘挂载门禁（`cloud_drive_unmounted` / `E8001`）与 120s TTL Toast 代发，全量离线单测 `163/163` 通过后合并回 `main` 并发布 `v3.0.0`。
+
+### Phase 7：[v3.1 分支 `feat/v3.1-budget-and-interaction`] 3 条件本地预算、主动配置面板与受控低频 B 站互动
+- [x] 模块 A（3 条件联合预算重构）：移除虚假 5h 比例/底线字段，升级为纯本地估算 `max_run_tokens`（默认 `150000`）+ `max_videos`（`100`）+ `max_minutes`（`30`），完整向后兼容旧版 `config.local.json` 与旧 `run_states/*.json`，`prepare-feed` / `check-budget` 新增 `--max-tokens` 并平滑兼容旧参数。
+- [x] 模块 B（桌面常驻小窗与主动配置）：`memory_store.py` + `runner.py status` 暴露累计/今日冲浪与互动统计及 429 冷却；`companion.py` 面板展示真实统计并新增「限额设置」按钮与托盘菜单项，支持「设为默认值」（仅原子更新 `config.local.json` 3 项并刷新内存配置）与「单次使用」（`next_run_override.json` 自动预填与单轮核销）。
+- [x] 模块 C（极低频受控 B 站自用交互）：`config.json` 新增默认全关闭 `interaction` 段（校验 `dm_enabled` 下唯一正整数 `owner_bili_uid`，零评论/`@` 代码）；SQLite 原地迁移 `interaction_ledger` 账本与跨分段幂等去重；`fetcher.py` 复用小号 `_bili_client` 实现点赞（`65006` 幂等）、私密收藏夹自动新建与满容滚存（`>=950`）、及强白名单大号私信分享（`-412`/`-101`/`-111` 零重试熔断）；`commit_appreciation_result()` 在主事务提交后 Best-effort 执行且绝不阻塞 `burn-temp`；`sync_manager.py` 导出脱敏统计且严禁泄露任何 `owner_bili_uid` 或凭据。

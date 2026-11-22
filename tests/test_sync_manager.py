@@ -689,3 +689,52 @@ def test_same_revision_repeated_sync_does_not_overwrite_yesterday_readonly(tmp_p
         y_text_day3 = y_diary.read_text(encoding="utf-8")
         assert "REVISION_TWO_MARKER" in y_text_day3
         assert "REVISION_THREE_MARKER" not in y_text_day3
+
+
+def test_exported_views_include_sanitized_surfing_stats_without_owner_uid_or_secrets(tmp_path: Path) -> None:
+    from dataclasses import replace as dc_replace
+    from gemininest.contracts import InteractionConfig
+
+    export_dir = tmp_path / "exports_stats"
+    cloud_dir = _setup_mock_cloud(tmp_path / "cloud_stats")
+    base_cfg = _make_sync_cfg(tmp_path, cloud_dir=cloud_dir, export_dir=export_dir)
+    cfg = dc_replace(
+        base_cfg,
+        interaction=InteractionConfig(
+            enabled=True,
+            like_enabled=True,
+            favorite_enabled=True,
+            dm_enabled=True,
+            owner_bili_uid=987654321,
+            max_daily_dms=2,
+        ),
+    )
+    mgr = SyncManager(cfg, persona_path=REPO_PERSONA_PATH, probe_retries=1, probe_retry_delay_sec=0.0)
+
+    with MemoryStore.from_config(cfg) as store:
+        mem = store.add_memory(title="佳作片", summary="很棒", importance=9.0)
+        store.add_diary_entry(
+            memory_id=mem.id,
+            run_id="r_exp",
+            bv_id="BV1exp0001",
+            title="佳作片",
+            impression_score=9,
+            public_diary="好听极了。",
+        )
+        store.upsert_watch_history(bv_id="BV1exp0001", title="佳作片", duration_sec=90, status="completed")
+        store.record_budget_usage(run_id="r_exp", total_est_tokens=12_345, status="ok")
+        store.record_interaction(bv_id="BV1exp0001", action_type="like", status="ok")
+        store.record_interaction(bv_id="BV1exp0001", action_type="dm", status="ok")
+
+        mgr.export_local_views(store)
+
+    summary_text = (export_dir / "memory_summary.md").read_text(encoding="utf-8")
+    diary_text = (export_dir / "diary_latest.md").read_text(encoding="utf-8")
+    for text in (summary_text, diary_text):
+        assert "12,345 Tokens" in text
+        assert "累计冲浪统计" in text
+        assert "累计互动统计" in text
+        assert "今日互动统计" in text
+        assert "987654321" not in text
+        assert "owner_bili_uid" not in text
+        assert "SESSDATA" not in text

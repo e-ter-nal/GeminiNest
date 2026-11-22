@@ -4,9 +4,9 @@
 >
 > *An autonomous Bilibili surfing, local visual safety-gated, desktop companion-assisted, and bounded cross-platform memory digital life system built for Google Antigravity's native multimodal host — zero external LLM API keys, hot-swappable between v1 Pure-Audio (`48kbps m4a`) and v2 Sanitized-Video (`wd-tagger` DirectML GPU + Surgical Blackout MP4), with v3 Win32 tray companion, 4-condition intersection budget control, and 3-branch startup gate.*
 
-[![Release](https://img.shields.io/badge/version-v3.0.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
+[![Release](https://img.shields.io/badge/version-v3.1.0-blue.svg)](#v1-纯音频-vs-v2-可插拔视觉安检门)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB.svg)](#user--ai-agent-通用快速部署清单quickstart-checklist)
-[![Tests](https://img.shields.io/badge/pytest-163%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-163-条单元测试)
+[![Tests](https://img.shields.io/badge/pytest-172%20passed%20(offline)-brightgreen.svg)](#step-4离线验货--dry-run-与-172-条单元测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -21,7 +21,7 @@
 | **模型接入与费用** | 强依赖外置 LLM SDK 与按量付费 API Key，多模态流量费用高昂 | **Antigravity 宿主原生 `read_file` 零额外 API 费**：零外置 LLM SDK、零 Gemini API Key，直接复用 Antigravity Pro 订阅原生读取本地 `.m4a` / `.mp4` |
 | **长期记忆与遗忘机制** | 堆叠全量历史聊天导致上下文膨胀，缺乏检索与遗忘衰减 | **SQLite FTS5 + 艾宾浩斯 Top-8 记忆引擎**：四列 BM25 加权（标题/简介/热评/新评）+ `<3` 字中文短词回退 + 印象分驱动的遗忘曲线衰减，每次注入严格封顶 Top-8（3 全局 + 5 关联） |
 | **跨端同步与安全隔离** | 原图/原片或数据库直传云端，极易触发 `SAFETY` 截断或泄露私密文件 | **四重防护 + Google Drive 纯文本物理隔离闭环**：前置元数据硬黑名单 → 本地 `wd-tagger` 全帧安检与外科手术抹黑 → 临时媒体两阶段用完即焚 → 云盘纯文本白名单（仅 `.md`/`.json`/`.txt`）打通 **Antigravity ↔ Gemini Web** 正反向记忆闭环 |
-| **定时唤醒与预算风控** | 隔离桌面（`exebox-*`）弹窗不可见、无启动门禁易半途空跑、单一限额易超支 | **v3 常驻桌面托盘 + 4 条件交集预算 + 三分支启动门禁**：`WinSta0\Default` 轻量小窗 + Win32 系统托盘经文件 IPC 跨桌面接收 `Toplevel` 预算窗与 120s Toast；4 维度交集上限（消耗比例 / 观看数 / 保留底线 / 时长）先触顶先停；开跑前强制校验小窗在线与云盘挂载 |
+| **定时唤醒与预算风控** | 隔离桌面（`exebox-*`）弹窗不可见、无启动门禁易半途空跑、虚假 5h 百分比不准 | **v3.1 常驻桌面托盘 + 3 条件本地联合预算 + 主动限额设置**：`WinSta0\Default` 轻量小窗展示真实累计/今日冲浪与互动统计（含「限额设置」设为默认值/单次使用预约）；3 维度交集上限（`max_run_tokens` / `max_videos` / `max_minutes`）先触顶先停；开跑前强制校验小窗在线与云盘挂载 |
 
 ---
 
@@ -74,9 +74,9 @@
 flowchart TD
     subgraph Step1["阶段 1：本地控制层批处理 (prepare-feed)"]
         A["三分支启动门禁: 桌面小窗 IPC 握手 + 云盘挂载校验"] --> B[".cat.lock PID 锁 & 租约安全清扫过期孤儿 temp"]
-        B --> C["60s 跨桌面 Toplevel 4 条件联合预算小窗 (交集上限·先触顶先停，--headless 静默兜底)"]
+        B --> C["60s 跨桌面 Toplevel 3 条件联合预算小窗 (交集上限·先触顶先停·支持单次预约，--headless 静默兜底)"]
         C --> D["Step 1: 吸收云盘 inbox/ 反向 [MEMORY_PATCH]"]
-        D --> E["B 站只读 WBI 心跳 & 推荐流 / 30% 好奇心轮换搜索"]
+        D --> E["B 站 WBI 心跳 & 推荐流 / 30% 好奇心轮换搜索"]
         E --> F["meta_filter 前置黑名单硬过滤 (二游/敏感分区零下载)"]
         F --> G["SQLite FTS5 四列 BM25 + 艾宾浩斯 Top-8 记忆召回"]
         G --> H["输出 SelectionPacket (4,500-5,200 Tok 静态前缀缓存)"]
@@ -84,7 +84,7 @@ flowchart TD
 
     subgraph Step2["阶段 2：Antigravity 宿主驱动两轮闭环"]
         H --> I["宿主小脑选片: 挑选高价值 BV (受 max_videos 与单批护栏 30 约束)"]
-        I --> J["prepare-media: 校验 4 条件联合上限并按 config.local.json 热路由 v1 / v2"]
+        I --> J["prepare-media: 校验 3 条件联合上限并按 config.local.json 热路由 v1 / v2"]
         J --> K{"pipeline_mode?"}
         K -- "v1: audio_only" --> L["FFmpeg + SponsorBlock -> 48kbps m4a"]
         K -- "v2: sanitized_video" --> M["FFmpeg 抽帧 -> wd-tagger ONNX (DirectML/CUDA/CPU)"]
@@ -140,11 +140,11 @@ GeminiNest/
 │   ├── config.py                     # 配置合并校验（黑名单并集追加 + Secrets repr 脱敏）
 │   ├── meta_filter.py                # NFKC + casefold 前置黑名单硬拦截防火墙
 │   ├── memory_store.py               # SQLite WAL + FTS5 trigram (<3 字回退) + 艾宾浩斯 Top-8 + 账本
-│   ├── fetcher.py                    # 只读 B 站 WBI API / yt-dlp / SponsorBlock / -412 熔断 / 快照
+│   ├── fetcher.py                    # B 站 WBI API / yt-dlp / SponsorBlock / -412 熔断 / 默认关闭的受控自用交互
 │   ├── media_processor.py            # FFmpeg v1 音频裁剪 / v2 抽帧与严格帧一致净版 MP4 重封 / 用完即焚
 │   ├── safety_gate.py                # v1 Passthrough 桩 / v2 wd-tagger ONNX (DirectML/CUDA/CPU + Early-Exit)
 │   ├── agent_bridge.py               # 静态前缀缓存拼装 / Packet 打包 / JSON Schema 校验 / 账本估算
-│   ├── budget_ui.py                  # 4 条件联合上限 UI 面板（Tk/Toplevel 复用）+ 原子 IPC + 120s TTL Toast 转发
+│   ├── budget_ui.py                  # 3 条件联合上限 UI 面板与主动限额设置（Tk/Toplevel 复用）+ 原子 IPC + 120s TTL Toast 转发
 │   ├── companion.py                  # WinSta0\Default 常驻轻量 tkinter 桌面小窗 + Win32 系统托盘（单实例互斥锁 + 状态看板 + IPC 监听）
 │   ├── sync_manager.py               # 纯文本扩展名防火墙 + exports 独立隐藏 Git + 轮转 + inbox 补丁吸收
 │   └── runner.py                     # .cat.lock PID 锁、三分支启动门禁、只读 status 接口与 --dry-run 离线回放
@@ -241,7 +241,7 @@ Copy-Item config.local.example.json config.local.json
   - 若需启用 v2 视觉安检，按上方「热插拔切换方式」补充 `pipeline_mode: "sanitized_video"` 与 `wd_tagger_enabled: true`。
 - [ ] 确认代理分流：B 站域名（`bilibili.com`、`bilivideo.com`、`hdslb.com`）走 `DIRECT` 直连，Google / Antigravity 走单一稳定节点。
 
-### Step 4：离线验货（`--dry-run`）与 163 条单元测试
+### Step 4：离线验货（`--dry-run`）与 172 条单元测试
 
 在接入真实小号与定时任务前，先运行全离线演练与单元测试（全程使用隔离临时沙箱，**零网络请求、零额度消耗、绝不触碰真实数据库与云盘**）：
 
@@ -257,7 +257,7 @@ python -m gemininest.runner --dry-run --headless
 python -m gemininest.runner --dry-run --mode sanitized_video --headless
 ```
 
-- [ ] 运行全量离线单元测试（确认 **163/163** 全部通过）：
+- [ ] 运行全量离线单元测试（确认 **172/172** 全部通过）：
 
 ```powershell
 python -m pytest -v
@@ -273,10 +273,10 @@ python -m pytest -v
      python scripts/create_companion_shortcut.py
      # 可先追加 --dry-run 预演确认解析路径
      ```
-  2. 双击桌面的「**GeminiNest 桌面小窝助手**」快捷方式常驻真实桌面（`WinSta0\Default`）：支持随时切换「**每次弹窗询问**」与「**自动默认值执行**」、后台异步刷新 `runner status`（当前模式 / 5h 算力 / 云盘挂载 / 手账数）、以及 120s TTL 原生 Toast 代发。
-  3. 在 Antigravity **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴 `docs/SETUP_AND_RUNTIME.md` 第 3.3 节「标准唤醒 Prompt」（默认不带 `--headless`，触发前自动执行小窗在线校验、云盘挂载门禁与跨桌面 4 条件联合预算弹窗）。
+  2. 双击桌面的「**GeminiNest 桌面小窝助手**」快捷方式常驻真实桌面（`WinSta0\Default`）：支持随时切换「**每次弹窗询问**」与「**自动默认值执行**」、点击「**限额设置**」调整默认 3 项限额或预约下次「**单次使用**」、后台异步刷新 `runner status`（当前模式 / 累计与今日冲浪互动统计 / 429 冷却 / 云盘挂载 / 手账数）、以及 120s TTL 原生 Toast 代发。
+  3. 在 Antigravity **`Scheduled Tasks`** 使用 **`Create With Prompt`** 粘贴 `docs/SETUP_AND_RUNTIME.md` 第 3.3 节「标准唤醒 Prompt」（默认不带 `--headless`，触发前自动执行小窗在线校验、云盘挂载门禁与跨桌面 3 条件联合预算弹窗）。
 - **方式 ②：`--headless` 纯无头自动化模式（或显式 CLI 预算覆盖）**：
-  - 无需打开桌面小窗，直接在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按配置 4 项默认值静默执行，跳过交互弹窗与 Toast），或传入 `--budget-ratio` / `--max-videos` / `--reserve-ratio` / `--max-minutes` 任意组合（未传维度本轮自动不限）；在线巡逻仍会在开跑前强制校验 Google Drive 云盘挂载状态（`require_cloud_mount_on_start: true`）。
+  - 无需打开桌面小窗，直接在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按默认或单次预约 3 项限额静默执行，跳过交互弹窗与 Toast），或传入 `--max-tokens` / `--max-videos` / `--max-minutes` 任意组合（未传维度本轮自动不限）；在线巡逻仍会在开跑前强制校验 Google Drive 云盘挂载状态（`require_cloud_mount_on_start: true`）。
 - ***(可选) 云端联动***：
   1. 部署 [`scripts/inbox_gdoc_exporter.gs`](scripts/inbox_gdoc_exporter.gs) 至 Google Apps Script（每 15 分钟将 `inbox/` 中的 `.gdoc` 转存为同名 `.txt`）；
   2. 配置 Gemini Web 端常驻 Gem 与每日 `Scheduled Actions`，实现手机/网页端与本地记忆的纯文本双向闭环。
@@ -285,7 +285,7 @@ python -m pytest -v
 
 ## 合规与免责声明
 
-1. **仅供学习与个人研究**：本项目仅面向个人多模态 Agent 架构学习、本地媒体安检与长期记忆实验研究，默认以**纯只读、低频自律**方式运行，**不包含且严禁添加任何自动点赞、投币、收藏、评论、私信、关注或刷量功能**；内置请求随机间隔、`-412` 连续两次自动熔断与 5 小时窗口算力限额保护。
+1. **仅供学习与个人研究（默认纯只读 + 可选极低频自用互动）**：本项目仅面向个人多模态 Agent 架构学习、本地媒体安检与长期记忆实验研究。**公版 `config.json` 出厂保持纯只读，所有写操作开关（`interaction.*`）默认全部关闭（`false`）**；代码库**严禁且绝不实现任何自动评论（`/x/v2/reply/add`）、`@` 提及、关注或刷量功能**。如使用者在本地 `config.local.json` 手动开启低频自用互动（仅限点赞、私密收藏与向单一目标大号 `owner_bili_uid` 私信分享），必须严格遵守每日频率上限与风控熔断保护，因违规或高频操作引发的一切账号风险与后果均由使用者自行承担。
 2. **遵守平台服务条款与法律法规**：使用者须严格遵守 Bilibili、Google Antigravity、Google Drive 及相关第三方平台的服务条款与所在地法律法规，因违规操作、滥用或违反平台协议引发的任何账号风控、封禁或其他后果均由使用者自行承担。
 3. **妥善保管个人凭据与隐私**：请仅在浏览器无痕窗口提取只读小号 Cookie，绝勿使用主力账号；严禁将 `.env`、`config.local.json`、`data/cat_memory.db`、模型权重或任何含个人隐私/凭据的文件提交至公开仓库或上传至云盘常规同步目录。
 

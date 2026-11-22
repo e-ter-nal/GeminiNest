@@ -16,8 +16,9 @@ import random
 import re
 import time
 import urllib.parse
+import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -40,11 +41,13 @@ from gemininest.contracts import (
 
 __all__ = [
     "BILI_API_BASE",
+    "BILI_VC_SEND_MSG_URL",
     "DEFAULT_BILI_HEADERS",
     "DEFAULT_SNAPSHOTS_DIR",
     "DEFAULT_SPONSORBLOCK_API_URL",
     "MIXIN_KEY_ENC_TAB",
     "BilibiliFetcher",
+    "InteractionActionResult",
     "clean_bilibili_text",
     "extract_wbi_key",
     "get_mixin_key",
@@ -56,8 +59,11 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 BILI_API_BASE = "https://api.bilibili.com"
+BILI_VC_SEND_MSG_URL = "https://api.vc.bilibili.com/web_im/v1/web_im/send_msg"
 DEFAULT_SPONSORBLOCK_API_URL = "https://bsbsb.top/api/skipSegments"
 DEFAULT_SNAPSHOTS_DIR = Path("data/snapshots")
+_FAV_FOLDER_ROLLOVER_COUNT = 950
+_RISK_CONTROL_CODES = frozenset({-412, -101, -111, -352, -403, -509, 21020, 21026, 21045, 24001, 24003})
 
 # Standard Bilibili WBI permutation table (64 indices, truncated to first 32 chars).
 MIXIN_KEY_ENC_TAB: tuple[int, ...] = (
@@ -336,8 +342,37 @@ def load_snapshot(
     return candidates, details, metadata
 
 
+@dataclass(frozen=True)
+class InteractionActionResult:
+    """Structured outcome of a single controlled Bilibili write API call."""
+
+    ok: bool
+    action_type: Literal["like", "favorite", "dm"]
+    status: Literal["ok", "failed"]
+    code: int | None = None
+    detail: str = ""
+    risk_control: bool = False
+    folder_id: int | None = None
+
+
+def _is_risk_control_response(
+    *,
+    http_status: int | None = None,
+    code: Any = None,
+    message: str = "",
+) -> bool:
+    if http_status in (403, 412):
+        return True
+    if isinstance(code, int) and not isinstance(code, bool) and code in _RISK_CONTROL_CODES:
+        return True
+    lowered = message.lower()
+    if any(tok in lowered for tok in ("风控", "验证码", "captcha", "risk", "blocked")):
+        return True
+    return False
+
+
 class BilibiliFetcher:
-    """Read-only Bilibili Web API + SponsorBlock fetcher with local `-412` circuit breaker."""
+    """Bilibili Web API + SponsorBlock client with `-412` circuit breaker and controlled write APIs."""
 
     def __init__(
         self,
@@ -381,6 +416,7 @@ class BilibiliFetcher:
         self._wbi_sub_key: str | None = None
         self._bili_request_count: int = 0
         self.consecutive_412: int = 0
+        self.last_login_mid: int | None = None
 
         bili_headers = dict(DEFAULT_BILI_HEADERS)
         cookie_pairs: list[str] = []
@@ -571,9 +607,12 @@ class BilibiliFetcher:
             )
 
         assert isinstance(data, Mapping)
+        mid = _parse_int(data.get("mid"))
+        if mid > 0:
+            self.last_login_mid = mid
         return {
             "is_login": True,
-            "mid": _parse_int(data.get("mid")),
+            "mid": mid,
             "uname": clean_bilibili_text(data.get("uname", "")),
         }
 
@@ -1128,4 +1167,473 @@ class BilibiliFetcher:
             consecutive_412=self.consecutive_412,
             aborted=aborted,
             error_code=error_code,
+        )
+
+    # ------------------------------------------------------------------
+    # Controlled Low-Frequency Write APIs (Like / Private Favorite / Owner DM ONLY)
+    # Strictly NO comment (/x/v2/reply/add) or @ mention capability exists.
+    # ------------------------------------------------------------------
+
+    def _bili_write_request(
+        self,
+        method: Literal["GET", "POST"],
+        url_or_path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        data: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[dict[str, Any] | None, int | None, str]:
+        """Execute a single no-retry authenticated Bilibili request for write operations."""
+        try:
+            if method == "GET":
+                response = self._bili_client.get(
+                    url_or_path,
+                    params=params,
+                    headers=dict(headers) if headers else None,
+                )
+            else:
+                response = self._bili_client.post(
+                    url_or_path,
+                    params=params,
+                    data=data,
+                    headers=dict(headers) if headers else None,
+                )
+        except httpx.HTTPError as exc:
+            return None, None, f"network_error:{exc.__class__.__name__}"
+
+        if response.status_code in (403, 412) or response.status_code >= 400:
+            return None, response.status_code, f"http_{response.status_code}"
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return None, response.status_code, "invalid_json"
+
+        if not isinstance(payload, dict):
+            return None, response.status_code, "non_dict_json"
+        return payload, response.status_code, ""
+
+    def _resolve_aid_for_write(self, bv_id: str, aid: int | None = None) -> int | None:
+        if aid is not None and int(aid) > 0:
+            return int(aid)
+        payload, http_status, err = self._bili_write_request(
+            "GET",
+            "/x/web-interface/view",
+            params={"bvid": bv_id.strip()},
+        )
+        if payload is None:
+            logger.warning("Failed resolving aid for %s (http=%s, err=%s).", bv_id, http_status, err)
+            return None
+        if payload.get("code") == 0 and isinstance(payload.get("data"), Mapping):
+            resolved = _parse_int(payload["data"].get("aid"))
+            return resolved if resolved > 0 else None
+        return None
+
+    def _resolve_mid_for_write(self, bili_mid: int | None = None) -> int | None:
+        if bili_mid is not None and int(bili_mid) > 0:
+            return int(bili_mid)
+        if self.last_login_mid is not None and self.last_login_mid > 0:
+            return self.last_login_mid
+        payload, _http_status, _err = self._bili_write_request("GET", "/x/web-interface/nav")
+        if payload and payload.get("code") == 0 and isinstance(payload.get("data"), Mapping):
+            data = payload["data"]
+            if data.get("isLogin") is True:
+                mid = _parse_int(data.get("mid"))
+                if mid > 0:
+                    self.last_login_mid = mid
+                    return mid
+        return None
+
+    def like_video(
+        self,
+        bv_id: str,
+        *,
+        aid: int | None = None,
+    ) -> InteractionActionResult:
+        """Like a Bilibili video (`POST /x/web-interface/archive/like`, 65006 = idempotent ok)."""
+        if not self._secrets.is_complete:
+            return InteractionActionResult(
+                ok=False,
+                action_type="like",
+                status="failed",
+                detail="secrets_incomplete",
+            )
+        form_data: dict[str, str] = {
+            "like": "1",
+            "csrf": self._secrets.bili_jct.strip(),
+        }
+        if bv_id.strip():
+            form_data["bvid"] = bv_id.strip()
+        if aid is not None and int(aid) > 0:
+            form_data["aid"] = str(int(aid))
+
+        payload, http_status, err = self._bili_write_request(
+            "POST",
+            "/x/web-interface/archive/like",
+            data=form_data,
+        )
+        if payload is None:
+            rc = _is_risk_control_response(http_status=http_status, message=err)
+            return InteractionActionResult(
+                ok=False,
+                action_type="like",
+                status="failed",
+                detail=err or f"http_{http_status}",
+                risk_control=rc,
+            )
+
+        code = payload.get("code")
+        msg = str(payload.get("message") or "")
+        if code == 0:
+            return InteractionActionResult(
+                ok=True,
+                action_type="like",
+                status="ok",
+                code=0,
+                detail="liked",
+            )
+        if code == 65006:
+            return InteractionActionResult(
+                ok=True,
+                action_type="like",
+                status="ok",
+                code=65006,
+                detail="already_liked_65006",
+            )
+        rc = _is_risk_control_response(http_status=http_status, code=code, message=msg)
+        return InteractionActionResult(
+            ok=False,
+            action_type="like",
+            status="failed",
+            code=int(code) if isinstance(code, int) and not isinstance(code, bool) else None,
+            detail=f"code={code}:{msg[:120]}",
+            risk_control=rc,
+        )
+
+    def resolve_or_create_favorite_folder(
+        self,
+        *,
+        bili_mid: int | None = None,
+        folder_id: int | None = None,
+        folder_name: str = "GeminiNest精选",
+        private: bool = True,
+        rollover_threshold: int = _FAV_FOLDER_ROLLOVER_COUNT,
+    ) -> tuple[int | None, InteractionActionResult | None]:
+        """Find existing or create private favorite folder with capacity rollover."""
+        eff_mid = self._resolve_mid_for_write(bili_mid)
+        if eff_mid is None or eff_mid <= 0:
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                code=-101,
+                detail="missing_bili_mid_or_login",
+                risk_control=True,
+            )
+
+        list_payload, http_status, err = self._bili_write_request(
+            "GET",
+            "/x/v3/fav/folder/created/list-all",
+            params={"up_mid": eff_mid},
+        )
+        if list_payload is None:
+            rc = _is_risk_control_response(http_status=http_status, message=err)
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail=f"list_folders_failed:{err}",
+                risk_control=rc,
+            )
+
+        code = list_payload.get("code")
+        msg = str(list_payload.get("message") or "")
+        if code != 0:
+            rc = _is_risk_control_response(http_status=http_status, code=code, message=msg)
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                code=int(code) if isinstance(code, int) and not isinstance(code, bool) else None,
+                detail=f"list_folders_code={code}:{msg[:120]}",
+                risk_control=rc,
+            )
+
+        raw_list = (list_payload.get("data") or {}).get("list")
+        folders = [item for item in raw_list if isinstance(item, Mapping)] if isinstance(raw_list, list) else []
+
+        by_id: dict[int, Mapping[str, Any]] = {}
+        by_title: dict[str, Mapping[str, Any]] = {}
+        for item in folders:
+            fid = _parse_int(item.get("id"))
+            title = str(item.get("title") or "").strip()
+            if fid > 0:
+                by_id[fid] = item
+            if title and title not in by_title:
+                by_title[title] = item
+
+        # 1. Explicit favorite_folder_id if still below rollover threshold
+        if folder_id is not None and int(folder_id) in by_id:
+            matched = by_id[int(folder_id)]
+            if _parse_int(matched.get("media_count", 0)) < rollover_threshold:
+                return int(folder_id), None
+
+        # 2. Match base folder_name or numbered rollover `<folder_name>_2`, `_3`, ...
+        base_title = folder_name.strip() or "GeminiNest精选"
+        target_create_title: str | None = None
+        if base_title in by_title:
+            base_entry = by_title[base_title]
+            if _parse_int(base_entry.get("media_count", 0)) < rollover_threshold:
+                return _parse_int(base_entry.get("id")), None
+            idx = 2
+            while True:
+                cand_title = f"{base_title}_{idx}"
+                if cand_title in by_title:
+                    cand_entry = by_title[cand_title]
+                    if _parse_int(cand_entry.get("media_count", 0)) < rollover_threshold:
+                        return _parse_int(cand_entry.get("id")), None
+                    idx += 1
+                    continue
+                target_create_title = cand_title
+                break
+        else:
+            target_create_title = base_title
+
+        # 3. Create private favorite folder (`privacy=1` private unless explicitly configured public)
+        add_payload, add_http, add_err = self._bili_write_request(
+            "POST",
+            "/x/v3/fav/folder/add",
+            data={
+                "title": target_create_title,
+                "intro": "GeminiNest精选收藏夹",
+                "privacy": "1" if private else "0",
+                "csrf": self._secrets.bili_jct.strip(),
+            },
+        )
+        if add_payload is None:
+            rc = _is_risk_control_response(http_status=add_http, message=add_err)
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail=f"create_folder_failed:{add_err}",
+                risk_control=rc,
+            )
+
+        add_code = add_payload.get("code")
+        add_msg = str(add_payload.get("message") or "")
+        if add_code != 0 or not isinstance(add_payload.get("data"), Mapping):
+            rc = _is_risk_control_response(http_status=add_http, code=add_code, message=add_msg)
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                code=int(add_code) if isinstance(add_code, int) and not isinstance(add_code, bool) else None,
+                detail=f"create_folder_code={add_code}:{add_msg[:120]}",
+                risk_control=rc,
+            )
+
+        new_fid = _parse_int(add_payload["data"].get("id"))
+        if new_fid <= 0:
+            return None, InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail="create_folder_missing_id",
+            )
+        return new_fid, None
+
+    def favorite_video(
+        self,
+        bv_id: str,
+        *,
+        aid: int | None = None,
+        bili_mid: int | None = None,
+        folder_id: int | None = None,
+        folder_name: str = "GeminiNest精选",
+        private: bool = True,
+    ) -> InteractionActionResult:
+        """Favorite a Bilibili video into a private/rollover folder (`POST /x/v3/fav/resource/deal`)."""
+        if not self._secrets.is_complete:
+            return InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail="secrets_incomplete",
+            )
+        eff_aid = self._resolve_aid_for_write(bv_id, aid=aid)
+        if eff_aid is None or eff_aid <= 0:
+            return InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail="missing_aid",
+            )
+
+        target_fid, folder_err = self.resolve_or_create_favorite_folder(
+            bili_mid=bili_mid,
+            folder_id=folder_id,
+            folder_name=folder_name,
+            private=private,
+        )
+        if folder_err is not None or target_fid is None:
+            return folder_err or InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail="resolve_folder_failed",
+            )
+
+        deal_payload, http_status, err = self._bili_write_request(
+            "POST",
+            "/x/v3/fav/resource/deal",
+            data={
+                "rid": str(eff_aid),
+                "type": "2",
+                "add_media_ids": str(target_fid),
+                "csrf": self._secrets.bili_jct.strip(),
+            },
+        )
+        if deal_payload is None:
+            rc = _is_risk_control_response(http_status=http_status, message=err)
+            return InteractionActionResult(
+                ok=False,
+                action_type="favorite",
+                status="failed",
+                detail=err or f"http_{http_status}",
+                risk_control=rc,
+                folder_id=target_fid,
+            )
+
+        code = deal_payload.get("code")
+        msg = str(deal_payload.get("message") or "")
+        if code == 0:
+            return InteractionActionResult(
+                ok=True,
+                action_type="favorite",
+                status="ok",
+                code=0,
+                detail=f"favorited_folder:{target_fid}",
+                folder_id=target_fid,
+            )
+        rc = _is_risk_control_response(http_status=http_status, code=code, message=msg)
+        return InteractionActionResult(
+            ok=False,
+            action_type="favorite",
+            status="failed",
+            code=int(code) if isinstance(code, int) and not isinstance(code, bool) else None,
+            detail=f"code={code}:{msg[:120]}",
+            risk_control=rc,
+            folder_id=target_fid,
+        )
+
+    def send_private_dm(
+        self,
+        *,
+        bv_id: str,
+        owner_bili_uid: int | None,
+        receiver_id: int | None = None,
+        message_text: str,
+        sender_uid: int | None = None,
+    ) -> InteractionActionResult:
+        """Send a private DM share strictly to the single whitelisted `owner_bili_uid`."""
+        if (
+            owner_bili_uid is None
+            or isinstance(owner_bili_uid, bool)
+            or not isinstance(owner_bili_uid, int)
+            or owner_bili_uid <= 0
+        ):
+            raise ValueError("owner_bili_uid must be a valid positive integer before sending DM.")
+
+        eff_receiver = owner_bili_uid if receiver_id is None else receiver_id
+        if (
+            isinstance(eff_receiver, bool)
+            or not isinstance(eff_receiver, int)
+            or eff_receiver <= 0
+            or eff_receiver != owner_bili_uid
+        ):
+            raise ValueError(
+                f"DM receiver whitelist violation: receiver_id={eff_receiver!r} != owner_bili_uid={owner_bili_uid}"
+            )
+
+        if not self._secrets.is_complete:
+            return InteractionActionResult(
+                ok=False,
+                action_type="dm",
+                status="failed",
+                detail="secrets_incomplete",
+            )
+
+        eff_sender = self._resolve_mid_for_write(sender_uid)
+        if eff_sender is None or eff_sender <= 0:
+            return InteractionActionResult(
+                ok=False,
+                action_type="dm",
+                status="failed",
+                code=-101,
+                detail="missing_sender_uid",
+                risk_control=True,
+            )
+
+        # Final code-layer assertion right before building the POST payload
+        assert eff_receiver == owner_bili_uid and eff_receiver > 0
+
+        text_body = message_text.strip()
+        video_url = f"https://www.bilibili.com/video/{bv_id.strip()}"
+        if video_url not in text_body:
+            text_body = f"{text_body}\n{video_url}".strip()
+
+        bili_jct = self._secrets.bili_jct.strip()
+        form_data = {
+            "msg[sender_uid]": str(eff_sender),
+            "msg[receiver_id]": str(eff_receiver),
+            "msg[receiver_type]": "1",
+            "msg[msg_type]": "1",
+            "msg[msg_status]": "0",
+            "msg[dev_id]": str(uuid.uuid4()).upper(),
+            "msg[timestamp]": str(int(time.time())),
+            "msg[new_face_version]": "0",
+            "msg[content]": json.dumps({"content": text_body}, ensure_ascii=False),
+            "csrf": bili_jct,
+            "csrf_token": bili_jct,
+        }
+        dm_headers = {
+            "Origin": "https://message.bilibili.com",
+            "Referer": "https://message.bilibili.com/",
+        }
+
+        payload, http_status, err = self._bili_write_request(
+            "POST",
+            BILI_VC_SEND_MSG_URL,
+            data=form_data,
+            headers=dm_headers,
+        )
+        if payload is None:
+            rc = _is_risk_control_response(http_status=http_status, message=err)
+            return InteractionActionResult(
+                ok=False,
+                action_type="dm",
+                status="failed",
+                detail=err or f"http_{http_status}",
+                risk_control=rc,
+            )
+
+        code = payload.get("code")
+        msg = str(payload.get("message") or payload.get("msg") or "")
+        if code == 0:
+            return InteractionActionResult(
+                ok=True,
+                action_type="dm",
+                status="ok",
+                code=0,
+                detail="dm_sent",
+            )
+        rc = _is_risk_control_response(http_status=http_status, code=code, message=msg)
+        return InteractionActionResult(
+            ok=False,
+            action_type="dm",
+            status="failed",
+            code=int(code) if isinstance(code, int) and not isinstance(code, bool) else None,
+            detail=f"code={code}:{msg[:120]}",
+            risk_control=rc,
         )

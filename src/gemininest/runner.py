@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import shutil
 import socket
 import stat
@@ -27,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
+
 from gemininest.agent_bridge import (
     DEFAULT_PERSONA_PATH,
     AgentBridge,
@@ -39,8 +42,10 @@ from gemininest.budget_ui import (
     atomic_write_json,
     budget_plan_from_dict,
     build_budget_plan,
+    consume_next_run_override,
     decision_from_plan,
     is_pid_alive,
+    load_next_run_override,
     notify_auth_expired,
     notify_high_score_video,
     probe_companion_lock,
@@ -60,8 +65,10 @@ from gemininest.contracts import (
     CommentItem,
     ErrorCode,
     GeminiNestError,
+    SecretsConfig,
     SelectionPacket,
     SponsorSegment,
+    SurfingStats,
     TokenEstimate,
     VideoDetail,
     VideoMeta,
@@ -360,24 +367,23 @@ def _effective_budget_plan(
 ) -> BudgetPlan:
     if decision.budget_plan is not None:
         return decision.budget_plan
-    if decision.rest_today or (
-        decision.max_use_ratio is not None and decision.max_use_ratio <= 0.0
+    if (
+        decision.rest_today
+        or (decision.max_run_tokens is not None and decision.max_run_tokens <= 0)
+        or (decision.max_videos is not None and decision.max_videos <= 0)
+        or (decision.max_use_ratio is not None and decision.max_use_ratio <= 0.0)
     ):
         return build_budget_plan(
             "rest",
             current_window_used_ratio=current_window_used_ratio,
         )
-    fallback_max_use = (
-        decision.max_use_ratio
-        if decision.max_use_ratio is not None
-        else (decision.budget_ratio if decision.budget_ratio > 0.0 else None)
-    )
     return build_budget_plan(
         "combined",
-        max_use_ratio=fallback_max_use,
+        max_run_tokens=decision.max_run_tokens,
         max_videos=decision.max_videos,
-        reserve_ratio=decision.reserve_ratio,
         max_minutes=decision.max_minutes,
+        max_use_ratio=decision.max_use_ratio,
+        reserve_ratio=decision.reserve_ratio,
         current_window_used_ratio=current_window_used_ratio,
     )
 
@@ -386,17 +392,35 @@ def _check_budget_status_for_plan(
     store: MemoryStore,
     plan: BudgetPlan,
 ) -> tuple[BudgetStatus, bool]:
-    if plan.rest_today or plan.effective_allowed_ratio <= 0.0 or plan.window_cap_ratio <= 0.0:
-        probe_ratio = plan.window_cap_ratio if plan.window_cap_ratio > 0.0 else 1.0
-        status = store.get_budget_status(allowed_ratio=probe_ratio)
+    if (
+        plan.rest_today
+        or (plan.max_run_tokens is not None and plan.max_run_tokens <= 0)
+        or (plan.max_videos is not None and plan.max_videos <= 0)
+    ):
+        status = store.get_budget_status(allowed_ratio=1.0)
         status = replace(
             status,
-            allowed_ratio=plan.effective_allowed_ratio,
+            allowed_ratio=0.0,
             remaining_tokens=0,
         )
         return status, False
-    status = store.get_budget_status(allowed_ratio=plan.window_cap_ratio)
-    can_proceed = (not status.in_cooldown) and (status.remaining_tokens > 0)
+
+    if plan.max_use_ratio is not None or plan.reserve_ratio is not None:
+        if plan.effective_allowed_ratio <= 0.0 or plan.window_cap_ratio <= 0.0:
+            probe_ratio = plan.window_cap_ratio if plan.window_cap_ratio > 0.0 else 1.0
+            status = store.get_budget_status(allowed_ratio=probe_ratio)
+            status = replace(
+                status,
+                allowed_ratio=plan.effective_allowed_ratio,
+                remaining_tokens=0,
+            )
+            return status, False
+        status = store.get_budget_status(allowed_ratio=plan.window_cap_ratio)
+        can_proceed = (not status.in_cooldown) and (status.remaining_tokens > 0)
+        return status, can_proceed
+
+    status = store.get_budget_status(allowed_ratio=1.0)
+    can_proceed = not status.in_cooldown
     return status, can_proceed
 
 
@@ -406,35 +430,46 @@ def _resolve_cli_budget_decision(
     budget_status: BudgetStatus,
     now_epoch_fn: Callable[[], float] | None = None,
 ) -> BudgetDecision | None:
-    """Resolve explicit CLI budget flags (`--budget-ratio`, `--max-videos`, `--reserve-ratio`, `--max-minutes`).
+    """Resolve explicit CLI budget flags (`--max-tokens`, `--max-videos`, `--max-minutes`).
 
-    Any combination of the 4 flags may be passed together. Whenever 1 or more flags are
+    Any combination of the 3 flags may be passed together. Whenever 1 or more flags are
     provided, the startup popup is skipped and ONLY the explicitly provided constraints
     apply (all omitted dimensions are set to `None` = unlimited for this run).
+    Legacy `--budget-ratio` / `--reserve-ratio` flags remain smoothly accepted with a
+    deprecation warning.
     """
     eff_now_fn = now_epoch_fn or _now_epoch
-    budget_ratio = getattr(args, "budget_ratio", None)
+    max_tokens = getattr(args, "max_tokens", None)
     max_videos = getattr(args, "budget_max_videos", None)
     if max_videos is None:
         max_videos = getattr(args, "max_videos", None)
-    reserve_ratio = getattr(args, "reserve_ratio", None)
     max_minutes = getattr(args, "max_minutes", None)
+    budget_ratio = getattr(args, "budget_ratio", None)
+    reserve_ratio = getattr(args, "reserve_ratio", None)
 
     if (
-        budget_ratio is None
+        max_tokens is None
         and max_videos is None
-        and reserve_ratio is None
         and max_minutes is None
+        and budget_ratio is None
+        and reserve_ratio is None
     ):
         return None
+
+    if budget_ratio is not None or reserve_ratio is not None:
+        logger.warning(
+            "CLI flags `--budget-ratio` / `--reserve-ratio` are deprecated in v3.1; "
+            "prefer `--max-tokens`, `--max-videos`, `--max-minutes`."
+        )
 
     try:
         plan = build_budget_plan(
             "combined",
-            max_use_ratio=budget_ratio,
+            max_run_tokens=max_tokens,
             max_videos=max_videos,
-            reserve_ratio=reserve_ratio,
             max_minutes=max_minutes,
+            max_use_ratio=budget_ratio,
+            reserve_ratio=reserve_ratio,
             current_window_used_ratio=budget_status.used_ratio,
             now_epoch=float(eff_now_fn()),
         )
@@ -475,7 +510,7 @@ def _evaluate_combined_budget_triggers(
     videos_processed: int,
     next_bv_already_counted: bool = False,
 ) -> tuple[list[str], dict[str, Any], BudgetStatus]:
-    """Evaluate all non-None intersection constraints simultaneously and return all triggered reasons."""
+    """Evaluate all non-None 3-condition intersection constraints and 429 cooldown simultaneously."""
     triggered_by: list[str] = []
     details: dict[str, Any] = {}
 
@@ -497,46 +532,39 @@ def _evaluate_combined_budget_triggers(
         details["now_epoch"] = round(now_epoch, 3)
 
     full_status = store.get_budget_status(allowed_ratio=1.0)
-    capacity = full_status.capacity_tokens
-    cur_used_tokens = full_status.used_tokens
-    baseline_used_tokens = int(
-        round(capacity * max(0.0, min(1.0, float(plan.current_window_used_ratio))))
-    )
-    run_ledger_tokens = store.get_run_used_tokens(run_id)
-    window_delta_tokens = max(0, cur_used_tokens - baseline_used_tokens)
-    run_spent_tokens = max(run_ledger_tokens, window_delta_tokens)
-    run_spent_ratio = round(run_spent_tokens / capacity, 6)
-    window_remaining_ratio = round(max(0.0, 1.0 - (cur_used_tokens / capacity)), 6)
+    run_spent_tokens = store.get_run_used_tokens(run_id)
 
     if full_status.in_cooldown:
         triggered_by.append("cooldown_429")
 
-    if plan.max_use_ratio is not None:
-        max_use_tokens = int(round(capacity * plan.max_use_ratio))
-        if run_spent_tokens >= max_use_tokens:
-            triggered_by.append("max_use_ratio")
-            details["max_use_ratio"] = plan.max_use_ratio
-            details["run_spent_ratio"] = run_spent_ratio
-            details["run_spent_tokens"] = run_spent_tokens
-            details["max_use_tokens"] = max_use_tokens
+    if plan.max_run_tokens is not None and run_spent_tokens >= plan.max_run_tokens:
+        triggered_by.append("max_run_tokens")
+        details["max_run_tokens"] = plan.max_run_tokens
+        details["run_spent_tokens"] = run_spent_tokens
 
-    if plan.reserve_ratio is not None:
-        reserve_cap_tokens = int(round(capacity * max(0.0, 1.0 - plan.reserve_ratio)))
-        if cur_used_tokens >= reserve_cap_tokens:
-            triggered_by.append("reserve_ratio")
-            details["reserve_ratio"] = plan.reserve_ratio
-            details["window_remaining_ratio"] = window_remaining_ratio
-            details["window_used_tokens"] = cur_used_tokens
-            details["reserve_cap_tokens"] = reserve_cap_tokens
-
-    if (
-        cur_used_tokens >= capacity
-        and "max_use_ratio" not in triggered_by
-        and "reserve_ratio" not in triggered_by
-    ):
-        triggered_by.append("window_exhausted")
-        details["window_used_tokens"] = cur_used_tokens
-        details["capacity_tokens"] = capacity
+    # Legacy ratio check ONLY if an older persisted run_state still carried ratio limits
+    if plan.max_use_ratio is not None or plan.reserve_ratio is not None:
+        capacity = full_status.capacity_tokens
+        cur_used_tokens = full_status.used_tokens
+        baseline_used_tokens = int(
+            round(capacity * max(0.0, min(1.0, float(plan.current_window_used_ratio))))
+        )
+        window_delta_tokens = max(0, cur_used_tokens - baseline_used_tokens)
+        legacy_spent_tokens = max(run_spent_tokens, window_delta_tokens)
+        if plan.max_use_ratio is not None:
+            max_use_tokens = int(round(capacity * plan.max_use_ratio))
+            if legacy_spent_tokens >= max_use_tokens:
+                triggered_by.append("max_use_ratio")
+                details["max_use_ratio"] = plan.max_use_ratio
+                details["run_spent_tokens"] = legacy_spent_tokens
+                details["max_use_tokens"] = max_use_tokens
+        if plan.reserve_ratio is not None:
+            reserve_cap_tokens = int(round(capacity * max(0.0, 1.0 - plan.reserve_ratio)))
+            if cur_used_tokens >= reserve_cap_tokens:
+                triggered_by.append("reserve_ratio")
+                details["reserve_ratio"] = plan.reserve_ratio
+                details["window_used_tokens"] = cur_used_tokens
+                details["reserve_cap_tokens"] = reserve_cap_tokens
 
     eff_status, _can_proceed = _check_budget_status_for_plan(store, plan)
     return triggered_by, details, eff_status
@@ -1162,6 +1190,213 @@ def _filter_curiosity_keywords(
     return tuple(clean)
 
 
+def _execute_controlled_interactions(
+    *,
+    config: AppConfig,
+    store: MemoryStore,
+    secrets: SecretsConfig | None,
+    bv_id: str,
+    video_title: str,
+    impression_score: int,
+    summary: str,
+    aid: int | None = None,
+    bili_mid: int | None = None,
+    offline: bool = True,
+    interaction_aborted: bool = False,
+    fetcher_transport: httpx.BaseTransport | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Best-effort controlled low-frequency interactions after SQLite commit (NEVER raises)."""
+    icfg = config.interaction
+    if not icfg.enabled or offline or secrets is None or not secrets.is_complete:
+        return [], interaction_aborted
+    if interaction_aborted:
+        return [
+            {"action_type": "all", "status": "skipped_aborted", "detail": "risk_control_circuit_open"}
+        ], True
+
+    outcomes: list[dict[str, Any]] = []
+    aborted = False
+    wrote_count = 0
+    eff_rng = rng or random.Random()
+
+    def _pace_between_writes() -> None:
+        if wrote_count <= 0:
+            return
+        low, high = icfg.action_interval_sec
+        if high > 0.0:
+            delay = eff_rng.uniform(low, high)
+            if delay > 0.0:
+                sleep_fn(delay)
+
+    def _safe_record(
+        action_type: Literal["like", "favorite", "dm"],
+        status: Literal["ok", "skipped_cap", "skipped_dup", "failed"],
+        detail: str,
+    ) -> None:
+        try:
+            store.record_interaction(
+                bv_id=bv_id,
+                action_type=action_type,
+                status=status,
+                detail=detail,
+            )
+        except Exception as rec_exc:  # noqa: BLE001
+            logger.warning("Failed recording interaction_ledger (%s/%s): %s", bv_id, action_type, rec_exc)
+
+    try:
+        with BilibiliFetcher(
+            config,
+            secrets,
+            transport=fetcher_transport,
+            sleep_fn=sleep_fn,
+            rng=eff_rng,
+        ) as fetcher:
+            if bili_mid is not None and int(bili_mid) > 0:
+                fetcher.last_login_mid = int(bili_mid)
+
+            # 1. Like
+            if icfg.like_enabled and impression_score >= icfg.like_min_score and not aborted:
+                try:
+                    allowed, reason = store.can_perform_interaction(
+                        bv_id, "like", daily_cap=icfg.max_daily_likes
+                    )
+                    if not allowed:
+                        _safe_record("like", reason, reason)
+                        outcomes.append({"action_type": "like", "status": reason, "detail": reason})
+                    else:
+                        _pace_between_writes()
+                        res = fetcher.like_video(bv_id, aid=aid)
+                        wrote_count += 1
+                        _safe_record("like", res.status, res.detail)
+                        outcomes.append(
+                            {
+                                "action_type": "like",
+                                "status": res.status,
+                                "detail": res.detail,
+                                "risk_control": res.risk_control,
+                            }
+                        )
+                        if res.risk_control and icfg.abort_on_risk_control:
+                            aborted = True
+                except Exception as exc:  # noqa: BLE001
+                    detail = f"exception:{exc.__class__.__name__}:{exc}"
+                    _safe_record("like", "failed", detail)
+                    outcomes.append({"action_type": "like", "status": "failed", "detail": detail})
+
+            # 2. Private Favorite
+            if icfg.favorite_enabled and impression_score >= icfg.favorite_min_score and not aborted:
+                try:
+                    allowed, reason = store.can_perform_interaction(
+                        bv_id, "favorite", daily_cap=icfg.max_daily_favorites
+                    )
+                    if not allowed:
+                        _safe_record("favorite", reason, reason)
+                        outcomes.append(
+                            {"action_type": "favorite", "status": reason, "detail": reason}
+                        )
+                    else:
+                        _pace_between_writes()
+                        res = fetcher.favorite_video(
+                            bv_id,
+                            aid=aid,
+                            bili_mid=bili_mid,
+                            folder_id=icfg.favorite_folder_id,
+                            folder_name=icfg.favorite_folder_name,
+                            private=icfg.favorite_private,
+                        )
+                        wrote_count += 1
+                        _safe_record("favorite", res.status, res.detail)
+                        outcomes.append(
+                            {
+                                "action_type": "favorite",
+                                "status": res.status,
+                                "detail": res.detail,
+                                "risk_control": res.risk_control,
+                            }
+                        )
+                        if res.risk_control and icfg.abort_on_risk_control:
+                            aborted = True
+                except Exception as exc:  # noqa: BLE001
+                    detail = f"exception:{exc.__class__.__name__}:{exc}"
+                    _safe_record("favorite", "failed", detail)
+                    outcomes.append(
+                        {"action_type": "favorite", "status": "failed", "detail": detail}
+                    )
+
+            # 3. Private DM Share strictly to single whitelisted owner_bili_uid
+            if icfg.dm_enabled and impression_score >= icfg.dm_min_score and not aborted:
+                try:
+                    owner_uid = icfg.owner_bili_uid
+                    if (
+                        owner_uid is None
+                        or isinstance(owner_uid, bool)
+                        or not isinstance(owner_uid, int)
+                        or owner_uid <= 0
+                    ):
+                        _safe_record("dm", "failed", "invalid_or_missing_owner_bili_uid")
+                        outcomes.append(
+                            {
+                                "action_type": "dm",
+                                "status": "failed",
+                                "detail": "invalid_or_missing_owner_bili_uid",
+                            }
+                        )
+                    else:
+                        allowed, reason = store.can_perform_interaction(
+                            bv_id, "dm", daily_cap=icfg.max_daily_dms
+                        )
+                        if not allowed:
+                            _safe_record("dm", reason, reason)
+                            outcomes.append(
+                                {"action_type": "dm", "status": reason, "detail": reason}
+                            )
+                        else:
+                            _pace_between_writes()
+                            short_title = (video_title or bv_id).strip()[:50]
+                            short_reason = summary.strip()[:120]
+                            msg_text = (
+                                f"【GeminiNest 宝藏分享 | {impression_score}/10】《{short_title}》\n"
+                                f"推荐理由：{short_reason or '高密度佳作，值得一听/一看！'}\n"
+                                f"https://www.bilibili.com/video/{bv_id}"
+                            )
+                            res = fetcher.send_private_dm(
+                                bv_id=bv_id,
+                                owner_bili_uid=owner_uid,
+                                receiver_id=owner_uid,
+                                message_text=msg_text,
+                                sender_uid=bili_mid,
+                            )
+                            wrote_count += 1
+                            _safe_record("dm", res.status, res.detail)
+                            outcomes.append(
+                                {
+                                    "action_type": "dm",
+                                    "status": res.status,
+                                    "detail": res.detail,
+                                    "risk_control": res.risk_control,
+                                }
+                            )
+                            if res.risk_control and icfg.abort_on_risk_control:
+                                aborted = True
+                except Exception as exc:  # noqa: BLE001
+                    detail = f"exception:{exc.__class__.__name__}:{exc}"
+                    _safe_record("dm", "failed", detail)
+                    outcomes.append({"action_type": "dm", "status": "failed", "detail": detail})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Best-effort interaction setup failed for %s: %s", bv_id, exc)
+        outcomes.append(
+            {
+                "action_type": "all",
+                "status": "failed",
+                "detail": f"setup_exception:{exc.__class__.__name__}",
+            }
+        )
+
+    return outcomes, aborted
+
+
 def commit_appreciation_result(
     *,
     config: AppConfig,
@@ -1189,6 +1424,14 @@ def commit_appreciation_result(
     ipc_dir: Path | str | None = None,
     companion_lock_path: Path | str | None = None,
     workspace_root: Path | str | None = None,
+    aid: int | None = None,
+    bili_mid: int | None = None,
+    secrets: SecretsConfig | None = None,
+    offline: bool = True,
+    interaction_aborted: bool = False,
+    fetcher_transport: httpx.BaseTransport | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
 ) -> dict[str, Any]:
     """Validate host appreciation output, persist memory/diary/history/ledger atomically, and ALWAYS burn temp dir."""
     burned = False
@@ -1339,6 +1582,23 @@ def commit_appreciation_result(
             workspace_root=workspace_root,
         )
 
+        interactions, next_interaction_aborted = _execute_controlled_interactions(
+            config=config,
+            store=store,
+            secrets=secrets,
+            bv_id=bv_id,
+            video_title=video_title or bv_id,
+            impression_score=response.impression_score,
+            summary=response.memory_summary,
+            aid=aid,
+            bili_mid=bili_mid,
+            offline=offline,
+            interaction_aborted=interaction_aborted,
+            fetcher_transport=fetcher_transport,
+            sleep_fn=sleep_fn,
+            rng=rng,
+        )
+
         return {
             "ok": True,
             "status": "committed",
@@ -1351,6 +1611,8 @@ def commit_appreciation_result(
             "tokens_recorded": ledger_entry.total_est_tokens,
             "cache_status": ledger_entry.cache_status,
             "toast_sent": toast_sent,
+            "interactions": interactions,
+            "interaction_aborted": next_interaction_aborted,
             "public_diary": response.public_diary,
             "private_thought": response.private_thought,
         }
@@ -1999,6 +2261,7 @@ def _resolve_startup_budget_with_gate(
     *,
     run_id: str,
     budget_status: BudgetStatus,
+    surfing_stats: SurfingStats | None = None,
     offline: bool,
     skip_inbox: bool,
     cloud_dir: Path | str | None,
@@ -2010,7 +2273,7 @@ def _resolve_startup_budget_with_gate(
 ) -> tuple[BudgetDecision | None, dict[str, Any] | None]:
     """Execute the 3-branch startup gate in strict priority order.
 
-    1. CLI exemption (`--headless` or any explicit `--budget-ratio`/`--max-videos`/`--reserve-ratio`/`--max-minutes`).
+    1. CLI exemption (`--headless` or any explicit `--max-tokens`/`--max-videos`/`--max-minutes`).
     2. Branch A: Companion online & IPC handshake (`req_` -> `ack_`) when not exempt and `companion_policy` applies.
     3. Branch B: Google Drive cloud mount check (before GUI popup) when `require_cloud_mount_on_start` and online.
     4. Branch C: Poll `res_<run_id>.json` with continuous companion liveness check (`desktop_companion_aborted` / 60s timeout).
@@ -2058,10 +2321,12 @@ def _resolve_startup_budget_with_gate(
         return None
 
     def _run_legacy_popup() -> BudgetDecision:
+        override = consume_next_run_override(eff_ipc_dir)
         return prompt_startup_budget(
             cfg,
             headless=bool(getattr(args, "headless", False)),
             budget_status=budget_status,
+            override_defaults=override,
             now_epoch_fn=eff_now_fn,
         )
 
@@ -2111,7 +2376,7 @@ def _resolve_startup_budget_with_gate(
         res_path = eff_ipc_dir / f"res_{run_id}.json"
         _cleanup_ipc_run_files(eff_ipc_dir, run_id)
 
-        req_payload = {
+        req_payload: dict[str, Any] = {
             "type": "budget_request",
             "run_id": run_id,
             "created_at": _utc_now_iso(),
@@ -2120,6 +2385,8 @@ def _resolve_startup_budget_with_gate(
             "budget_cfg": asdict(budget_cfg),
             "budget_status": asdict(budget_status),
         }
+        if surfing_stats is not None:
+            req_payload["surfing_stats"] = asdict(surfing_stats)
         atomic_write_json(req_path, req_payload)
 
         ack_received = False
@@ -2182,12 +2449,20 @@ def _resolve_startup_budget_with_gate(
             now_m = float(monotonic_fn())
             if now_m >= res_deadline:
                 _cleanup_ipc_run_files(eff_ipc_dir, run_id)
+                consumed_ovr = consume_next_run_override(eff_ipc_dir)
+                if consumed_ovr is not None:
+                    tok = consumed_ovr.get("max_run_tokens")
+                    vid = consumed_ovr.get("max_videos")
+                    mins = consumed_ovr.get("max_minutes")
+                else:
+                    tok = budget_cfg.default_max_run_tokens
+                    vid = budget_cfg.default_max_videos
+                    mins = budget_cfg.default_max_minutes
                 default_plan = build_budget_plan(
                     "combined",
-                    max_use_ratio=budget_cfg.default_window_budget_ratio,
-                    max_videos=budget_cfg.default_max_videos,
-                    reserve_ratio=budget_cfg.default_reserve_ratio,
-                    max_minutes=budget_cfg.default_max_minutes,
+                    max_run_tokens=tok,
+                    max_videos=vid,
+                    max_minutes=mins,
                     current_window_used_ratio=budget_status.used_ratio,
                     now_epoch=float(eff_now_fn()),
                 )
@@ -2226,6 +2501,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     with store_cm as store:
         window_status = store.get_budget_status(allowed_ratio=1.0)
+        surfing_stats = store.get_surfing_stats(interaction_cfg=cfg.interaction)
         memory_count = store.count_memories()
         diary_count = store.count_diary_entries()
         recent_entries = store.list_recent_diary_entries(limit=3)
@@ -2267,17 +2543,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
         expected_workspace_root=eff_ws_root,
         now_epoch=_now_epoch(),
     )
+    eff_ipc_dir = resolve_ipc_dir(cfg, ipc_dir=getattr(args, "ipc_dir", None))
+    next_run_override = load_next_run_override(eff_ipc_dir)
 
     _emit_json(
         {
             "ok": True,
             "pipeline_mode": cfg.project.pipeline_mode,
+            **asdict(surfing_stats),
+            "interaction_enabled": cfg.interaction.enabled,
+            "next_run_override": next_run_override,
             "window_bucket": window_status.window_bucket,
             "used_tokens": window_status.used_tokens,
             "capacity_tokens": window_status.capacity_tokens,
             "used_ratio": window_status.used_ratio,
             "remaining_tokens": window_status.remaining_tokens,
-            "in_cooldown": window_status.in_cooldown,
             "budget_status": asdict(window_status),
             "cloud_mounted": cloud_mounted,
             "cat_lock_active": cat_lock_active,
@@ -2299,11 +2579,13 @@ def _cmd_check_budget(args: argparse.Namespace) -> int:
     eff_run_id = sanitize_temp_segment(args.run_id or _generate_run_id("budget"), field_name="run_id")
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         default_status = store.get_budget_status()
+        surfing_stats = store.get_surfing_stats(interaction_cfg=cfg.interaction)
         decision, stop_payload = _resolve_startup_budget_with_gate(
             cfg,
             args,
             run_id=eff_run_id,
             budget_status=default_status,
+            surfing_stats=surfing_stats,
             offline=True,
             skip_inbox=True,
             cloud_dir=getattr(args, "cloud_dir", None),
@@ -2374,11 +2656,13 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
     with PidLockFile(eff_lock_path, run_id=eff_run_id):
         with MemoryStore.from_config(cfg, db_path=args.db) as store:
             default_status = store.get_budget_status()
+            surfing_stats = store.get_surfing_stats(interaction_cfg=cfg.interaction)
             decision, stop_payload = _resolve_startup_budget_with_gate(
                 cfg,
                 args,
                 run_id=eff_run_id,
                 budget_status=default_status,
+                surfing_stats=surfing_stats,
                 offline=offline,
                 skip_inbox=skip_inbox,
                 cloud_dir=explicit_cloud_dir,
@@ -2449,6 +2733,9 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                     "created_at": now_iso,
                     "updated_at": now_iso,
                     **lease_fields,
+                    "offline": offline,
+                    "bili_mid": None,
+                    "interaction_aborted": False,
                     "budget_plan": asdict(plan),
                     "decision": asdict(decision),
                     "prepared_bvs": [],
@@ -2523,6 +2810,11 @@ def _cmd_prepare_feed(args: argparse.Namespace) -> int:
                             )
                         candidates = batch.candidates
                         snapshot_used = str(batch.snapshot_path) if batch.snapshot_path else None
+                        if fetcher.last_login_mid is not None:
+                            latest_state = _load_run_state(run_state_path) or {}
+                            latest_state["bili_mid"] = fetcher.last_login_mid
+                            latest_state["updated_at"] = _utc_now_iso()
+                            _save_run_state(run_state_path, latest_state)
 
                 # Rotate & track curiosity usage only after feed fetch succeeded
                 curiosity_updated = store.mark_curiosity_searched(
@@ -2848,6 +3140,7 @@ def _cmd_prepare_media(args: argparse.Namespace) -> int:
 
         bv_estimate_record = {
             "bv_id": safe_bv,
+            "aid": detail.meta.aid,
             "title": detail.meta.title,
             "duration_sec": detail.meta.duration_sec,
             "tags": list(detail.meta.tags),
@@ -2960,6 +3253,13 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
     )
     eff_ipc_dir = resolve_ipc_dir(cfg, ipc_dir=getattr(args, "ipc_dir", None))
 
+    eff_offline = bool(getattr(args, "offline", False) or (run_state or {}).get("offline", False))
+    raw_aid = cached_bv.get("aid")
+    eff_aid = int(raw_aid) if isinstance(raw_aid, int) and raw_aid > 0 else None
+    raw_mid = (run_state or {}).get("bili_mid")
+    eff_bili_mid = int(raw_mid) if isinstance(raw_mid, int) and raw_mid > 0 else None
+    prior_interaction_aborted = bool((run_state or {}).get("interaction_aborted", False))
+
     with MemoryStore.from_config(cfg, db_path=args.db) as store:
         outcome = commit_appreciation_result(
             config=cfg,
@@ -2986,9 +3286,20 @@ def _cmd_commit_appreciation(args: argparse.Namespace) -> int:
             ipc_dir=eff_ipc_dir,
             companion_lock_path=eff_comp_lock,
             workspace_root=eff_ws_root,
+            aid=eff_aid,
+            bili_mid=eff_bili_mid,
+            secrets=_secrets,
+            offline=eff_offline,
+            interaction_aborted=prior_interaction_aborted,
         )
         outcome["token_estimate_reused"] = persisted_token_est is not None
         _record_run_state_bv(run_state_path, bv_id=safe_bv, field="committed_bvs", run_id=safe_run_id)
+        if outcome.get("interaction_aborted"):
+            latest_state = _load_run_state(run_state_path)
+            if latest_state is not None:
+                latest_state["interaction_aborted"] = True
+                latest_state["updated_at"] = _utc_now_iso()
+                _save_run_state(run_state_path, latest_state)
         _emit_json(outcome, output_path=args.output)
         return 0
 
@@ -3228,12 +3539,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--workspace-root", default=argparse.SUPPRESS)
     p_status.add_argument("--output", default=argparse.SUPPRESS)
 
-    p_budget = subparsers.add_parser("check-budget", help="Check 5h window compute budget")
+    p_budget = subparsers.add_parser("check-budget", help="Check 3-condition local compute budget")
+    p_budget.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Max estimated tokens to consume this run (>0); combinable with other flags; skips popup",
+    )
     p_budget.add_argument(
         "--budget-ratio",
         type=float,
         default=None,
-        help="Max 5h window ratio to consume this run (0.0-1.0); combinable with other flags; skips popup",
+        help="[Deprecated v3.0 compat] Ignored window ratio flag; skips popup when passed",
     )
     p_budget.add_argument(
         "--max-videos",
@@ -3246,7 +3563,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reserve-ratio",
         type=float,
         default=None,
-        help="Min 5h window remaining ratio floor (0.0-1.0); combinable with other flags; skips popup",
+        help="[Deprecated v3.0 compat] Ignored reserve ratio flag; skips popup when passed",
     )
     p_budget.add_argument(
         "--max-minutes",
@@ -3269,10 +3586,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("--offline", action="store_true")
     p_feed.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
     p_feed.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Max estimated tokens to consume this run (>0); combinable; unpassed flags become unlimited",
+    )
+    p_feed.add_argument(
         "--budget-ratio",
         type=float,
         default=None,
-        help="Max 5h window ratio to consume this run (0.0-1.0); combinable; unpassed flags become unlimited",
+        help="[Deprecated v3.0 compat] Ignored window ratio flag; unpassed flags become unlimited",
     )
     p_feed.add_argument(
         "--max-videos",
@@ -3285,7 +3608,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reserve-ratio",
         type=float,
         default=None,
-        help="Min 5h window remaining ratio floor (0.0-1.0); combinable; unpassed flags become unlimited",
+        help="[Deprecated v3.0 compat] Ignored reserve ratio flag; unpassed flags become unlimited",
     )
     p_feed.add_argument(
         "--max-minutes",
@@ -3354,6 +3677,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit cache status override (default: unknown unless --cache-hit is set)",
     )
+    p_commit.add_argument("--offline", action="store_true")
     p_commit.add_argument("--headless", action="store_true", default=argparse.SUPPRESS)
     p_commit.add_argument("--ipc-dir", default=argparse.SUPPRESS)
     p_commit.add_argument("--companion-lock", default=argparse.SUPPRESS)
