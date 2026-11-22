@@ -980,11 +980,32 @@ class SyncManager:
             timestamps.append(wb.updated_at)
         for hist in store.list_recent_watch_history(limit=5):
             timestamps.append(hist.updated_at)
+        latest_inter = store.get_latest_interaction_timestamp()
+        if latest_inter:
+            timestamps.append(latest_inter)
         for entry in diary_entries:
             ts = entry.get("created_at") or entry.get("timestamp")
             if isinstance(ts, str) and ts.strip():
                 timestamps.append(ts.strip())
         return max(timestamps) if timestamps else "initial"
+
+    def _format_sanitized_surfing_stats_lines(self, store: MemoryStore) -> list[str]:
+        """Render sanitized cumulative & daily surfing/interaction stats (never exports UIDs or secrets)."""
+        stats = store.get_surfing_stats(interaction_cfg=self._config.interaction)
+        return [
+            f"- 累计冲浪统计：已看 {stats.total_watched} 片 ｜ 累计估算 {stats.total_est_tokens:,} Tokens",
+            (
+                f"- 累计互动统计：点赞 {stats.total_likes} ({stats.total_like_rate * 100:.1f}%) ｜ "
+                f"收藏 {stats.total_favorites} ({stats.total_favorite_rate * 100:.1f}%) ｜ "
+                f"私信分享 {stats.total_dms} 次"
+            ),
+            (
+                f"- 今日互动统计 ({stats.local_date})：已看 {stats.today_watched} 片 ｜ "
+                f"点赞 {stats.today_likes} ({stats.today_like_rate * 100:.1f}%) ｜ "
+                f"收藏 {stats.today_favorites} ({stats.today_favorite_rate * 100:.1f}%) ｜ "
+                f"私信 {stats.today_dms}/{stats.max_daily_dms}"
+            ),
+        ]
 
     def _render_persona_snapshot(self, store: MemoryStore, data_stamp: str) -> str:
         if self._persona_path.is_file():
@@ -1027,6 +1048,7 @@ class SyncManager:
             f"- 数据修订标记：`{data_stamp}`",
             f"- 记忆主库总条数：{total_memories}",
             f"- 活跃好奇心词条数：{len(curiosity)}",
+            *self._format_sanitized_surfing_stats_lines(store),
             "",
             "## 1. 核心激活记忆（按艾宾浩斯保留度排序）",
         ]
@@ -1074,6 +1096,7 @@ class SyncManager:
             "",
             f"- 数据修订标记：`{data_stamp}`",
             f"- 管线模式：`{self._config.project.pipeline_mode}`",
+            *self._format_sanitized_surfing_stats_lines(store),
             "",
         ]
 

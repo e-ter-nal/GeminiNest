@@ -16,6 +16,7 @@ from gemininest.budget_ui import (
     build_budget_plan,
     decision_from_plan,
     enqueue_toast_ipc,
+    load_next_run_override,
     probe_companion_lock,
     read_json_safe,
 )
@@ -420,18 +421,28 @@ def test_run_companion_app_single_tk_toplevel_radio_switch_and_clean_exit(
     assert not comp_lock.exists()
 
 
-def test_format_status_snapshot_displays_window_bucket_and_memory_count() -> None:
+def test_format_status_snapshot_displays_surfing_stats_cooldown_and_memory_count() -> None:
     from gemininest.companion import _format_status_snapshot, _resolve_companion_icon_path
 
     rendered = _format_status_snapshot(
         {
             "ok": True,
             "pipeline_mode": "sanitized_video",
-            "window_bucket": "2026-11-21T05:00:00Z_5h",
-            "used_tokens": 0,
-            "capacity_tokens": 1_400_000,
-            "used_ratio": 0.0,
-            "remaining_tokens": 1_400_000,
+            "total_watched": 42,
+            "total_est_tokens": 318_500,
+            "total_likes": 12,
+            "total_like_rate": 12 / 42,
+            "total_favorites": 4,
+            "total_favorite_rate": 4 / 42,
+            "total_dms": 2,
+            "local_date": "2026-11-22",
+            "today_watched": 5,
+            "today_likes": 2,
+            "today_like_rate": 0.4,
+            "today_favorites": 1,
+            "today_favorite_rate": 0.2,
+            "today_dms": 1,
+            "max_daily_dms": 2,
             "in_cooldown": False,
             "cloud_mounted": True,
             "cat_lock_active": False,
@@ -441,9 +452,30 @@ def test_format_status_snapshot_displays_window_bucket_and_memory_count() -> Non
             "recent_diaries": [],
         }
     )
-    assert "本 5h 窗口（" in rendered["window_line"]
-    assert "起）" in rendered["window_line"]
+    assert "累计冲浪：已看 42 片" in rendered["window_line"]
+    assert "估耗 318,500 Tokens" in rendered["window_line"]
+    assert "赞 12 (28.6%)" in rendered["window_line"]
+    assert "藏 4 (9.5%)" in rendered["window_line"]
+    assert "私信 2" in rendered["window_line"]
+    assert "今日 (2026-11-22)：已看 5 片" in rendered["window_line"]
+    assert "私信 1/2" in rendered["window_line"]
+    assert "[429 冷却中]" not in rendered["window_line"]
     assert "手账：0 篇（累计记忆 7 条）" in rendered["diary_line"]
+
+    rendered_cd = _format_status_snapshot(
+        {
+            "ok": True,
+            "pipeline_mode": "audio_only",
+            "in_cooldown": True,
+            "cloud_mounted": False,
+            "cat_lock_active": False,
+            "active_run_count": 0,
+            "memory_count": 0,
+            "diary_count": 0,
+            "recent_diaries": [],
+        }
+    )
+    assert "[429 冷却中]" in rendered_cd["window_line"]
 
     icon_path = _resolve_companion_icon_path(REPO_ROOT)
     assert icon_path is not None and icon_path.is_file()
@@ -582,6 +614,7 @@ def test_companion_tray_action_queue_and_minimize_restore(
             self.destroyed = True
 
         def mainloop(self) -> None:
+            assert any(text == "限额设置" for text, _cb in self.buttons)
             tray_btn = next(cb for text, cb in self.buttons if text == "收进托盘")
             tray_btn()
             assert self.withdrawn is True
@@ -703,3 +736,109 @@ def test_create_companion_shortcut_dry_run_resolves_paths_without_hardcoding(
     )
     assert proc.returncode == 0, f"Shortcut bootstrap failed: {proc.stderr}"
     assert "gemininest.companion" in proc.stdout
+
+
+def test_companion_save_budget_defaults_and_one_time_override_lifecycle(tmp_path: Path) -> None:
+    ws_root = tmp_path / "ws_cfg"
+    ws_root.mkdir()
+    local_cfg = tmp_path / "config.local.json"
+    local_cfg.write_text(
+        json.dumps(
+            {
+                "media_preprocess": {"ffmpeg_binary": "C:/mock/ffmpeg.exe"},
+                "sync": {"cloud_nest_dir": "C:/mock/cloud"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    comp_lock = tmp_path / ".companion.lock"
+    ipc_dir = tmp_path / "ipc"
+
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg)
+    launched_overrides: list[dict[str, Any] | None] = []
+
+    def _popup_launcher(req: dict[str, Any], on_done: Any) -> None:
+        override_defaults = req.get("override_defaults")
+        launched_overrides.append(override_defaults)
+        eff_tokens = (override_defaults or {}).get(
+            "max_run_tokens", cfg.budget_and_runtime.default_max_run_tokens
+        )
+        eff_videos = (override_defaults or {}).get(
+            "max_videos", cfg.budget_and_runtime.default_max_videos
+        )
+        eff_mins = (override_defaults or {}).get(
+            "max_minutes", cfg.budget_and_runtime.default_max_minutes
+        )
+        plan = build_budget_plan(max_run_tokens=eff_tokens, max_videos=eff_videos, max_minutes=eff_mins)
+        on_done(decision_from_plan(plan, source="user_custom"))
+
+    guard = CompanionInstanceGuard(
+        comp_lock,
+        workspace_root=ws_root,
+        ipc_dir=ipc_dir,
+        use_win32_mutex=False,
+        mutex_name=f"Local\\GeminiNestTestCfg_{uuid.uuid4().hex[:10]}",
+    )
+    guard.acquire()
+    try:
+        ctrl = CompanionController(
+            cfg,
+            workspace_root=ws_root,
+            ipc_dir=ipc_dir,
+            companion_lock_path=comp_lock,
+            config_path=REPO_CONFIG_PATH,
+            local_config_path=local_cfg,
+            guard=guard,
+            popup_launcher=_popup_launcher,
+        )
+
+        # 1. save_budget_defaults preserves unrelated keys and reloads ctrl.config
+        ctrl.save_budget_defaults(max_run_tokens=90_000, max_videos=25, max_minutes=None)
+        raw_local = json.loads(local_cfg.read_text(encoding="utf-8"))
+        assert raw_local["media_preprocess"]["ffmpeg_binary"] == "C:/mock/ffmpeg.exe"
+        assert raw_local["sync"]["cloud_nest_dir"] == "C:/mock/cloud"
+        assert raw_local["budget_and_runtime"]["default_max_run_tokens"] == 90_000
+        assert raw_local["budget_and_runtime"]["default_max_videos"] == 25
+        assert raw_local["budget_and_runtime"]["default_max_minutes"] is None
+        assert ctrl.config.budget_and_runtime.default_max_run_tokens == 90_000
+        assert ctrl.config.budget_and_runtime.default_max_videos == 25
+        assert ctrl.config.budget_and_runtime.default_max_minutes is None
+
+        # 2. schedule_one_time_override in ask mode: pre-fills popup AND deletes file after resolution
+        ctrl.schedule_one_time_override(max_run_tokens=40_000, max_videos=4, max_minutes=8)
+        assert load_next_run_override(ipc_dir) is not None
+        atomic_write_json(
+            ipc_dir / "req_once_ask.json",
+            {"run_id": "once_ask", "budget_status": {"used_ratio": 0.0}},
+        )
+        ctrl.process_ipc_once()
+        assert launched_overrides[-1] is not None
+        assert launched_overrides[-1]["max_run_tokens"] == 40_000
+        assert launched_overrides[-1]["max_videos"] == 4
+        assert launched_overrides[-1]["max_minutes"] == 8
+        res_ask = read_json_safe(ipc_dir / "res_once_ask.json")
+        assert res_ask is not None and res_ask["decision"]["max_run_tokens"] == 40_000
+        assert load_next_run_override(ipc_dir) is None  # Consumed!
+
+        # 3. Subsequent auto_default patrol uses saved defaults (90_000 / 25 / None)
+        ctrl.set_mode("auto_default")
+        ctrl.schedule_one_time_override(max_run_tokens=20_000, max_videos=2, max_minutes=5)
+        atomic_write_json(ipc_dir / "req_once_auto.json", {"run_id": "once_auto"})
+        ctrl.process_ipc_once()
+        res_auto = read_json_safe(ipc_dir / "res_once_auto.json")
+        assert res_auto is not None
+        assert res_auto["decision"]["max_run_tokens"] == 20_000
+        assert res_auto["decision"]["max_videos"] == 2
+        assert res_auto["decision"]["max_minutes"] == 5
+        assert load_next_run_override(ipc_dir) is None
+
+        atomic_write_json(ipc_dir / "req_after_auto.json", {"run_id": "after_auto"})
+        ctrl.process_ipc_once()
+        res_default = read_json_safe(ipc_dir / "res_after_auto.json")
+        assert res_default is not None
+        assert res_default["decision"]["max_run_tokens"] == 90_000
+        assert res_default["decision"]["max_videos"] == 25
+        assert res_default["decision"]["max_minutes"] is None
+    finally:
+        guard.release()

@@ -45,14 +45,24 @@ def test_load_repo_config_without_local_file(tmp_path: Path) -> None:
     assert cfg.safety_alignment.min_general_score == pytest.approx(0.20)
     assert cfg.safety_alignment.max_sensitive_score == pytest.approx(0.75)
     assert cfg.safety_alignment.max_unsafe_score == pytest.approx(0.05)
-    assert cfg.budget_and_runtime.default_window_budget_ratio == pytest.approx(0.4)
+    assert cfg.budget_and_runtime.default_max_run_tokens == 150_000
     assert cfg.budget_and_runtime.default_max_videos == 100
-    assert cfg.budget_and_runtime.default_reserve_ratio == pytest.approx(0.30)
     assert cfg.budget_and_runtime.default_max_minutes == 30
+    assert cfg.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg.budget_and_runtime.default_reserve_ratio is None
     assert cfg.budget_and_runtime.companion_policy == "required"
     assert cfg.budget_and_runtime.ipc_dir == "data/budget_ipc"
     assert cfg.budget_and_runtime.ipc_ack_timeout_sec == pytest.approx(2.5)
     assert cfg.budget_and_runtime.require_cloud_mount_on_start is True
+    assert cfg.interaction.enabled is False
+    assert cfg.interaction.like_enabled is False
+    assert cfg.interaction.favorite_enabled is False
+    assert cfg.interaction.dm_enabled is False
+    assert cfg.interaction.owner_bili_uid is None
+    assert cfg.interaction.favorite_private is True
+    assert cfg.interaction.max_daily_likes == 10
+    assert cfg.interaction.max_daily_favorites == 5
+    assert cfg.interaction.max_daily_dms == 2
     assert "原神" in cfg.safety_alignment.blacklist.tags
     assert len(ErrorCode) == 18
 
@@ -209,9 +219,10 @@ def test_load_secrets_from_env_file_and_environ_precedence(tmp_path: Path) -> No
         ),
         lambda d: d["sync"].update({"allowed_sync_extensions": [".md", ".mp4"]}),
         lambda d: d["fetcher"].update({"request_interval_sec": [5.0, 2.0]}),
-        lambda d: d["budget_and_runtime"].update({"est_5h_window_token_capacity": True}),
+        lambda d: d["budget_and_runtime"].update({"default_max_run_tokens": True}),
         lambda d: d["safety_alignment"].update({"max_sensitive_score": 1.25}),
         lambda d: d["safety_alignment"].update({"wd_tagger_device": "tpu"}),
+        lambda d: d["interaction"].update({"enabled": True, "dm_enabled": True, "owner_bili_uid": None}),
     ],
 )
 def test_invalid_config_raises_e1001(tmp_path: Path, mutator) -> None:
@@ -265,16 +276,15 @@ def test_sync_export_private_thought_optional_switch(tmp_path: Path) -> None:
     assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID
 
 
-def test_budget_4_condition_defaults_null_overrides_and_legacy_compat(tmp_path: Path) -> None:
+def test_budget_3_condition_defaults_null_overrides_and_legacy_compat(tmp_path: Path) -> None:
     # 1. Local override with custom numeric values & null (unlimited)
     local_custom = tmp_path / "local_budget_custom.json"
     local_custom.write_text(
         json.dumps(
             {
                 "budget_and_runtime": {
-                    "default_window_budget_ratio": None,
+                    "default_max_run_tokens": 220000,
                     "default_max_videos": 200,
-                    "default_reserve_ratio": 0.25,
                     "default_max_minutes": None,
                 }
             }
@@ -282,20 +292,18 @@ def test_budget_4_condition_defaults_null_overrides_and_legacy_compat(tmp_path: 
         encoding="utf-8",
     )
     cfg_custom = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_custom)
-    assert cfg_custom.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg_custom.budget_and_runtime.default_max_run_tokens == 220_000
     assert cfg_custom.budget_and_runtime.default_max_videos == 200
-    assert cfg_custom.budget_and_runtime.default_reserve_ratio == pytest.approx(0.25)
     assert cfg_custom.budget_and_runtime.default_max_minutes is None
 
-    # 2. All 4 budget defaults set to null in local override
+    # 2. All 3 budget defaults set to null in local override
     local_all_null = tmp_path / "local_budget_all_null.json"
     local_all_null.write_text(
         json.dumps(
             {
                 "budget_and_runtime": {
-                    "default_window_budget_ratio": None,
+                    "default_max_run_tokens": None,
                     "default_max_videos": None,
-                    "default_reserve_ratio": None,
                     "default_max_minutes": None,
                 }
             }
@@ -303,39 +311,107 @@ def test_budget_4_condition_defaults_null_overrides_and_legacy_compat(tmp_path: 
         encoding="utf-8",
     )
     cfg_null = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_all_null)
-    assert cfg_null.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg_null.budget_and_runtime.default_max_run_tokens is None
     assert cfg_null.budget_and_runtime.default_max_videos is None
-    assert cfg_null.budget_and_runtime.default_reserve_ratio is None
     assert cfg_null.budget_and_runtime.default_max_minutes is None
 
-    # 3. Legacy config.json without new 3 fields and with legacy default_budget_mode still loads cleanly
+    # 3. Legacy v3.0 config.json / config.local.json keys (5h window ratio / reserve / capacity)
+    #    must be silently tolerated without triggering E1001_CONFIG_INVALID.
     legacy = copy.deepcopy(_load_base_dict())
+    legacy["budget_and_runtime"].pop("default_max_run_tokens", None)
     legacy["budget_and_runtime"].pop("default_max_videos", None)
-    legacy["budget_and_runtime"].pop("default_reserve_ratio", None)
     legacy["budget_and_runtime"].pop("default_max_minutes", None)
     legacy["budget_and_runtime"]["default_budget_mode"] = "use_ratio"
+    legacy["budget_and_runtime"]["default_window_budget_ratio"] = 0.4
+    legacy["budget_and_runtime"]["default_reserve_ratio"] = 0.3
+    legacy["budget_and_runtime"]["est_5h_window_token_capacity"] = True  # stale legacy type also ignored
     legacy_file = tmp_path / "legacy_budget.json"
     legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
-    cfg_legacy = load_config(config_path=legacy_file, local_config_path=None)
-    assert cfg_legacy.budget_and_runtime.default_max_videos == 100
-    assert cfg_legacy.budget_and_runtime.default_reserve_ratio == pytest.approx(0.30)
-    assert cfg_legacy.budget_and_runtime.default_max_minutes == 30
-    assert cfg_legacy.budget_and_runtime.default_budget_mode == "use_ratio"
 
-    # 4. Invalid budget values raise E1001_CONFIG_INVALID
+    local_legacy = tmp_path / "local_legacy_budget.json"
+    local_legacy.write_text(
+        json.dumps(
+            {
+                "budget_and_runtime": {
+                    "default_window_budget_ratio": 0.45,
+                    "default_reserve_ratio": 0.25,
+                    "est_5h_window_token_capacity": 1400000,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_legacy = load_config(config_path=legacy_file, local_config_path=local_legacy)
+    assert cfg_legacy.budget_and_runtime.default_max_run_tokens == 150_000
+    assert cfg_legacy.budget_and_runtime.default_max_videos == 100
+    assert cfg_legacy.budget_and_runtime.default_max_minutes == 30
+    assert cfg_legacy.budget_and_runtime.default_window_budget_ratio is None
+    assert cfg_legacy.budget_and_runtime.default_reserve_ratio is None
+
+    # 4. Invalid 3-condition budget values raise E1001_CONFIG_INVALID
     for bad_patch in (
-        {"default_window_budget_ratio": 0.0},
-        {"default_window_budget_ratio": 1.2},
-        {"default_window_budget_ratio": True},
+        {"default_max_run_tokens": 0},
+        {"default_max_run_tokens": -50},
+        {"default_max_run_tokens": True},
+        {"default_max_run_tokens": "150000"},
         {"default_max_videos": 0},
         {"default_max_videos": True},
-        {"default_reserve_ratio": -0.1},
-        {"default_reserve_ratio": 1.1},
         {"default_max_minutes": 0},
         {"default_max_minutes": False},
     ):
         bad_local = tmp_path / "bad_budget.json"
         bad_local.write_text(json.dumps({"budget_and_runtime": bad_patch}), encoding="utf-8")
+        with pytest.raises(GeminiNestError) as exc_info:
+            load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
+        assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID
+
+
+def test_interaction_config_defaults_overrides_and_uid_validation(tmp_path: Path) -> None:
+    # Legacy config without `interaction` section loads with safe all-off defaults
+    legacy = copy.deepcopy(_load_base_dict())
+    legacy.pop("interaction", None)
+    legacy_file = tmp_path / "legacy_no_interaction.json"
+    legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    cfg_legacy = load_config(config_path=legacy_file, local_config_path=None)
+    assert cfg_legacy.interaction.enabled is False
+    assert cfg_legacy.interaction.dm_enabled is False
+
+    # Valid interaction override with numeric string or int owner_bili_uid parses cleanly
+    valid_local = tmp_path / "local_valid_interaction.json"
+    valid_local.write_text(
+        json.dumps(
+            {
+                "interaction": {
+                    "enabled": True,
+                    "like_enabled": True,
+                    "favorite_enabled": True,
+                    "dm_enabled": True,
+                    "owner_bili_uid": "12345678",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_valid = load_config(config_path=REPO_CONFIG_PATH, local_config_path=valid_local)
+    assert cfg_valid.interaction.enabled is True
+    assert cfg_valid.interaction.dm_enabled is True
+    assert cfg_valid.interaction.owner_bili_uid == 12345678
+
+    # Invalid owner_bili_uid when enabled=True and dm_enabled=True raises E1001_CONFIG_INVALID
+    for bad_uid in (None, "", "abc123", 0, -42, True):
+        bad_local = tmp_path / "local_bad_dm_uid.json"
+        bad_local.write_text(
+            json.dumps(
+                {
+                    "interaction": {
+                        "enabled": True,
+                        "dm_enabled": True,
+                        "owner_bili_uid": bad_uid,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         with pytest.raises(GeminiNestError) as exc_info:
             load_config(config_path=REPO_CONFIG_PATH, local_config_path=bad_local)
         assert exc_info.value.error_code is ErrorCode.E1001_CONFIG_INVALID

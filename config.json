@@ -132,15 +132,13 @@
     "recall_stability_boost": 0.5
   },
   "budget_and_runtime": {
-    "default_window_budget_ratio": 0.4,
+    "default_max_run_tokens": 150000,
     "default_max_videos": 100,
-    "default_reserve_ratio": 0.30,
     "default_max_minutes": 30,
     "startup_popup_timeout_sec": 60,
     "enable_startup_popup": true,
     "enable_toast_notification": true,
     "toast_min_impression_score": 8,
-    "est_5h_window_token_capacity": 1400000,
     "token_calibration_k": 1.0,
     "lock_file_path": "data/.cat.lock",
     "cooldown_hours_on_429": 5,
@@ -148,6 +146,24 @@
     "ipc_dir": "data/budget_ipc",
     "ipc_ack_timeout_sec": 2.5,
     "require_cloud_mount_on_start": true
+  },
+  "interaction": {
+    "enabled": false,
+    "like_enabled": false,
+    "favorite_enabled": false,
+    "dm_enabled": false,
+    "owner_bili_uid": null,
+    "like_min_score": 7,
+    "favorite_min_score": 9,
+    "dm_min_score": 9,
+    "favorite_folder_id": null,
+    "favorite_folder_name": "GeminiNest精选",
+    "favorite_private": true,
+    "max_daily_likes": 10,
+    "max_daily_favorites": 5,
+    "max_daily_dms": 2,
+    "action_interval_sec": [3.0, 8.0],
+    "abort_on_risk_control": true
   },
   "sync": {
     "pure_text_only": true,

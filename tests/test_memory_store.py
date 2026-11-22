@@ -43,6 +43,7 @@ def test_schema_and_wal_mode_on_temp_file_db(tmp_path: Path) -> None:
                 "worldbook",
                 "watch_history",
                 "budget_ledger",
+                "interaction_ledger",
             }.issubset(tables)
         finally:
             conn.close()
@@ -369,12 +370,16 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         t0 = datetime(2026, 11, 19, 10, 15, 0, tzinfo=timezone.utc)
         bucket_t0 = compute_window_bucket(t0)
 
-        # Default capacity=1,400,000, allowed_ratio=0.4 -> allowed=560,000
+        # Default capacity=1,400,000, v3.1 default allowed_ratio=1.0 -> allowed=1,400,000
         status0 = store.get_budget_status(now=t0)
         assert status0.window_bucket == bucket_t0
         assert status0.used_tokens == 0
-        assert status0.remaining_tokens == 560_000
+        assert status0.remaining_tokens == 1_400_000
         assert status0.in_cooldown is False
+
+        # Explicit legacy allowed_ratio=0.4 still computes 560,000 cap
+        status_legacy_cap = store.get_budget_status(now=t0, allowed_ratio=0.4)
+        assert status_legacy_cap.remaining_tokens == 560_000
 
         # Record 200,000 tokens with calibration_k=1.2 -> 240,000 total_est_tokens
         entry1 = store.record_budget_usage(
@@ -388,19 +393,19 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         assert entry1.total_est_tokens == 240_000
         assert store.get_run_used_tokens("run-001") == 240_000
 
-        # Record another 350,000 tokens in same 5h bucket -> used=590,000 (> 560,000 allowed)
+        # Record another 350,000 tokens in same 5h bucket -> used=590,000
         store.record_budget_usage(
             run_id="run-002",
             est_audio_tokens=350_000,
             calibration_k=1.0,
             now=t0 + timedelta(minutes=20),
         )
-        status_exceeded = store.get_budget_status(now=t0 + timedelta(minutes=30))
+        status_exceeded = store.get_budget_status(now=t0 + timedelta(minutes=30), allowed_ratio=0.4)
         assert status_exceeded.used_tokens == 590_000
         assert status_exceeded.remaining_tokens == 0
         assert store.get_run_used_tokens("run-002") == 350_000
 
-        # Raising allowed_ratio via popup (e.g. 0.50 -> 700,000) restores remaining budget
+        # Raising allowed_ratio (e.g. 0.50 -> 700,000) restores remaining budget
         status_raised = store.get_budget_status(
             now=t0 + timedelta(minutes=30),
             allowed_ratio=0.50,
@@ -412,7 +417,7 @@ def test_budget_ledger_5h_window_and_429_cooldown_boundaries() -> None:
         assert compute_window_bucket(t_next_window) != bucket_t0
         status_next = store.get_budget_status(now=t_next_window)
         assert status_next.used_tokens == 0
-        assert status_next.remaining_tokens == 560_000
+        assert status_next.remaining_tokens == 1_400_000
 
         # Trigger 429 rate limit -> cooldown active for < 5h, expires at exact 5h boundary
         t_429 = t_next_window + timedelta(minutes=5)
@@ -550,6 +555,20 @@ def test_legacy_db_migration_preserves_old_data_and_enables_new_features(tmp_pat
         assert store.record_applied_patch(patch_id="patch_mig_1", op="add_curiosity", content_hash="abc123") is True
         assert store.is_patch_applied("patch_mig_1") is True
 
+        # 5. Migrated DB supports interaction_ledger & get_surfing_stats without losing legacy rows
+        entry = store.record_interaction(
+            bv_id="BV1legacy001",
+            action_type="like",
+            status="ok",
+            local_date="2026-11-22",
+            now=BASE_TIME,
+        )
+        assert entry.id >= 1
+        stats = store.get_surfing_stats(local_date="2026-11-22", now=BASE_TIME)
+        assert stats.total_watched == 1
+        assert stats.total_est_tokens == 8000
+        assert stats.total_likes == 1
+
 
 def test_atomic_transaction_rolls_back_memory_and_diary_together() -> None:
     with MemoryStore(":memory:") as store:
@@ -634,3 +653,55 @@ def test_count_diary_entries_returns_exact_total() -> None:
             assert store.count_diary_entries() == idx
         recent_3 = store.list_recent_diary_entries(limit=3)
         assert [d.bv_id for d in recent_3] == ["BV1diary0004", "BV1diary0003", "BV1diary0002"]
+
+
+def test_interaction_ledger_idempotency_daily_cap_and_surfing_stats() -> None:
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
+    day1 = datetime(2026, 11, 21, 10, 0, 0)
+    day2 = datetime(2026, 11, 22, 10, 0, 0)
+
+    with MemoryStore.from_config(cfg, db_path=":memory:") as store:
+        # Watch history: completed + in_progress count toward watched; filtered_* do NOT!
+        store.upsert_watch_history(bv_id="BV1ok01", title="片1", duration_sec=60, status="completed", now=day1)
+        store.upsert_watch_history(bv_id="BV1ok02", title="片2", duration_sec=120, status="in_progress", now=day2)
+        store.upsert_watch_history(bv_id="BV1ok03", title="片3", duration_sec=90, status="completed", now=day2)
+        store.upsert_watch_history(bv_id="BV1blk01", title="黑名单", duration_sec=50, status="filtered_blacklist", now=day2)
+        store.upsert_watch_history(bv_id="BV1saf01", title="安检拦截", duration_sec=50, status="filtered_safety", now=day2)
+
+        store.record_budget_usage(run_id="r1", est_text_tokens=12_000, now=day1)
+        store.record_budget_usage(run_id="r2", est_text_tokens=8_000, now=day2)
+
+        # Failed attempt does NOT block idempotency retry
+        store.record_interaction(bv_id="BV1ok02", action_type="like", status="failed", local_date="2026-11-22", detail="net")
+        assert store.can_perform_interaction("BV1ok02", "like", daily_cap=1, local_date="2026-11-22") == (True, "ok")
+
+        # Succeed on BV1ok02 like -> duplicate check blocks repeat segment, daily cap blocks BV1ok03 on same day
+        store.record_interaction(bv_id="BV1ok02", action_type="like", status="ok", local_date="2026-11-22")
+        assert store.has_succeeded_interaction("BV1ok02", "like") is True
+        assert store.can_perform_interaction("BV1ok02", "like", daily_cap=5, local_date="2026-11-22") == (False, "skipped_dup")
+        assert store.can_perform_interaction("BV1ok03", "like", daily_cap=1, local_date="2026-11-22") == (False, "skipped_cap")
+        # Next local day allows cap again for BV1ok03
+        assert store.can_perform_interaction("BV1ok03", "like", daily_cap=1, local_date="2026-11-23") == (True, "ok")
+
+        # Add day1 like + day2 favorite + day2 dm
+        store.record_interaction(bv_id="BV1ok01", action_type="like", status="ok", local_date="2026-11-21")
+        store.record_interaction(bv_id="BV1ok03", action_type="favorite", status="ok", local_date="2026-11-22")
+        store.record_interaction(bv_id="BV1ok03", action_type="dm", status="ok", local_date="2026-11-22")
+
+        stats = store.get_surfing_stats(interaction_cfg=cfg.interaction, local_date="2026-11-22", now=day2)
+        assert stats.total_watched == 3
+        assert stats.total_est_tokens == 20_000
+        assert stats.total_likes == 2
+        assert stats.total_like_rate == pytest.approx(2 / 3, abs=1e-4)
+        assert stats.total_favorites == 1
+        assert stats.total_favorite_rate == pytest.approx(1 / 3, abs=1e-4)
+        assert stats.total_dms == 1
+        assert stats.local_date == "2026-11-22"
+        assert stats.today_watched == 2
+        assert stats.today_likes == 1
+        assert stats.today_like_rate == pytest.approx(0.5)
+        assert stats.today_favorites == 1
+        assert stats.today_favorite_rate == pytest.approx(0.5)
+        assert stats.today_dms == 1
+        assert stats.max_daily_dms == cfg.interaction.max_daily_dms
+        assert stats.in_cooldown is False

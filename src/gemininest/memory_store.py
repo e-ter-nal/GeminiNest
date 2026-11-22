@@ -22,10 +22,15 @@ from gemininest.contracts import (
     DiaryEntry,
     ErrorCode,
     GeminiNestError,
+    InteractionActionType,
+    InteractionConfig,
+    InteractionLedgerEntry,
+    InteractionStatusType,
     MemoryConfig,
     MemoryRecord,
     RecalledMemory,
     StabilityMappingConfig,
+    SurfingStats,
     WatchHistoryRecord,
     WorldbookEntry,
 )
@@ -36,9 +41,11 @@ __all__ = [
     "BudgetStatus",
     "DiaryEntry",
     "ErrorCode",
+    "InteractionLedgerEntry",
     "MemoryRecord",
     "MemoryStore",
     "RecalledMemory",
+    "SurfingStats",
     "WatchHistoryRecord",
     "WorldbookEntry",
     "compute_window_bucket",
@@ -169,11 +176,23 @@ CREATE TABLE IF NOT EXISTS budget_ledger (
     cache_status TEXT NOT NULL DEFAULT 'unknown' CHECK(cache_status IN ('hit', 'miss', 'unknown'))
 );
 
+CREATE TABLE IF NOT EXISTS interaction_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bv_id TEXT NOT NULL,
+    action_type TEXT NOT NULL CHECK(action_type IN ('like', 'favorite', 'dm')),
+    local_date TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ok', 'skipped_cap', 'skipped_dup', 'failed')),
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_bv_id ON memories(bv_id);
 CREATE INDEX IF NOT EXISTS idx_diary_entries_created ON diary_entries(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_diary_entries_bv ON diary_entries(bv_id);
 CREATE INDEX IF NOT EXISTS idx_budget_ledger_window ON budget_ledger(window_bucket, created_at);
 CREATE INDEX IF NOT EXISTS idx_budget_ledger_status ON budget_ledger(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_interaction_ledger_date_action ON interaction_ledger(local_date, action_type, status);
+CREATE INDEX IF NOT EXISTS idx_interaction_ledger_bv_action ON interaction_ledger(bv_id, action_type, status);
 """
 
 
@@ -200,6 +219,18 @@ def _parse_datetime(value: datetime | str | None) -> datetime:
 
 def _to_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
+
+
+def _local_date_str(value: datetime | str | None = None) -> str:
+    """Resolve local calendar date string `YYYY-MM-DD` for daily interaction caps & stats."""
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+            return cleaned
+        return _parse_datetime(cleaned).astimezone().strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return _parse_datetime(value).astimezone().strftime("%Y-%m-%d")
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
 def compute_window_bucket(now: datetime | str | None = None) -> str:
@@ -1586,3 +1617,222 @@ class MemoryStore:
             ).fetchall()
 
         return tuple(self._row_to_budget_entry(r) for r in rows)
+
+    # ------------------------------------------------------------------
+    # Controlled Interaction Ledger (`interaction_ledger`) & Surfing Stats
+    # ------------------------------------------------------------------
+
+    def _row_to_interaction_entry(self, row: sqlite3.Row) -> InteractionLedgerEntry:
+        return InteractionLedgerEntry(
+            id=int(row["id"]),
+            bv_id=str(row["bv_id"]),
+            action_type=row["action_type"],
+            local_date=str(row["local_date"]),
+            status=row["status"],
+            detail=str(row["detail"] or ""),
+            created_at=str(row["created_at"]),
+        )
+
+    def has_succeeded_interaction(
+        self,
+        bv_id: str,
+        action_type: InteractionActionType,
+    ) -> bool:
+        """Check if `(bv_id, action_type)` has already succeeded (`status='ok'`) to prevent duplicates."""
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM interaction_ledger
+            WHERE bv_id = ? AND action_type = ? AND status = 'ok'
+            LIMIT 1
+            """,
+            (bv_id.strip(), action_type),
+        ).fetchone()
+        return row is not None
+
+    def count_daily_interactions(
+        self,
+        action_type: InteractionActionType,
+        *,
+        local_date: str | None = None,
+        now: datetime | str | None = None,
+    ) -> int:
+        """Count successful (`status='ok'`) interactions of `action_type` on `local_date` (YYYY-MM-DD)."""
+        eff_date = _local_date_str(local_date if local_date is not None else now)
+        row = self._conn.execute(
+            """
+            SELECT COUNT(DISTINCT bv_id) AS cnt
+            FROM interaction_ledger
+            WHERE local_date = ? AND action_type = ? AND status = 'ok'
+            """,
+            (eff_date, action_type),
+        ).fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    def count_total_interactions(self, action_type: InteractionActionType) -> int:
+        """Count total distinct videos with successful (`status='ok'`) interactions."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(DISTINCT bv_id) AS cnt
+            FROM interaction_ledger
+            WHERE action_type = ? AND status = 'ok'
+            """,
+            (action_type,),
+        ).fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    def can_perform_interaction(
+        self,
+        bv_id: str,
+        action_type: InteractionActionType,
+        *,
+        daily_cap: int,
+        local_date: str | None = None,
+        now: datetime | str | None = None,
+    ) -> tuple[bool, Literal["ok", "skipped_dup", "skipped_cap"]]:
+        """Atomically check idempotency and daily cap before executing an interaction."""
+        if self.has_succeeded_interaction(bv_id, action_type):
+            return False, "skipped_dup"
+        if int(daily_cap) <= 0:
+            return False, "skipped_cap"
+        used_today = self.count_daily_interactions(
+            action_type,
+            local_date=local_date,
+            now=now,
+        )
+        if used_today >= int(daily_cap):
+            return False, "skipped_cap"
+        return True, "ok"
+
+    def record_interaction(
+        self,
+        *,
+        bv_id: str,
+        action_type: InteractionActionType,
+        status: InteractionStatusType,
+        detail: str = "",
+        local_date: str | None = None,
+        now: datetime | str | None = None,
+    ) -> InteractionLedgerEntry:
+        """Persist an interaction outcome into `interaction_ledger`."""
+        now_dt = _parse_datetime(now)
+        now_iso = _to_iso(now_dt)
+        eff_date = _local_date_str(local_date if local_date is not None else now_dt)
+        try:
+            with self.transaction():
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO interaction_ledger (
+                        bv_id, action_type, local_date, status, detail, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (bv_id.strip(), action_type, eff_date, status, detail.strip()[:300], now_iso),
+                )
+                entry_id = int(cur.lastrowid)
+        except sqlite3.OperationalError as exc:
+            self._handle_operational_error(exc)
+            raise
+
+        row = self._conn.execute(
+            "SELECT * FROM interaction_ledger WHERE id = ?",
+            (entry_id,),
+        ).fetchone()
+        assert row is not None
+        return self._row_to_interaction_entry(row)
+
+    def list_interaction_entries(
+        self,
+        *,
+        bv_id: str | None = None,
+        action_type: InteractionActionType | None = None,
+        limit: int = 50,
+    ) -> tuple[InteractionLedgerEntry, ...]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if bv_id is not None:
+            clauses.append("bv_id = ?")
+            params.append(bv_id.strip())
+        if action_type is not None:
+            clauses.append("action_type = ?")
+            params.append(action_type)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(0, int(limit)))
+        rows = self._conn.execute(
+            f"SELECT * FROM interaction_ledger {where_sql} ORDER BY created_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return tuple(self._row_to_interaction_entry(r) for r in rows)
+
+    def get_latest_interaction_timestamp(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT created_at FROM interaction_ledger ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return str(row["created_at"]) if row is not None else None
+
+    def get_surfing_stats(
+        self,
+        *,
+        interaction_cfg: InteractionConfig | None = None,
+        local_date: str | None = None,
+        now: datetime | str | None = None,
+    ) -> SurfingStats:
+        """Read-only aggregation of historical & today's watching, token, and interaction stats."""
+        eff_now = _parse_datetime(now)
+        eff_date = _local_date_str(local_date if local_date is not None else eff_now)
+        icfg = interaction_cfg or InteractionConfig()
+
+        watched_rows = self._conn.execute(
+            """
+            SELECT updated_at
+            FROM watch_history
+            WHERE status IN ('completed', 'in_progress')
+            """
+        ).fetchall()
+        total_watched = len(watched_rows)
+        today_watched = 0
+        for row in watched_rows:
+            try:
+                if _local_date_str(str(row["updated_at"])) == eff_date:
+                    today_watched += 1
+            except Exception:  # noqa: BLE001
+                pass
+
+        tok_row = self._conn.execute(
+            "SELECT COALESCE(SUM(total_est_tokens), 0) AS total_tok FROM budget_ledger"
+        ).fetchone()
+        total_est_tokens = int(tok_row["total_tok"]) if tok_row is not None else 0
+
+        total_likes = self.count_total_interactions("like")
+        total_favorites = self.count_total_interactions("favorite")
+        total_dms = self.count_total_interactions("dm")
+
+        today_likes = self.count_daily_interactions("like", local_date=eff_date)
+        today_favorites = self.count_daily_interactions("favorite", local_date=eff_date)
+        today_dms = self.count_daily_interactions("dm", local_date=eff_date)
+
+        budget_status = self.get_budget_status(now=eff_now, allowed_ratio=1.0)
+
+        return SurfingStats(
+            local_date=eff_date,
+            total_watched=total_watched,
+            total_est_tokens=total_est_tokens,
+            total_likes=total_likes,
+            total_like_rate=round(total_likes / total_watched, 4) if total_watched > 0 else 0.0,
+            total_favorites=total_favorites,
+            total_favorite_rate=(
+                round(total_favorites / total_watched, 4) if total_watched > 0 else 0.0
+            ),
+            total_dms=total_dms,
+            today_watched=today_watched,
+            today_likes=today_likes,
+            today_like_rate=round(today_likes / today_watched, 4) if today_watched > 0 else 0.0,
+            today_favorites=today_favorites,
+            today_favorite_rate=(
+                round(today_favorites / today_watched, 4) if today_watched > 0 else 0.0
+            ),
+            today_dms=today_dms,
+            max_daily_likes=icfg.max_daily_likes,
+            max_daily_favorites=icfg.max_daily_favorites,
+            max_daily_dms=icfg.max_daily_dms,
+            in_cooldown=budget_status.in_cooldown,
+        )

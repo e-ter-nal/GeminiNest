@@ -159,11 +159,12 @@ class MemoryConfig:
 
 BudgetControlMode = Literal[
     "combined",
-    "use_ratio",
+    "max_tokens",
     "max_videos",
-    "reserve_ratio",
     "max_minutes",
     "rest",
+    "use_ratio",
+    "reserve_ratio",
 ]
 
 CompanionPolicy = Literal["required", "optional", "disabled"]
@@ -178,14 +179,7 @@ def compute_effective_allowed_ratio(
 ) -> float:
     """Compute effective per-run allowed token ratio as the strictest intersection.
 
-    Formula:
-        min(
-            max(0.0, 1.0 - current_window_used_ratio),
-            max_use_ratio (if non-None),
-            max(0.0, 1.0 - reserve_ratio - current_window_used_ratio) (if non-None),
-        )
-    When both `max_use_ratio` and `reserve_ratio` are None, falls back to
-    `max(0.0, 1.0 - current_window_used_ratio)`. Returns `0.0` when `rest_today` is True.
+    Retained for backward compatibility with legacy 4-condition ratio plans.
     """
     if rest_today:
         return 0.0
@@ -206,7 +200,7 @@ def compute_window_cap_ratio(
     current_window_used_ratio: float = 0.0,
     rest_today: bool = False,
 ) -> float:
-    """Compute cumulative 5h-window usage ceiling corresponding to the intersection constraints."""
+    """Compute cumulative 5h-window usage ceiling (legacy compatibility helper)."""
     if rest_today:
         return 0.0
     used = max(0.0, min(1.0, float(current_window_used_ratio)))
@@ -220,24 +214,28 @@ def compute_window_cap_ratio(
 
 @dataclass(frozen=True)
 class BudgetPlan:
-    """Unified 4-condition intersection budget plan persisted across prepare-feed -> prepare-media.
+    """Unified 3-condition intersection budget plan persisted across prepare-feed -> prepare-media.
 
-    All non-None constraints apply simultaneously (strictest intersection; first limit hit stops).
+    All non-None constraints (`max_run_tokens`, `max_videos`, `max_minutes`) apply
+    simultaneously (strictest intersection; first limit hit stops).
+    Legacy ratio fields remain optional for backward-compatible loading of older run_states.
     """
 
     mode: BudgetControlMode = "combined"
-    max_use_ratio: float | None = None
+    max_run_tokens: int | None = None
     max_videos: int | None = None
-    reserve_ratio: float | None = None
     max_minutes: int | float | None = None
+    started_epoch: float | None = None
+    deadline_epoch: float | None = None
+    rest_today: bool = False
+    # Legacy optional fields retained for backward compatibility with old run_states JSON
+    max_use_ratio: float | None = None
+    reserve_ratio: float | None = None
     current_window_used_ratio: float = 0.0
     effective_allowed_ratio: float = -1.0
     allowed_ratio: float = -1.0
     window_cap_ratio: float = -1.0
     use_ratio: float | None = None
-    started_epoch: float | None = None
-    deadline_epoch: float | None = None
-    rest_today: bool = False
 
     def __post_init__(self) -> None:
         eff_max_use = self.max_use_ratio if self.max_use_ratio is not None else self.use_ratio
@@ -283,23 +281,45 @@ class BudgetPlan:
 
 @dataclass(frozen=True)
 class BudgetAndRuntimeConfig:
-    default_window_budget_ratio: float | None
-    startup_popup_timeout_sec: int
-    enable_startup_popup: bool
-    enable_toast_notification: bool
-    toast_min_impression_score: int
-    est_5h_window_token_capacity: int
-    token_calibration_k: float
-    lock_file_path: str
-    cooldown_hours_on_429: int
-    default_budget_mode: BudgetControlMode = "combined"
+    startup_popup_timeout_sec: int = 60
+    enable_startup_popup: bool = True
+    enable_toast_notification: bool = True
+    toast_min_impression_score: int = 8
+    token_calibration_k: float = 1.0
+    lock_file_path: str = "data/.cat.lock"
+    cooldown_hours_on_429: int = 5
+    default_max_run_tokens: int | None = 150_000
     default_max_videos: int | None = 100
-    default_reserve_ratio: float | None = 0.30
-    default_max_minutes: int | None = 30
+    default_max_minutes: int | float | None = 30
+    default_budget_mode: BudgetControlMode = "combined"
     companion_policy: CompanionPolicy = "required"
     ipc_dir: str = "data/budget_ipc"
     ipc_ack_timeout_sec: float = 2.5
     require_cloud_mount_on_start: bool = True
+    # Legacy optional fields retained for backward compatibility with old callers/run_states
+    default_window_budget_ratio: float | None = None
+    default_reserve_ratio: float | None = None
+    est_5h_window_token_capacity: int = 1_400_000
+
+
+@dataclass(frozen=True)
+class InteractionConfig:
+    enabled: bool = False
+    like_enabled: bool = False
+    favorite_enabled: bool = False
+    dm_enabled: bool = False
+    owner_bili_uid: int | None = None
+    like_min_score: int = 7
+    favorite_min_score: int = 9
+    dm_min_score: int = 9
+    favorite_folder_id: int | None = None
+    favorite_folder_name: str = "GeminiNest精选"
+    favorite_private: bool = True
+    max_daily_likes: int = 10
+    max_daily_favorites: int = 5
+    max_daily_dms: int = 2
+    action_interval_sec: tuple[float, float] = (3.0, 8.0)
+    abort_on_risk_control: bool = True
 
 
 @dataclass(frozen=True)
@@ -337,6 +357,7 @@ class AppConfig:
     memory: MemoryConfig
     budget_and_runtime: BudgetAndRuntimeConfig
     sync: SyncConfig
+    interaction: InteractionConfig = field(default_factory=InteractionConfig)
 
 
 @dataclass(frozen=True)
@@ -637,6 +658,43 @@ class BudgetLedgerEntry:
     status: Literal["ok", "rate_limited_429", "safety_blocked"]
     created_at: str
     cache_status: Literal["hit", "miss", "unknown"] = "unknown"
+
+
+InteractionActionType = Literal["like", "favorite", "dm"]
+InteractionStatusType = Literal["ok", "skipped_cap", "skipped_dup", "failed"]
+
+
+@dataclass(frozen=True)
+class InteractionLedgerEntry:
+    id: int
+    bv_id: str
+    action_type: InteractionActionType
+    local_date: str
+    status: InteractionStatusType
+    detail: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class SurfingStats:
+    local_date: str
+    total_watched: int
+    total_est_tokens: int
+    total_likes: int
+    total_like_rate: float
+    total_favorites: int
+    total_favorite_rate: float
+    total_dms: int
+    today_watched: int
+    today_likes: int
+    today_like_rate: float
+    today_favorites: int
+    today_favorite_rate: float
+    today_dms: int
+    max_daily_likes: int
+    max_daily_favorites: int
+    max_daily_dms: int
+    in_cooldown: bool
 
 
 # ---------------------------------------------------------------------------

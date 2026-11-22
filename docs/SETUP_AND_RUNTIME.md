@@ -1,6 +1,6 @@
 # GeminiNest 运维部署与跨端联动实操手册（v1 / v2 通用版）
 
-> 本手册适用于 **GeminiNest v3.0.0**（全面兼容 **v1 纯音频模式 `audio_only`** 与 **v2 视觉安检净版视频模式 `sanitized_video`**）。涵盖环境初始化、v2 `wd-tagger`（DirectML GPU / CPU）热插拔启用、**v3 桌面常驻小窗/Win32 托盘与三分支启动门禁**、**Antigravity `Scheduled Tasks` 自适应唤醒 Prompt（含 `Create With Prompt` 快捷建任务）**、**Google Apps Script 自动导出脚本**，以及 **Gemini Web 端常驻 Skill 与每日 `Scheduled Actions`** 配置。
+> 本手册适用于 **GeminiNest v3.1.0**（全面兼容 **v1 纯音频模式 `audio_only`** 与 **v2 视觉安检净版视频模式 `sanitized_video`**）。涵盖环境初始化、v2 `wd-tagger`（DirectML GPU / CPU）热插拔启用、**v3.1 桌面常驻小窗/Win32 托盘、3 条件本地联合预算与主动「限额设置」**、**可选极低频自用 B 站交互前置准备**、**Antigravity `Scheduled Tasks` 自适应唤醒 Prompt（含 `Create With Prompt` 快捷建任务）**、**Google Apps Script 自动导出脚本**，以及 **Gemini Web 端常驻 Skill 与每日 `Scheduled Actions`** 配置。
 >
 > **安全红线**：本文档全部路径均为通用占位符（`<YOUR_PROJECT_DIR>`、`<YOUR_CONDA_PYTHON>`、`<YOUR_FFMPEG_PATH>`、`<YOUR_GOOGLE_DRIVE_NEST>`），严禁在文档、Git 仓库或云盘中写入真实 Cookie、密钥或本机私密信息。
 
@@ -117,37 +117,33 @@ Copy-Item config.local.example.json config.local.json
 
 ## 3. Antigravity 左侧 `Scheduled Tasks` 定时任务配置
 
-### 3.1 调度窗口与 4 条件联合上限预算控制（GUI 弹窗 + CLI 双支持）
+### 3.1 调度窗口与 3 条件联合上限预算控制（GUI 主动配置 + 弹窗 + CLI 三支持）
 
-* **推荐调度窗口**：每天设置 **2 个独立 5 小时额度窗口**（例如 `11:30` 与 `20:30`），初期标定前 3 天观察 `budget_ledger` 消耗后，可在 `config.local.json` 中微调 `token_calibration_k`。
+* **推荐调度窗口**：每天按自己节奏安排巡逻触发窗口，初期标定后若需更贴近实际额度账单，可配合 `@usage-audit` 审计结果在 `config.local.json` 中微调 `token_calibration_k`。
 * **防撞车锁与跨命令运行租约**：`runner.py` 内置 `.cat.lock` 存活 PID 校验锁，防止单命令并发撞车；同时利用 `data/run_states/<run_id>.json` 为整轮跨 CLI 巡逻维护带 TTL 的**活跃运行租约**（`prepare-feed` 创建、`prepare-media`/`commit-appreciation` 续期、`sync --run-id <run_id>` 释放），启动清扫 `sweep_stale_temp()` 仅回收已过期且不属于任何活跃 `run_id` 的孤儿目录，杜绝并发巡逻互删媒体。
-* **4 条件联合约束（交集上限，先触顶先停，任意项可设为 `null` / 留空 = 不限）**：
-  四个维度不再互斥，而是**同时生效取最严交集**，任意一个非空条件先触顶即优雅止步：
-  1. `max_use_ratio`（CLI `--budget-ratio` / 配置 `default_window_budget_ratio`）：本次巡逻最多消耗 5h 窗口比例（如 `0.40` 表示最多用 40%；`null` 表示不限）；
+* **3 条件联合约束（纯本地估算交集上限，先触顶先停，任意项可设为 `null` / 留空 = 不限）**：
+  三个维度不再使用虚构的 5h 窗口百分比，而是以纯本地精确/校准估算 **同时生效取最严交集**，任意一个非空条件先触顶即优雅止步：
+  1. `max_run_tokens`（CLI `--max-tokens` / 配置 `default_max_run_tokens`）：本次巡逻估算 Token 消耗上限（例如 `150000`；`null` 表示不限）；
   2. `max_videos`（CLI `--max-videos` / 配置 `default_max_videos`）：本次巡逻最多观看去重视频个数（如 `100`；`null` 表示不限）；
-  3. `reserve_ratio`（CLI `--reserve-ratio` / 配置 `default_reserve_ratio`）：5h 窗口至少保留的剩余额度底线（如 `0.30` 表示剩余不得低于 30%；`null` 表示不限）；
-  4. `max_minutes`（CLI `--max-minutes` / 配置 `default_max_minutes`）：本次巡逻最长玩耍时长分钟数（产出 `deadline_epoch`；`null` 表示不限）。
-  * **有效 Token 额度交集换算公式**：
-    `effective_allowed_ratio = min(窗口当前剩余, 非空时的 max_use_ratio, 非空时的 max(0.0, 1.0 - reserve_ratio - current_window_used_ratio))`（当两项均留空时，按当前 5h 窗口剩余 `max(0.0, 1.0 - current_window_used_ratio)` 作为物理底线，并持续受 429 冷却保护）。
+  3. `max_minutes`（CLI `--max-minutes` / 配置 `default_max_minutes`）：本次巡逻最长玩耍时长分钟数（产出 `deadline_epoch`；`null` 表示不限）。
   * **公版保守默认 vs 本地 `config.local.json` 自定义**：
-    * 公版 `config.json` 默认：`default_window_budget_ratio: 0.4`、`default_max_videos: 100`、`default_reserve_ratio: 0.30`、`default_max_minutes: 30`。
-    * 如需在本地放宽或取消某项限制（例如放宽到 200 个视频、60 分钟，或设为 `null` 不限），只需在私有 `config.local.json` 中按需覆写对应字段即可，无需改动公版 `config.json`：
+    * 公版 `config.json` 默认：`default_max_run_tokens: 150000`、`default_max_videos: 100`、`default_max_minutes: 30`（向后兼容：若旧版 `config.local.json` 或旧 `run_states/*.json` 仍残留 `default_window_budget_ratio` / `default_reserve_ratio` / `est_5h_window_token_capacity`，将自动静默忽略而不报错）。
+    * 如需在本地放宽或取消某项限制（例如放宽到 `250000` Token、200 个视频、60 分钟，或设为 `null` 不限），既可直接在桌面小窗点击「**限额设置** -> **设为默认值**」，也可以在私有 `config.local.json` 中手动修改：
       ```json
       {
         "budget_and_runtime": {
-          "default_window_budget_ratio": 0.5,
+          "default_max_run_tokens": 250000,
           "default_max_videos": 200,
-          "default_reserve_ratio": 0.30,
           "default_max_minutes": 60
         }
       }
       ```
-* **CLI 灵活组合与「只传 1 项，其余 3 项自动不限」规则**：
-  * `prepare-feed` 与 `check-budget` 支持同时传入 `--budget-ratio`、`--max-videos`、`--reserve-ratio`、`--max-minutes` 的任意组合。
-  * **关键规则**：只要命令行显式传入了上述 4 个参数中的**任意 1 个或多个**，系统会自动跳过弹窗，且**仅生效显式传入的那几项，未传入的其余项本轮自动设为 `null`（不限）**（例如只传 `--max-videos 5` 时，本轮仅限看 5 片，不额外受默认比例/时长限制）。当 4 个参数均未传入且走超时 / `--headless` / 隔离桌面兜底时，自动启用配置里的 4 项默认值联合组合。
+* **CLI 灵活组合与「只传 1 项，其余 2 项自动不限」规则**：
+  * `prepare-feed` 与 `check-budget` 支持同时传入 `--max-tokens`、`--max-videos`、`--max-minutes` 的任意组合（对旧 `--budget-ratio` / `--reserve-ratio` 保留平滑兼容与弃用日志提示）。
+  * **关键规则**：只要命令行显式传入了上述预算参数中的**任意 1 个或多个**，系统会自动跳过弹窗，且**仅生效显式传入的那几项，未传入的其余项本轮自动设为 `null`（不限）**（例如只传 `--max-videos 5` 时，本轮仅限看 5 片，不额外受默认 Token/时长限制）。当 CLI 参数均未传入且走超时 / `--headless` / 隔离桌面兜底时，自动启用配置（或「单次使用」预约）的 3 项限额。
   * **`--max-select` 与 `max_videos` 协同及防滥用护栏**：未显式传 `--max-select` 时，若 `max_videos` 明确指定（例如 `12` 或 `100`），单轮选片上限会自动按 `min(max_videos, 30)` 推进（不再被默认 `4` 卡死）；若 `max_videos` 为不限（`null`），单轮选片默认为 `4`。为防止单次上下文请求过度膨胀或误刷接口，程序内置单次选片防滥用护栏 **`MAX_SELECT_PER_BATCH_GUARDRAIL = 30`**（即使显式传更大的 `--max-select` 也会被钳制在 `30` 以内；当 `max_videos > 30` 时，宿主可按分段波次在同一预算约束下稳步推进）。
 * **两种启动运行方式（并列支持，按需选择）**：
-  由于 Antigravity 定时任务命令终端通常运行在隔离桌面（`WinSta0\exebox-*`），直接拉起的 GUI 窗口对当前用户桌面不可见，因此 v3 引入「**跨桌面文件 IPC + 常驻轻量桌面小窗**」架构：
+  由于 Antigravity 定时任务命令终端通常运行在隔离桌面（`WinSta0\exebox-*`），直接拉起的 GUI 窗口对当前用户桌面不可见，因此 v3/v3.1 采用「**跨桌面文件 IPC + 常驻轻量桌面小窗**」架构：
 
   * **方式 ①：桌面小窗交互模式（推荐，真实桌面 `WinSta0\Default`）**
     1. **一键生成桌面快捷方式（零黑框，仅需执行一次）**：
@@ -155,17 +151,43 @@ Copy-Item config.local.example.json config.local.json
        <YOUR_CONDA_PYTHON> scripts/create_companion_shortcut.py
        # 可先加 --dry-run 预演确认 pythonw.exe 与仓库路径
        ```
-    2. **双击桌面「GeminiNest 桌面小窝助手」**（或运行 `pythonw -m gemininest.companion`）：常驻轻量 `tkinter` 小窗在 `WinSta0\Default` 监听 `data/budget_ipc/`，不持有 `.cat.lock`、不并发写库，后台线程定时调用只读 `python -m gemininest.runner status` 刷新 **当前管线模式、5h 窗口算力、云盘挂载、手账总数与最新时间**。
-    3. **小窗运行策略单选切换**：
-       * **「每次弹窗询问」**（默认）：收到巡逻请求时以 `tk.Toplevel` 非抢占弹出 60 秒 **4 条件联合上限**确认窗（含实时预览、清空条件、确认出发、今日休息），支持点击「收进托盘」或最小化将其收纳至 Windows 系统托盘「显示隐藏的图标」（左键恢复、右键提供打开面板/刷新/切换模式/退出菜单），并在高分/失效时通过 `winotify` 代发 120s TTL 原生 Toast；
-       * **「自动默认值执行」**：收到请求后不弹窗，立即按配置 4 项默认值回传继续巡逻。
+    2. **双击桌面「GeminiNest 桌面小窝助手」**（或运行 `pythonw -m gemininest.companion`）：常驻轻量 `tkinter` 小窗在 `WinSta0\Default` 监听 `data/budget_ipc/`，不持有 `.cat.lock`、不并发写库，后台线程定时调用只读 `python -m gemininest.runner status` 刷新 **当前管线模式、累计与今日真实冲浪/互动统计（已看数、估算总 Tokens、点赞/收藏率、私信配额及 `[429 冷却中]` 状态）、云盘挂载、手账总数与最新时间**。
+    3. **小窗运行策略单选切换与主动「限额设置」**：
+       * **「每次弹窗询问」**（默认）：收到巡逻请求时以 `tk.Toplevel` 非抢占弹出 60 秒 **3 条件联合上限**确认窗（含实时预览、清空条件、确认出发、今日休息），支持点击「收进托盘」或最小化将其收纳至 Windows 系统托盘「显示隐藏的图标」（左键恢复、右键提供打开面板/限额设置/刷新/切换模式/退出菜单），并在高分/失效时通过 `winotify` 代发 120s TTL 原生 Toast；
+       * **「自动默认值执行」**：收到请求后不弹窗，立即按当前有效默认（或单次预约）回传继续巡逻；
+       * **主动「限额设置」弹窗（主面板按钮 & 托盘右键菜单）**：无 60s 倒计时，随时调整 3 项限额并选择：
+         1. **「设为默认值」**：仅原子读-改-写本地私有 `config.local.json` 的 `budget_and_runtime` 3 项默认值（绝不覆盖已有 `ffmpeg_binary`、`cloud_nest_dir`、`extra_blacklist`、`pipeline_mode` 或 `interaction` 字段）并立即刷新内存配置；
+         2. **「单次使用」**：原子写入 `data/budget_ipc/next_run_override.json` 预约下一轮限额——下轮 `ask` 模式弹窗自动预填这组数值（超时也按这组数值出发），`auto_default` 模式直接秒回出发；无论哪种模式，一旦消费立即删除该预约文件，再下一轮自动恢复默认值；
+         3. **「取消」**：关闭配置窗，不修改任何默认值或预约。
     4. **三分支启动门禁（`config.json` `budget_and_runtime`）**：
-       * `companion_policy: "required"`（默认）：未传 `--headless` 且未传 CLI 预算参数时，先校验 `data/.companion.lock` 存活与 `ack` 握手（`ipc_ack_timeout_sec: 2.5`），未启动小窗则**退出码 0** 返回 `stopped_reason: "desktop_companion_offline"`；等待确认中途用户点「退出」小窗则返回 `stopped_reason: "desktop_companion_aborted"`；60s 超时按配置 4 项默认值继续。
+       * `companion_policy: "required"`（默认）：未传 `--headless` 且未传 CLI 预算参数时，先校验 `data/.companion.lock` 存活与 `ack` 握手（`ipc_ack_timeout_sec: 2.5`），未启动小窗则**退出码 0** 返回 `stopped_reason: "desktop_companion_offline"`；等待确认中途用户点「退出」小窗则返回 `stopped_reason: "desktop_companion_aborted"`；60s 超时按当前预填（默认或单次预约）3 条件继续。
        * `require_cloud_mount_on_start: true`（默认）：在线巡逻（非 `--offline` 且非 `--skip-inbox`）在弹窗之前校验 Google Drive 云盘挂载（`SyncManager.probe_cloud_nest()`），**即使显式传了 `--headless` 也会执行此校验**；未挂载时**退出码 0** 返回 `stopped_reason: "cloud_drive_unmounted"`（`E8001_CLOUD_DRIVE_UNMOUNTED`），绝不半途白跑 B 站拉取或弹窗。`--offline` / `--dry-run` 保留本地兜底不强退。
 
   * **方式 ②：`--headless` 纯无头自动化模式（或显式 CLI 预算覆盖）**
-    * 无需启动桌面小窗：在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按配置 4 项默认值执行，不弹小窗、不发 Toast），或在 `prepare-feed` 传入 `--budget-ratio` / `--max-videos` / `--reserve-ratio` / `--max-minutes` 任意组合（跳过前端检查与交互弹窗，未传维度本轮自动不限）。
+    * 无需启动桌面小窗：在 `prepare-feed` 与 `commit-appreciation` 后追加 `--headless`（按默认或单次预约 3 项限额执行，不弹小窗、不发 Toast），或在 `prepare-feed` 传入 `--max-tokens` / `--max-videos` / `--max-minutes` 任意组合（跳过前端检查与交互弹窗，未传维度本轮自动不限）。
     * 注意：在线巡逻即便传入 `--headless`，若 `require_cloud_mount_on_start: true` 仍会在开跑前校验 Google Drive 云盘是否已挂载。
+
+### 3.1.1 【可选】极低频受控 B 站自用互动前置准备（默认全关闭）
+
+* 公版 `config.json` 中 `interaction` 段 **全部写操作开关默认为 `false`**。如仅研究纯只读巡逻，跳过本节即可。
+* 若希望小猫在遇到高分佳作（默认点赞 `>=7`、收藏 `>=9`、私信分享 `>=9`）时顺手留痕并在 `commit_appreciation_result()` 主事务提交后低频反馈：
+  1. **清理与互关**：用小号在网页端清理无关测试关注，让 **小号与你的单一主力大号相互关注**；
+  2. **私信破冰（B 站反垃圾前置）**：由 **你的大号主动给小号发一条私信**（如“嗨”），让 B 站放开后续 API 私信投递通道；
+  3. **本地配置**：在 `config.local.json` 新增 `interaction` 段，开启需要的开关并填入唯一大号数字 UID（`owner_bili_uid`，系统对评论 `/x/v2/reply/add` 与 `@` 功能物理不实现，并对 `receiver_id == owner_bili_uid` 做代码层硬校验与 `-412`/`-101`/`-111` 零重试熔断）：
+     ```json
+     {
+       "interaction": {
+         "enabled": true,
+         "like_enabled": true,
+         "favorite_enabled": true,
+         "dm_enabled": true,
+         "owner_bili_uid": 12345678,
+         "max_daily_likes": 10,
+         "max_daily_favorites": 5,
+         "max_daily_dms": 2
+       }
+     }
+     ```
 
 ### 3.2 使用 `Create With Prompt` 快捷创建定时任务
 
@@ -188,7 +210,7 @@ Copy-Item config.local.example.json config.local.json
 请严格使用 Python 解释器 `<YOUR_CONDA_PYTHON>`（设置环境变量 `PYTHONPATH=src`），按以下三阶段协议顺序执行，严禁跳过安全校验或残留临时媒体文件：
 
 【阶段 1：启动门禁校验 + 预算确认 + 吸收反向补丁 + 准备今日菜单（小脑选片）】
-1. 执行命令（默认不带 `--headless`，经桌面小窗 IPC 弹出 60 秒 4 条件联合上限预算确认窗；也可按需显式传入 `--budget-ratio`、`--max-videos`、`--reserve-ratio`、`--max-minutes` 中的任意 1 项或多项组合跳过弹窗，或追加 `--headless` 走纯无头默认模式；程序会按优先级完成：桌面小窗在线门禁、Google Drive 云盘挂载门禁、`.cat.lock` 锁校验、仅回收过期孤儿目录的安全清扫、Step 1 幂等吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心轮换拉取、黑名单硬过滤、Top-8 记忆召回，并在 `data/run_states/<run_id>.json` 落盘 `budget_plan` 与活跃运行租约）：
+1. 执行命令（默认不带 `--headless`，经桌面小窗 IPC 弹出 60 秒 3 条件联合上限预算确认窗；也可按需显式传入 `--max-tokens`、`--max-videos`、`--max-minutes` 中的任意 1 项或多项组合跳过弹窗，或追加 `--headless` 走纯无头默认模式；程序会按优先级完成：桌面小窗在线门禁、Google Drive 云盘挂载门禁、`.cat.lock` 锁校验、仅回收过期孤儿目录的安全清扫、Step 1 幂等吸收云盘 `inbox/` 合法补丁、小号心跳与推荐流/好奇心轮换拉取、黑名单硬过滤、Top-8 记忆召回，并在 `data/run_states/<run_id>.json` 落盘 `budget_plan` 与活跃运行租约）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-feed`
    （如需固定每波次选片条数，可追加 `--max-select 4`；单次请求防滥用护栏上限为 `30`。）
 2. 解析标准输出的 JSON：
@@ -201,9 +223,9 @@ Copy-Item config.local.example.json config.local.json
 
 【阶段 2：逐条制备媒体 -> 原生 `read_file` 鉴赏 -> 提交回写并物理焚毁】
 对每个选中的 `bv_id` 顺序执行：
-1. 调用媒体制备命令（程序自动同时校验全部非空预算条件：`rest_today`、去重已看数 `>= max_videos`、`now >= deadline_epoch`、本轮消耗触及 `max_use_ratio` 或窗口剩余触及 `reserve_ratio` 底线/429 冷却，任一先触顶即止步；通过后再按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；同时自动将该 BV 的完整 Token 预估明细与元数据写入 `data/run_states/<run_id>.json` 供提交阶段复用；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
+1. 调用媒体制备命令（程序自动同时校验全部非空预算条件：`rest_today`、去重已看数 `>= max_videos`、`now >= deadline_epoch`、本轮累计估算 Token 触及 `max_run_tokens` 或 429 冷却，任一先触顶即止步；通过后再按 `config.local.json` 中的 `pipeline_mode` 执行 v1 48kbps 单声道 `m4a` 提取，或 v2 抽帧 → `wd-tagger` 全帧安检抹黑 → 净版 MP4 重封；同时自动将该 BV 的完整 Token 预估明细、视频 `aid` 与元数据写入 `data/run_states/<run_id>.json` 供提交阶段复用；如 v2 抹黑率超过 15% 会自动触发 `E5001_SAFETY_GATE_DOWNGRADED` 降级为纯音频）：
    `<YOUR_CONDA_PYTHON> -m gemininest.runner prepare-media --run-id <run_id> --bv <bv_id>`
-   - **若返回 `stopped_reason: "budget_limit_reached"`**（可在 `stop_detail.triggered_by` 查看触顶条件列表，如 `["max_videos"]`、`["max_minutes"]`、`["max_use_ratio"]`、`["reserve_ratio"]`），**立即优雅中止阶段 2 循环，跳过剩余 BV 直接进入阶段 3 收尾同步**。
+   - **若返回 `stopped_reason: "budget_limit_reached"`**（可在 `stop_detail.triggered_by` 查看触顶条件列表，如 `["max_run_tokens"]`、`["max_videos"]`、`["max_minutes"]`），**立即优雅中止阶段 2 循环，跳过剩余 BV 直接进入阶段 3 收尾同步**。
    - 若返回 `E3001_BLACKLIST_REJECTED`、`E4001_FFMPEG_FAILED` 或 `E4002_PAYLOAD_TOO_LARGE`，跳过该 BV 继续下一条。
 2. 读取返回 JSON 中的 `prepared_media.payload_path`、`prepared_media.mode`、`prepared_media.frame_count` 与 `prepared_media.effective_duration_sec`，调用 Antigravity 原生工具 `read_file(Path="<prepared_media.payload_path>")` 加载本地净版媒体（`.m4a` 或 `.mp4`），并结合 `packet.static_prefix_prompt` 与 `packet.dynamic_context_prompt` 进行沉浸鉴赏：
    - **当 `prepared_media.mode` 为 `audio_only` 或 `downgraded_audio` 时（最高红线：纯听觉诚实）**：只根据标题、简介、字幕、热评与真实听到的声音（BGM、节奏、语气、音效）写手账，**严禁捏造未提供的具体视觉画面细节**。

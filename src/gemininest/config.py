@@ -21,6 +21,7 @@ from gemininest.contracts import (
     ErrorCode,
     FetcherConfig,
     GeminiNestError,
+    InteractionConfig,
     MediaPreprocessConfig,
     MemoryConfig,
     ModelAndApiConfig,
@@ -43,6 +44,7 @@ __all__ = [
     "ErrorCode",
     "FetcherConfig",
     "GeminiNestError",
+    "InteractionConfig",
     "MediaPreprocessConfig",
     "MemoryConfig",
     "ModelAndApiConfig",
@@ -493,16 +495,19 @@ def _parse_memory(raw: Mapping[str, Any]) -> MemoryConfig:
 
 def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
     sec = _require_dict(raw, "budget_and_runtime", "root")
-    if "default_window_budget_ratio" not in sec:
-        raise _config_error("Missing required field 'budget_and_runtime.default_window_budget_ratio'")
-    raw_ratio = sec["default_window_budget_ratio"]
-    ratio: float | None
-    if raw_ratio is None:
-        ratio = None
-    else:
-        ratio = _require_float(sec, "default_window_budget_ratio", "budget_and_runtime")
-        if not (0.0 < ratio <= 1.0):
-            raise _config_error("'budget_and_runtime.default_window_budget_ratio' must be in (0.0, 1.0] or null")
+
+    default_max_run_tokens: int | None = 150_000
+    if "default_max_run_tokens" in sec:
+        if sec["default_max_run_tokens"] is None:
+            default_max_run_tokens = None
+        else:
+            default_max_run_tokens = _require_int(
+                sec, "default_max_run_tokens", "budget_and_runtime"
+            )
+            if default_max_run_tokens < 1:
+                raise _config_error(
+                    "'budget_and_runtime.default_max_run_tokens' must be >= 1 or null"
+                )
 
     popup_timeout = _require_int(sec, "startup_popup_timeout_sec", "budget_and_runtime")
     if popup_timeout <= 0:
@@ -510,27 +515,12 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
     toast_min = _require_int(sec, "toast_min_impression_score", "budget_and_runtime")
     if not (1 <= toast_min <= 10):
         raise _config_error("'budget_and_runtime.toast_min_impression_score' must be in [1, 10]")
-    capacity = _require_int(sec, "est_5h_window_token_capacity", "budget_and_runtime")
-    if capacity <= 0:
-        raise _config_error("'budget_and_runtime.est_5h_window_token_capacity' must be > 0")
     calib_k = _require_float(sec, "token_calibration_k", "budget_and_runtime")
     if calib_k <= 0.0:
         raise _config_error("'budget_and_runtime.token_calibration_k' must be > 0")
     cooldown = _require_int(sec, "cooldown_hours_on_429", "budget_and_runtime")
     if cooldown <= 0:
         raise _config_error("'budget_and_runtime.cooldown_hours_on_429' must be > 0")
-
-    default_budget_mode: Literal[
-        "combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes", "rest"
-    ] = "combined"
-    if "default_budget_mode" in sec:
-        raw_mode = _require_str(sec, "default_budget_mode", "budget_and_runtime")
-        if raw_mode not in ("combined", "use_ratio", "max_videos", "reserve_ratio", "max_minutes"):
-            raise _config_error(
-                f"Invalid 'budget_and_runtime.default_budget_mode': {raw_mode!r}; "
-                "expected one of 'combined', 'use_ratio', 'max_videos', 'reserve_ratio', 'max_minutes'"
-            )
-        default_budget_mode = raw_mode  # type: ignore[assignment]
 
     default_max_videos: int | None = 100
     if "default_max_videos" in sec:
@@ -541,23 +531,16 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
             if default_max_videos < 1:
                 raise _config_error("'budget_and_runtime.default_max_videos' must be >= 1 or null")
 
-    default_reserve_ratio: float | None = 0.30
-    if "default_reserve_ratio" in sec:
-        if sec["default_reserve_ratio"] is None:
-            default_reserve_ratio = None
-        else:
-            default_reserve_ratio = _require_float(sec, "default_reserve_ratio", "budget_and_runtime")
-            if not (0.0 <= default_reserve_ratio <= 1.0):
-                raise _config_error("'budget_and_runtime.default_reserve_ratio' must be in [0.0, 1.0] or null")
-
-    default_max_minutes: int | None = 30
+    default_max_minutes: int | float | None = 30
     if "default_max_minutes" in sec:
-        if sec["default_max_minutes"] is None:
+        raw_min = sec["default_max_minutes"]
+        if raw_min is None:
             default_max_minutes = None
         else:
-            default_max_minutes = _require_int(sec, "default_max_minutes", "budget_and_runtime")
-            if default_max_minutes < 1:
-                raise _config_error("'budget_and_runtime.default_max_minutes' must be >= 1 or null")
+            f_min = _require_float(sec, "default_max_minutes", "budget_and_runtime")
+            if f_min <= 0.0:
+                raise _config_error("'budget_and_runtime.default_max_minutes' must be > 0 or null")
+            default_max_minutes = int(f_min) if float(f_min).is_integer() else round(f_min, 2)
 
     companion_policy: CompanionPolicy = "required"
     if "companion_policy" in sec:
@@ -585,26 +568,155 @@ def _parse_budget_and_runtime(raw: Mapping[str, Any]) -> BudgetAndRuntimeConfig:
             sec, "require_cloud_mount_on_start", "budget_and_runtime"
         )
 
+    # Backward-compatible silent tolerance of deprecated v3.0 5h-window ratio fields
+    # (`default_window_budget_ratio`, `default_reserve_ratio`, `est_5h_window_token_capacity`,
+    # `max_use_ratio`, `reserve_ratio`, `default_budget_mode`): never raise E1001 if present.
     return BudgetAndRuntimeConfig(
-        default_window_budget_ratio=ratio,
+        default_max_run_tokens=default_max_run_tokens,
+        default_max_videos=default_max_videos,
+        default_max_minutes=default_max_minutes,
         startup_popup_timeout_sec=popup_timeout,
         enable_startup_popup=_require_bool(sec, "enable_startup_popup", "budget_and_runtime"),
         enable_toast_notification=_require_bool(
             sec, "enable_toast_notification", "budget_and_runtime"
         ),
         toast_min_impression_score=toast_min,
-        est_5h_window_token_capacity=capacity,
         token_calibration_k=calib_k,
         lock_file_path=_require_str(sec, "lock_file_path", "budget_and_runtime"),
         cooldown_hours_on_429=cooldown,
-        default_budget_mode=default_budget_mode,
-        default_max_videos=default_max_videos,
-        default_reserve_ratio=default_reserve_ratio,
-        default_max_minutes=default_max_minutes,
         companion_policy=companion_policy,
         ipc_dir=ipc_dir,
         ipc_ack_timeout_sec=ipc_ack_timeout_sec,
         require_cloud_mount_on_start=require_cloud_mount_on_start,
+    )
+
+
+def _parse_optional_positive_uid(raw_val: Any, field_path: str) -> int | None:
+    if raw_val is None:
+        return None
+    if isinstance(raw_val, bool):
+        raise _config_error(f"Expected positive integer UID or null at '{field_path}', got bool")
+    if isinstance(raw_val, int):
+        if raw_val <= 0:
+            raise _config_error(f"'{field_path}' must be a positive integer > 0, got {raw_val}")
+        return raw_val
+    if isinstance(raw_val, str):
+        cleaned = raw_val.strip()
+        if not cleaned:
+            return None
+        if not cleaned.isdigit():
+            raise _config_error(
+                f"'{field_path}' must be a positive integer UID (digits only), got {raw_val!r}"
+            )
+        parsed = int(cleaned)
+        if parsed <= 0:
+            raise _config_error(f"'{field_path}' must be > 0, got {parsed}")
+        return parsed
+    raise _config_error(
+        f"Expected positive integer UID or null at '{field_path}', got {type(raw_val).__name__}"
+    )
+
+
+def _parse_interaction(raw: Mapping[str, Any]) -> InteractionConfig:
+    if "interaction" not in raw:
+        return InteractionConfig()
+    sec = _require_dict(raw, "interaction", "root")
+
+    enabled = _require_bool(sec, "enabled", "interaction") if "enabled" in sec else False
+    like_enabled = _require_bool(sec, "like_enabled", "interaction") if "like_enabled" in sec else False
+    favorite_enabled = (
+        _require_bool(sec, "favorite_enabled", "interaction") if "favorite_enabled" in sec else False
+    )
+    dm_enabled = _require_bool(sec, "dm_enabled", "interaction") if "dm_enabled" in sec else False
+
+    owner_uid = _parse_optional_positive_uid(sec.get("owner_bili_uid"), "interaction.owner_bili_uid")
+    if enabled and dm_enabled and owner_uid is None:
+        raise _config_error(
+            "'interaction.owner_bili_uid' must be a valid positive integer when "
+            "interaction.enabled=true and interaction.dm_enabled=true"
+        )
+
+    like_min_score = _require_int(sec, "like_min_score", "interaction") if "like_min_score" in sec else 7
+    favorite_min_score = (
+        _require_int(sec, "favorite_min_score", "interaction") if "favorite_min_score" in sec else 9
+    )
+    dm_min_score = _require_int(sec, "dm_min_score", "interaction") if "dm_min_score" in sec else 9
+    for name, score in (
+        ("like_min_score", like_min_score),
+        ("favorite_min_score", favorite_min_score),
+        ("dm_min_score", dm_min_score),
+    ):
+        if not (1 <= score <= 10):
+            raise _config_error(f"'interaction.{name}' must be in [1, 10], got {score}")
+
+    fav_folder_id = _parse_optional_positive_uid(
+        sec.get("favorite_folder_id"), "interaction.favorite_folder_id"
+    )
+    fav_folder_name = (
+        _require_str(sec, "favorite_folder_name", "interaction")
+        if "favorite_folder_name" in sec
+        else "GeminiNest精选"
+    )
+    fav_private = (
+        _require_bool(sec, "favorite_private", "interaction") if "favorite_private" in sec else True
+    )
+
+    max_daily_likes = _require_int(sec, "max_daily_likes", "interaction") if "max_daily_likes" in sec else 10
+    max_daily_favorites = (
+        _require_int(sec, "max_daily_favorites", "interaction")
+        if "max_daily_favorites" in sec
+        else 5
+    )
+    max_daily_dms = _require_int(sec, "max_daily_dms", "interaction") if "max_daily_dms" in sec else 2
+    for name, cap in (
+        ("max_daily_likes", max_daily_likes),
+        ("max_daily_favorites", max_daily_favorites),
+        ("max_daily_dms", max_daily_dms),
+    ):
+        if cap < 0:
+            raise _config_error(f"'interaction.{name}' must be >= 0, got {cap}")
+
+    interval: tuple[float, float] = (3.0, 8.0)
+    if "action_interval_sec" in sec:
+        raw_int = sec["action_interval_sec"]
+        if not isinstance(raw_int, list) or len(raw_int) != 2:
+            raise _config_error("'interaction.action_interval_sec' must be a 2-element list [min, max]")
+        low_v, high_v = raw_int
+        if (
+            not isinstance(low_v, (int, float))
+            or isinstance(low_v, bool)
+            or not isinstance(high_v, (int, float))
+            or isinstance(high_v, bool)
+        ):
+            raise _config_error("'interaction.action_interval_sec' entries must be numbers")
+        low_f, high_f = float(low_v), float(high_v)
+        if low_f < 0.0 or high_f < low_f:
+            raise _config_error("'interaction.action_interval_sec' must satisfy 0 <= min <= max")
+        interval = (low_f, high_f)
+
+    abort_on_rc = (
+        _require_bool(sec, "abort_on_risk_control", "interaction")
+        if "abort_on_risk_control" in sec
+        else True
+    )
+
+    return InteractionConfig(
+        enabled=enabled,
+        like_enabled=like_enabled,
+        favorite_enabled=favorite_enabled,
+        dm_enabled=dm_enabled,
+        owner_bili_uid=owner_uid,
+        like_min_score=like_min_score,
+        favorite_min_score=favorite_min_score,
+        dm_min_score=dm_min_score,
+        favorite_folder_id=fav_folder_id,
+        favorite_folder_name=fav_folder_name,
+        favorite_private=fav_private,
+        max_daily_likes=max_daily_likes,
+        max_daily_favorites=max_daily_favorites,
+        max_daily_dms=max_daily_dms,
+        action_interval_sec=interval,
+        abort_on_risk_control=abort_on_rc,
     )
 
 
@@ -687,6 +799,7 @@ def load_config(
         memory=_parse_memory(merged),
         budget_and_runtime=_parse_budget_and_runtime(merged),
         sync=_parse_sync(merged),
+        interaction=_parse_interaction(merged),
     )
 
 

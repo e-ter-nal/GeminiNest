@@ -32,7 +32,7 @@
   * **短片（`<= agentic_threshold_sec`，默认 300 秒）**：采用 `static` 模式（支持自定义 `extract_fps` 与 300 秒基准分段，低延迟、无额外导航推理开销）。
   * **长片（`> 300 秒`）**：按配置切换为 Gemini 4 原生 `agentic` 模式（对已安检净版 MP4 动态按需读字幕与画面，最高省 88% 输入 Token 且 100% 安全），或按 300 秒分段无状态接力 / 降级纯音频。
 
-* **v3 桌面交互与启动门禁扩展**：为解决 Antigravity 定时任务运行于隔离桌面（`WinSta0\exebox-*`）导致交互弹窗不可见及无头空跑问题，v3 新增 `companion.py`（`WinSta0\Default` 常驻轻量 `tkinter` 小窗 + 纯 Win32 `Shell_NotifyIconW` 系统托盘）、`budget_ui.py` 4 条件联合交集预算与原子文件 IPC（`data/budget_ipc/` + 120s TTL Toast 转发），以及 `runner.py` 三分支启动门禁（小窗在线握手 + Google Drive 挂载探活 + 60s 跨桌面预算确认）与只读 `status` 接口。
+* **v3.1 桌面交互、3 条件本地预算与受控自用互动扩展**：在 v3 常驻轻量小窗（`companion.py`，`WinSta0\Default` + Win32 系统托盘）、原子文件 IPC（`data/budget_ipc/` + 120s TTL Toast 转发）与三分支启动门禁的基础上，v3.1 将虚构 5h 百分比限额重构为纯本地估算的 **3 条件联合交集预算**（`max_run_tokens` / `max_videos` / `max_minutes`）；升级桌面小窗展示累计与今日真实冲浪/互动统计，并新增「**限额设置**」主动配置窗（支持「设为默认值」原子更新 `config.local.json` 与「单次使用」预约 `next_run_override.json`）；新增默认全关闭的受控自用低频 B 站交互（仅点赞 / 私密收藏夹+滚存 / 唯一大号私信分享，SQLite `interaction_ledger` 日上限与跨分段幂等去重，严禁评论与 `@`）。
 
 ---
 
@@ -42,15 +42,15 @@
 
 | 模块名 | 核心职责 | 依赖 / 参考开源方案 |
 | :--- | :--- | :--- |
-| **`config`** | 加载并校验 `config.json` 全局参数；隔离读取 `.env` / `config.local.json` 敏感凭证；导出只读配置对象。 | Python 标准库 `json` / `dataclasses` |
-| **`fetcher`** | 管理 B 站小号登录态心跳检测；拉取推荐流、分区排行、好奇心搜索、字幕、热评/新评及下载音视频流；内置 `-412` 指数退避与空降助手时间戳查询。 | v1 采用轻量只读 **`httpx`**（WBI 签名）+ **`yt-dlp`** + **`Bilibili SponsorBlock`**（暂不挂载 MCP，省去工具定义 Token）；借鉴 `dsh-bili-whale` 退避策略与 `agent-bilibili` 扁平文本清洗；预留 `bilibili-mcp-agent` 按需扩展 |
+| **`config`** | 加载并校验 `config.json` 全局参数；隔离读取 `.env` / `config.local.json` 敏感凭证；导出只读配置对象；静默兼容旧版 5h 比例字段并校验 `interaction.owner_bili_uid`。 | Python 标准库 `json` / `dataclasses` |
+| **`fetcher`** | 管理 B 站小号登录态心跳检测（持久化 `bili_mid`）；拉取推荐流、分区排行、好奇心搜索、字幕、热评/新评及下载音视频流；支持默认关闭的受控自用低频写操作（点赞 / 私密收藏夹+滚存 / 唯一大号白名单私信分享，零重试风控熔断）；内置 `-412` 指数退避与空降助手时间戳查询。 | 轻量 **`httpx`**（WBI 签名）+ **`yt-dlp`** + **`Bilibili SponsorBlock`**（公版默认纯只读，严禁评论与 `@`） |
 | **`meta_filter`** | **前置硬过滤防火墙**：在下载任何媒体流前拦截元数据命中黑名单的视频（主流二游全杀 + 宅舞/时尚/美妆/MMD/政治敏感）。 | 纯本地规则引擎（正则/集合匹配 `tname`/`tags`/`title`） |
 | **`media_processor`** | 封装本地原生 `FFmpeg`：v1 提取 `48kbps` 单声道 `m4a` 与空降去广告裁剪；v2 负责抽帧、净版 MP4 重封、分段对齐及临时目录用完即焚。 | 本地原生 **`FFmpeg`** (`subprocess`) |
 | **`safety_gate`** | 本地视觉安检门接口。**v1 为空壳直通桩（Passthrough Stub）**；**v2 热插拔 `wd-tagger` ONNX 引擎**，执行逐帧评分、黑帧替换与整片降级判定。 | v1 零依赖；v2 接入 `onnxruntime` + `wd-tagger` |
 | **`agent_bridge`** | **Antigravity 宿主驱动桥接层**（零额外 API Key，复用 Antigravity Pro 订阅额度）：负责静态前缀拼装（4,500–5,200 Tokens 稳过隐式缓存阈值）、本地媒体路径打包（供宿主原生 `read_file` 加载 `m4a`/`mp4`）、宿主 JSON 输出校验、算力账本估算，以及 `SAFETY`/`PROHIBITED_CONTENT` 异常优雅跳过。 | Python 标准库（v1 零 LLM SDK 依赖）+ Antigravity 原生多模态环境 |
 | **`memory_store`** | 管理本地 SQLite 四表（动态记忆 + FTS5 `trigram` 虚拟表、世界书表、已看与长视频断点追更表、算力账本表）；实现 `bm25()` 四列加权（含 `<3` 字中文短词回退）与艾宾浩斯 Top-8 显式权重输出。 | Python 标准库 **`sqlite3`**（内置 FTS5） |
 | **`sync_manager`** | 管理纯文本云盘正反向同步：本地纯文本导出 + `data/exports/` 独立隐藏 Git 自动提交 + 滚动备份 `1_yesterday_readonly/` + 刷新 `0_active/` + 扫描合并 `inbox/` 纯文本反向补丁（Apps Script 导出 `.txt` 及手动 `.md`/`.txt`）。v2 预留 `py7zr` 加密冷备接口。 | **Google Drive for Desktop**（流式挂载）+ 本地 **Git**；v2 预留 `py7zr` |
-| **`budget_ui` / `companion`** | 4 条件联合交集预算面板（`Tk`/`Toplevel` 复用）、跨桌面原子文件 IPC、120s TTL Toast 转发，以及 `WinSta0\Default` 常驻轻量桌面小窗与纯 Win32 系统托盘收纳（零 `.cat.lock` / 零并发写库）。 | Python 标准库 `tkinter` / `ctypes` + `winotify` |
+| **`budget_ui` / `companion`** | 3 条件联合交集预算面板与主动「限额设置」弹窗（`Tk`/`Toplevel` 复用）、跨桌面原子文件 IPC（含 `next_run_override.json` 单次预约）、120s TTL Toast 转发，以及 `WinSta0\Default` 常驻轻量桌面小窗（累计+今日冲浪统计看板）与纯 Win32 系统托盘收纳（零 `.cat.lock` / 零并发写库）。 | Python 标准库 `tkinter` / `ctypes` + `winotify` |
 
 ---
 
@@ -90,6 +90,6 @@
 ## 5. 安全、运维与鲁棒性红线
 1. **前置黑名单硬拦截**：严禁先下后筛。命中主流二游（碧蓝档案/蔚蓝档案/碧蓝航线/原神/星铁/鸣潮/绝区零/明日方舟/NIKKE/二游标签等）及宅舞、时尚、美妆、MMD、政治敏感标签时，在元数据阶段直接丢弃。
 2. **用完即焚与异常兜底**：临时音频/帧图/净版 MP4 在 API 返回（无论成功或异常）的 `finally` 块中立即物理删除；遇到 `SAFETY` / `PROHIBITED_CONTENT` 拦截记录结构化日志并优雅跳过，严禁死循环重试。
-3. **防撞车与三分支启动门禁**：使用 `.cat.lock` PID 文件锁与 `data/run_states/<run_id>.json` 运行租约防止休眠补发或跨命令撞车；在线启动依次执行小窗 IPC 握手校验（`companion_policy: "required"`）、Google Drive 云盘挂载探活（`require_cloud_mount_on_start: true`）及小号 Cookie 心跳，再经 `WinSta0\Default` 桌面小窗弹出 60 秒非抢占 `Toplevel` 4 条件联合预算窗（超时按默认交集配置出发，支持 `--headless` 静默模式或当日休眠）。
+3. **防撞车与三分支启动门禁**：使用 `.cat.lock` PID 文件锁与 `data/run_states/<run_id>.json` 运行租约防止休眠补发或跨命令撞车；在线启动依次执行小窗 IPC 握手校验（`companion_policy: "required"`）、Google Drive 云盘挂载探活（`require_cloud_mount_on_start: true`）及小号 Cookie 心跳，再经 `WinSta0\Default` 桌面小窗弹出 60 秒非抢占 `Toplevel` 3 条件联合预算窗（支持自动预填并单次消耗 `next_run_override.json`，超时按当前有效设定出发，支持 `--headless` 静默模式或当日休眠）。
 4. **网络与账号物理隔离**：Clash 将 B 站域名全部设为 `DIRECT` 直连，将 Google/Antigravity 流量锁死单一稳定节点；小号 Cookie 仅通过无痕窗口提取，严禁登录日常主力浏览器。
 5. **纯本地 Git 与脱敏规范**：项目初始化即执行 `git init`，严格通过 `.gitignore` 屏蔽凭据、Cookie、本地配置、SQLite 数据库、临时媒体、快照及 ONNX 权重，采用 `main` + `feat/v1-mvp` + `feat/v2-visual` 分支小步提交。

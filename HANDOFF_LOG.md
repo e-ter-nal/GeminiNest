@@ -5,14 +5,14 @@
 ---
 
 ## 当前全局状态（Current Snapshot）
-* **当前阶段**：✅ **v3.0.0 发布收尾：桌面常驻轻量前端（`WinSta0\Default`）+ 系统托盘收纳 + 三分支启动门禁 + 只读 `status` 接口完成开发与全离线验收，文档已同步至 v3.0.0 并推送至 GitHub `origin/main`**（离线单元测试 **163/163 全绿**，零网络、零真实数据触碰）
-* **当前分支**：`main`（已 `--no-ff` 合并 `feat/v3-companion` 并同步更新文档，已 `git push` 至 `origin/main` 与版本标签 `v3.0.0`）
-* **当前激活模式**：`config.json` 默认保持 v1 `audio_only`、`wd_tagger_enabled: false`、4 条件公版安全默认预算（`0.4` / `100` / `0.30` / `30`），以及桌面前端与启动门禁默认配置（`companion_policy: "required"`、`ipc_dir: "data/budget_ipc"`、`ipc_ack_timeout_sec: 2.5`、`require_cloud_mount_on_start: true`）；未改动本机私有 `config.local.json`
+* **当前阶段**：✅ **v3.1.0 发布完成（已合并 `main` 并推送 GitHub `origin/main` 与标签 `v3.1.0`）**：3 条件本地联合预算（`max_run_tokens`/`max_videos`/`max_minutes`）+ 桌面小窗真实冲浪统计与主动「限额设置」（设为默认值/单次使用）+ 默认全关闭受控低频 B 站自用互动，经用户真机实测确认与全离线单测 **172/172** 通过。
+* **当前分支**：`main`（由 `feat/v3.1-budget-and-interaction` `--no-ff` 合并并发布 `v3.1.0`）
+* **当前激活模式**：`config.json` 默认保持 v1 `audio_only`、`wd_tagger_enabled: false`、3 条件本地默认预算（`default_max_run_tokens: 150000` / `default_max_videos: 100` / `default_max_minutes: 30`）、桌面前端与启动门禁默认配置（`companion_policy: "required"`、`ipc_dir: "data/budget_ipc"`、`ipc_ack_timeout_sec: 2.5`、`require_cloud_mount_on_start: true`），以及全关闭的受控互动配置 `interaction.*: false`；未改动本机私有 `config.local.json`、`data/cat_memory.db` 或 `.env`
 * **已落盘与核验基建**：
-  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（已并列补充「桌面小窗交互模式」与「`--headless` 纯无头自动化模式」，并在第 3.3 节标准唤醒 Prompt 补充 `desktop_companion_offline` / `desktop_companion_aborted` / `cloud_drive_unmounted` 明确中文汇报与立即中止指令）
-  * `.agent/rules/cat-soul.md`、`config.json`、`.gitignore`（新增屏蔽 `data/budget_ipc/`、`data/.companion.lock`、`data/*.lock`）、`.env.example`、`config.local.example.json`、`requirements.txt`、`requirements-v2.txt`、`requirements-dev.txt`、`pyproject.toml`
+  * `README.md`、`LICENSE`（MIT）、`ARCHITECTURE.md`、`SPEC_AND_TASKS.md`、`docs/SETUP_AND_RUNTIME.md`（同步 v3.1 3 条件预算、桌面「限额设置」、受控自用互动前置步骤与合规免责声明）
+  * `.agent/rules/cat-soul.md`、`config.json`、`.gitignore`（包含 `data/budget_ipc/` 含 `next_run_override.json`、`data/.companion.lock`、`data/*.lock`）、`.env.example`、`config.local.example.json`、`requirements.txt`、`requirements-v2.txt`、`requirements-dev.txt`、`pyproject.toml`
   * 核心代码模块与脚本：`src/gemininest/{contracts,config,meta_filter,memory_store,fetcher,media_processor,safety_gate,agent_bridge,budget_ui,companion,sync_manager,runner}.py`、`assets/gemininest.ico`、`scripts/create_companion_shortcut.py`、`scripts/download_wd_tagger.py`、`scripts/inbox_gdoc_exporter.gs`
-  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,companion,runner,sync_manager}.py`（`pytest` **163/163 全绿**，零外部网络请求、真实 `data/` 与真实云盘目录 `<YOUR_GOOGLE_DRIVE_NEST>` 零触碰）
+  * 全离线单元测试：`tests/test_{config,meta_filter,memory_store,fetcher,media_processor,safety_gate,download_wd_tagger,agent_bridge,budget_ui,companion,runner,sync_manager}.py`（`pytest` **172/172 全绿**，100% 隔离沙箱与 `httpx.MockTransport`）
   * 本地私有资产（均被 `.gitignore` 严格忽略）：`config.local.json`、`data/models/model.onnx`（`SmilingWolf/wd-vit-tagger-v3`，361.00 MB）与 `data/models/selected_tags.csv`（10,861 标签）、`data/cat_memory.db`（4 条真实巡逻记忆）、`data/exports/` 内独立隐藏 Git 仓库
   * Anaconda 环境 `gemininest`（Python 3.11.18 + SQLite 3.54.1 FTS5 `trigram` + `yt-dlp`、`httpx`、`python-dotenv`、`winotify`、`pytest`、`Pillow 10.4.0`、`numpy 2.4.6`、`onnxruntime-directml 1.24.4`）
   * Google Drive 云盘目录：`<YOUR_GOOGLE_DRIVE_NEST>\{0_active,1_yesterday_readonly,inbox,inbox_archived}` 均已建齐并通过双端实飞同步验证
@@ -47,6 +47,14 @@
   * 更新 `README.md`（版本徽章升级至 `v3.0.0`、离线单测徽章与清单同步为 `163 passed`、补全 v3 桌面常驻托盘与三分支门禁架构对比、流程图与 `assets/gemininest.ico` 目录项）、`ARCHITECTURE.md`（更新至 `v3.0` 架构说明）、`SPEC_AND_TASKS.md`（补充 `companion.py`/`budget_ipc`/`run_states` 目录树与 Phase 6 v3 里程碑勾选）、`docs/SETUP_AND_RUNTIME.md`（适用版本同步为 `v3.0.0`）及本交接日志顶部状态。
   * 在 `main` 分支完成文档提交并推送 `origin/main` 与附注标签 `v3.0.0`（注意：历史局部标签 `v1.0.0`/`v2.0.0` 仍仅保留在本地 `archive/local-v2-history`，不推送远端）。
 * **回归验证**：`<YOUR_CONDA_PYTHON> -m pytest -v` **163 passed**，全仓库路径/凭据扫描零残留。
+
+### [v3.1 Budget Refactor, Companion Settings & Controlled Interaction] - 2026-11-22
+* **目标与分支状态**：在独立分支 `feat/v3.1-budget-and-interaction` 完成 3 条件本地联合预算、桌面常驻小窗真实冲浪统计+主动「限额设置」、以及默认全关闭的受控极低频 B 站互动开发与全离线验收（**172/172 passed** + 双模式 `--dry-run` 通过），经用户真机实测与私有 `config.local.json` 配置验证通过后，已 `--no-ff` 合并回 **`main`** 并推送 `origin/main`（标签 `v3.1.0`）。
+* **关键实现**：
+  * **模块 A（3 条件联合预算重构）**：`contracts.py` / `config.py` / `config.json` / `config.local.example.json` 以 `default_max_run_tokens: 150000` 替换原虚假 5h 比例/保留底线，保留 `token_calibration_k` 与 `cooldown_hours_on_429`；旧配置与旧 `run_states/*.json` 残留的 5h 字段静默兼容不报 `E1001`；`runner.py` 新增 `--max-tokens`（平滑兼容 `--budget-ratio`/`--reserve-ratio` 弃用提示），`_evaluate_combined_budget_triggers()` 与 `_check_prepare_media_budget_limit()` 校验 `run_spent_tokens >= max_run_tokens`（经 `store.get_run_used_tokens(run_id)`）。
+  * **模块 B（桌面常驻小窗看板与主动配置）**：`memory_store.py` `get_surfing_stats()` 与 `runner.py status` 提供只读累计/今日（本地自然日 `YYYY-MM-DD`）观看/Tokens/点赞率/收藏率/私信次数与 `[429 冷却中]` 状态（严格过滤 `watch_history.status IN ('completed', 'in_progress')`）；`budget_ui.py` 与 `companion.py` 升级 3 输入框，并在主面板与托盘右键菜单新增「限额设置」弹窗（「设为默认值」原子读-改-写仅更新 `config.local.json` 3 项并刷新内存 `config`；「单次使用」写 `data/budget_ipc/next_run_override.json` 在下轮 `ask` 自动预填/`auto_default` 直接应用并即刻核销；「取消」无副作用）。
+  * **模块 C（极低频受控 B 站自用交互）**：`config.json` 新增默认全关 `interaction` 段，强校验 `dm_enabled` 时必须为合法正整数 `owner_bili_uid`，代码库物理零评论(`/x/v2/reply/add`)与 `@`；SQLite 原地迁移新增 `interaction_ledger`（日上限与跨 `continue_watching` 分段幂等去重）；`fetcher.py` 复用 `_bili_client` 实现点赞（`65006` 幂等）、私密收藏夹自动新建与满容滚存（`>=950`）、及强白名单校验（`receiver_id == owner_bili_uid`）大号私信分享（`Origin`/`Referer` 显式设置，`-412`/`-101`/`-111` 零重试即刻熔断）；`commit_appreciation_result()` 在 SQLite 主事务提交后 Best-effort 执行，绝不阻塞返回值与 `finally` `burn-temp`；`sync_manager.py` 导出脱敏统计且绝不泄露 `owner_bili_uid` 或凭据。
+
 ### [v3 Companion & 3-Branch Startup Gate - 桌面常驻轻量前端 + 跨桌面 IPC + 只读 `status`] - 2026-11-21
 * **分支与合并状态**：基于 `main` 在 `feat/v3-companion` 完成开发与桌面交互打磨后，已 `--no-ff` 合并回 **`main`**。
 * **核心实现**：

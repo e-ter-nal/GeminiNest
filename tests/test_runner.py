@@ -1228,7 +1228,7 @@ def test_prepare_feed_cli_4_condition_single_multi_overrides_and_prepare_media_e
     assert out_zero["stopped_reason"] == "rest_today"
 
 
-def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guardrail(
+def test_combined_budget_max_run_tokens_all_none_and_max_select_guardrail(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1241,9 +1241,8 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
             {
                 "media_preprocess": {"ffmpeg_binary": ffmpeg_bin},
                 "budget_and_runtime": {
-                    "default_window_budget_ratio": None,
+                    "default_max_run_tokens": None,
                     "default_max_videos": None,
-                    "default_reserve_ratio": None,
                     "default_max_minutes": None,
                 },
             }
@@ -1325,16 +1324,14 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
     out_abuse = json.loads(capsys.readouterr().out)
     assert out_abuse["effective_max_select"] == 30
 
-    # 2. check-budget with combined flags skips popup & returns accurate intersection
+    # 2. check-budget with combined 3-condition flags skips popup & returns accurate plan
     assert (
         main(
             [
                 *common,
                 "check-budget",
-                "--budget-ratio",
-                "0.25",
-                "--reserve-ratio",
-                "0.30",
+                "--max-tokens",
+                "120000",
                 "--max-videos",
                 "10",
             ]
@@ -1344,13 +1341,11 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
     chk_out = json.loads(capsys.readouterr().out)
     assert chk_out["ok"] is True
     assert chk_out["can_proceed"] is True
-    assert chk_out["budget_plan"]["max_use_ratio"] == pytest.approx(0.25)
-    assert chk_out["budget_plan"]["reserve_ratio"] == pytest.approx(0.30)
+    assert chk_out["budget_plan"]["max_run_tokens"] == 120_000
     assert chk_out["budget_plan"]["max_videos"] == 10
     assert chk_out["budget_plan"]["max_minutes"] is None
-    assert chk_out["budget_plan"]["effective_allowed_ratio"] == pytest.approx(0.25)
 
-    # 3. max_use_ratio triggers BEFORE reserve_ratio when max_use is stricter
+    # 3. max_run_tokens triggers graceful stop BEFORE exceeding run token limit
     assert (
         main(
             [
@@ -1358,11 +1353,11 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
                 "prepare-feed",
                 "--offline",
                 "--run-id",
-                "run_use_first",
-                "--budget-ratio",
-                "0.20",
-                "--reserve-ratio",
-                "0.30",
+                "run_tok_first",
+                "--max-tokens",
+                "120000",
+                "--max-videos",
+                "10",
             ]
         )
         == 0
@@ -1371,10 +1366,9 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
 
     cfg_check = load_config(config_path=REPO_CONFIG_PATH, local_config_path=all_null_local)
     with MemoryStore.from_config(cfg_check, db_path=db_path) as store:
-        # Spend 20% (280,000) in run_use_first -> hits max_use_ratio=0.20 while 80% remains (> 30% reserve)
         store.record_budget_usage(
-            run_id="run_use_first",
-            total_est_tokens=280_000,
+            run_id="run_tok_first",
+            total_est_tokens=120_000,
             status="ok",
         )
 
@@ -1385,7 +1379,7 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
                 "prepare-media",
                 "--offline",
                 "--run-id",
-                "run_use_first",
+                "run_tok_first",
                 "--bv",
                 "BV1drygem001",
                 "--source-audio",
@@ -1396,28 +1390,25 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
     )
     use_hit = json.loads(capsys.readouterr().out)
     assert use_hit["stopped_reason"] == "budget_limit_reached"
-    assert use_hit["stop_detail"]["triggered_by"] == ["max_use_ratio"]
+    assert use_hit["stop_detail"]["triggered_by"] == ["max_run_tokens"]
 
-    # 4. All 4 limits set to None (from config.local.json) -> allowed while under window capacity,
-    #    but hitting 100% of 5h window capacity still triggers safety defense `window_exhausted`!
+    # 4. All 3 limits set to None (from config.local.json) -> unlimited local budget;
+    #    429 cooldown still blocks safely (`cooldown_429`).
     assert main([*common, "prepare-feed", "--offline", "--headless", "--run-id", "run_all_null"]) == 0
     out_null = json.loads(capsys.readouterr().out)
     assert out_null["ok"] is True
-    assert out_null["budget_plan"]["max_use_ratio"] is None
+    assert out_null["budget_plan"]["max_run_tokens"] is None
     assert out_null["budget_plan"]["max_videos"] is None
-    assert out_null["budget_plan"]["reserve_ratio"] is None
     assert out_null["budget_plan"]["max_minutes"] is None
-    assert out_null["budget_plan"]["effective_allowed_ratio"] == pytest.approx(0.80, abs=1e-4)
     assert out_null["effective_max_select"] == 4
 
     with MemoryStore.from_config(cfg_check, db_path=db_path) as store:
-        # Exhaust the remaining 80% (1,120,000) -> 100% of 5h window used
         store.record_budget_usage(
             run_id="run_all_null",
-            total_est_tokens=1_120_000,
+            total_est_tokens=200_000,
             status="ok",
         )
-
+    # Still allowed because max_run_tokens is None
     assert (
         main(
             [
@@ -1434,10 +1425,36 @@ def test_combined_budget_max_use_ratio_first_all_none_safety_and_max_select_guar
         )
         == 0
     )
-    win_hit = json.loads(capsys.readouterr().out)
-    assert win_hit["ok"] is True
-    assert win_hit["stopped_reason"] == "budget_limit_reached"
-    assert win_hit["stop_detail"]["triggered_by"] == ["window_exhausted"]
+    ok_null_media = json.loads(capsys.readouterr().out)
+    assert ok_null_media["ok"] is True
+    assert "stopped_reason" not in ok_null_media
+
+    with MemoryStore.from_config(cfg_check, db_path=db_path) as store:
+        store.record_budget_usage(
+            run_id="run_all_null",
+            total_est_tokens=1_000,
+            status="rate_limited_429",
+        )
+    assert (
+        main(
+            [
+                *common,
+                "prepare-media",
+                "--offline",
+                "--run-id",
+                "run_all_null",
+                "--bv",
+                "BV1drygem002",
+                "--source-audio",
+                str(wav_path),
+            ]
+        )
+        == 0
+    )
+    cool_hit = json.loads(capsys.readouterr().out)
+    assert cool_hit["ok"] is True
+    assert cool_hit["stopped_reason"] == "budget_limit_reached"
+    assert "cooldown_429" in cool_hit["stop_detail"]["triggered_by"]
 
 
 def test_dry_run_stops_gracefully_on_max_minutes_deadline(tmp_path: Path) -> None:
@@ -2305,4 +2322,232 @@ def test_startup_gate_branches_a_b_c_and_ipc_roundtrip(
         stop_ctrl.set()
         t_ctrl.join(timeout=2.0)
         guard.release()
+
+
+def test_status_surfing_stats_and_next_run_override_consumption(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gemininest.budget_ui import load_next_run_override, save_next_run_override
+
+    monkeypatch.setattr("gemininest.runner.DEFAULT_SNAPSHOTS_DIR", tmp_path / "empty_snaps")
+    ipc_dir = tmp_path / "budget_ipc"
+    comp_lock = tmp_path / ".companion.lock"
+    db_path = tmp_path / "stats.db"
+    local_cfg = tmp_path / "local.json"
+    local_cfg.write_text(
+        json.dumps(
+            {
+                "budget_and_runtime": {
+                    "companion_policy": "disabled",
+                    "require_cloud_mount_on_start": False,
+                    "ipc_dir": str(ipc_dir),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg)
+    with MemoryStore.from_config(cfg, db_path=db_path) as store:
+        store.upsert_watch_history(bv_id="BV1stat01", title="片1", duration_sec=60, status="completed")
+        store.upsert_watch_history(bv_id="BV1stat02", title="黑名单片", duration_sec=60, status="filtered_blacklist")
+        store.record_budget_usage(run_id="r_stat", total_est_tokens=45_000, status="ok")
+        store.record_interaction(bv_id="BV1stat01", action_type="like", status="ok")
+
+    save_next_run_override(ipc_dir, max_run_tokens=60_000, max_videos=4, max_minutes=12)
+
+    common = [
+        "--config",
+        str(REPO_CONFIG_PATH),
+        "--local-config",
+        str(local_cfg),
+        "--env",
+        "",
+        "--db",
+        str(db_path),
+        "--temp-root",
+        str(tmp_path / "temp"),
+        "--lock-file",
+        str(tmp_path / "cat.lock"),
+        "--persona",
+        str(REPO_PERSONA_PATH),
+        "--ipc-dir",
+        str(ipc_dir),
+        "--companion-lock",
+        str(comp_lock),
+    ]
+
+    assert main([*common, "status"]) == 0
+    st = json.loads(capsys.readouterr().out)
+    assert st["ok"] is True
+    assert st["total_watched"] == 1  # blacklist excluded!
+    assert st["total_est_tokens"] == 45_000
+    assert st["total_likes"] == 1
+    assert st["next_run_override"]["max_run_tokens"] == 60_000
+
+    # First run consumes next_run_override
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--skip-inbox", "--run-id", "ov_1"]) == 0
+    out1 = json.loads(capsys.readouterr().out)
+    assert out1["budget_plan"]["max_run_tokens"] == 60_000
+    assert out1["budget_plan"]["max_videos"] == 4
+    assert out1["budget_plan"]["max_minutes"] == 12
+    assert load_next_run_override(ipc_dir) is None
+
+    # Next run falls back automatically to repo/local defaults
+    assert main([*common, "prepare-feed", "--offline", "--headless", "--skip-inbox", "--run-id", "ov_2"]) == 0
+    out2 = json.loads(capsys.readouterr().out)
+    assert out2["budget_plan"]["max_run_tokens"] == 150_000
+    assert out2["budget_plan"]["max_videos"] == 100
+    assert out2["budget_plan"]["max_minutes"] == 30
+
+
+def test_commit_appreciation_controlled_interactions_offline_guard_and_temp_burn(tmp_path: Path) -> None:
+    import httpx
+    from gemininest.agent_bridge import AgentBridge
+    from gemininest.contracts import SecretsConfig
+    from gemininest.media_processor import MediaProcessor
+    from gemininest.meta_filter import MetaFilter
+    from gemininest.runner import commit_appreciation_result
+
+    ffmpeg_bin = _resolve_test_ffmpeg()
+    local_cfg = tmp_path / "local_interact.json"
+    local_cfg.write_text(
+        json.dumps(
+            {
+                "media_preprocess": {"ffmpeg_binary": ffmpeg_bin},
+                "budget_and_runtime": {"companion_policy": "disabled"},
+                "interaction": {
+                    "enabled": True,
+                    "like_enabled": True,
+                    "favorite_enabled": True,
+                    "dm_enabled": True,
+                    "owner_bili_uid": 77665544,
+                    "like_min_score": 7,
+                    "favorite_min_score": 9,
+                    "dm_min_score": 9,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=local_cfg)
+    secrets = SecretsConfig(bili_sessdata="mock_s", bili_jct="mock_j", bili_buvid3="mock_b")
+
+    calls: list[str] = []
+    mode = {"dm_code": 0}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/x/web-interface/archive/like":
+            return httpx.Response(200, json={"code": 0})
+        if request.url.path == "/x/v3/fav/folder/created/list-all":
+            return httpx.Response(200, json={"code": 0, "data": {"list": [{"id": 55, "title": "GeminiNest精选", "media_count": 10}]}})
+        if request.url.path == "/x/v3/fav/resource/deal":
+            return httpx.Response(200, json={"code": 0})
+        if str(request.url).startswith("https://api.vc.bilibili.com/web_im/v1/web_im/send_msg"):
+            return httpx.Response(200, json={"code": mode["dm_code"]})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+    temp_root = tmp_path / "temp_interact"
+    media_proc = MediaProcessor(cfg, temp_root=temp_root)
+    bridge = AgentBridge(cfg, persona_path=REPO_PERSONA_PATH)
+    meta_filter = MetaFilter(cfg)
+
+    def _resp_json(bv: str, score: int) -> str:
+        return json.dumps(
+            {
+                "bv_id": bv,
+                "public_diary": "完整佳作手账正文。",
+                "private_thought": "很喜欢。",
+                "impression_score": score,
+                "memory_summary": "佳作摘要。",
+                "continue_watching": False,
+                "recap_50chars": "已看。",
+                "next_curiosity_keywords": [],
+                "safety_blocked": False,
+                "block_reason": None,
+            },
+            ensure_ascii=False,
+        )
+
+    with MemoryStore.from_config(cfg, db_path=tmp_path / "interact.db") as store:
+        # 1. offline=True NEVER fires any network interaction write
+        (temp_root / "run_off" / "BV1off001").mkdir(parents=True, exist_ok=True)
+        out_off = commit_appreciation_result(
+            config=cfg,
+            store=store,
+            bridge=bridge,
+            meta_filter=meta_filter,
+            media_processor=media_proc,
+            run_id="run_off",
+            bv_id="BV1off001",
+            raw_response=_resp_json("BV1off001", 9),
+            video_title="离线片",
+            aid=1001,
+            bili_mid=1234,
+            secrets=secrets,
+            offline=True,
+            headless=True,
+            fetcher_transport=transport,
+            sleep_fn=lambda _: None,
+        )
+        assert out_off["ok"] is True
+        assert calls == []
+        assert not (temp_root / "run_off" / "BV1off001").exists()
+
+        # 2. Live online commit with score=9 executes like+favorite+dm AND burns temp
+        (temp_root / "run_on" / "BV1on001").mkdir(parents=True, exist_ok=True)
+        out_on = commit_appreciation_result(
+            config=cfg,
+            store=store,
+            bridge=bridge,
+            meta_filter=meta_filter,
+            media_processor=media_proc,
+            run_id="run_on",
+            bv_id="BV1on001",
+            raw_response=_resp_json("BV1on001", 9),
+            video_title="线上神作",
+            aid=2002,
+            bili_mid=1234,
+            secrets=secrets,
+            offline=False,
+            headless=True,
+            fetcher_transport=transport,
+            sleep_fn=lambda _: None,
+        )
+        assert out_on["ok"] is True
+        assert out_on["interaction_aborted"] is False
+        assert {it["action_type"]: it["status"] for it in out_on["interactions"]} == {
+            "like": "ok",
+            "favorite": "ok",
+            "dm": "ok",
+        }
+        assert not (temp_root / "run_on" / "BV1on001").exists()
+
+        # 3. Risk-control -412 during DM triggers interaction_aborted=True WITHOUT blocking commit or burn-temp!
+        mode["dm_code"] = -412
+        (temp_root / "run_rc" / "BV1rc001").mkdir(parents=True, exist_ok=True)
+        out_rc = commit_appreciation_result(
+            config=cfg,
+            store=store,
+            bridge=bridge,
+            meta_filter=meta_filter,
+            media_processor=media_proc,
+            run_id="run_rc",
+            bv_id="BV1rc001",
+            raw_response=_resp_json("BV1rc001", 9),
+            video_title="风控触发测试",
+            aid=3003,
+            bili_mid=1234,
+            secrets=secrets,
+            offline=False,
+            headless=True,
+            fetcher_transport=transport,
+            sleep_fn=lambda _: None,
+        )
+        assert out_rc["ok"] is True
+        assert out_rc["interaction_aborted"] is True
+        assert not (temp_root / "run_rc" / "BV1rc001").exists()
 

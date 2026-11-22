@@ -1,4 +1,4 @@
-"""Offline unit tests for gemininest.budget_ui (4-condition intersection popup + Win32 + Toast)."""
+"""Offline unit tests for gemininest.budget_ui (3-condition intersection popup + active config + Win32 + Toast)."""
 
 from __future__ import annotations
 
@@ -18,9 +18,12 @@ from gemininest.budget_ui import (
     budget_plan_from_dict,
     build_budget_plan,
     compute_effective_allowed_ratio,
+    consume_next_run_override,
     decision_from_plan,
+    load_next_run_override,
     notify_auth_expired,
     notify_high_score_video,
+    open_budget_settings_toplevel,
     open_budget_toplevel,
     parse_budget_ratio_input,
     parse_positive_float_input,
@@ -28,6 +31,7 @@ from gemininest.budget_ui import (
     probe_companion_lock,
     prompt_startup_budget,
     read_json_safe,
+    save_budget_defaults_to_local_config,
 )
 from gemininest.config import load_config
 from gemininest.contracts import BudgetPlan, BudgetStatus
@@ -169,7 +173,7 @@ class _FakeTkRoot:
                 clear_btn = self._find_button("清空条件")
                 assert clear_btn is not None and clear_btn.command is not None
                 clear_btn.command()
-                assert [v.get() for v in self.entry_vars] == ["", "", "", ""]
+                assert [v.get() for v in self.entry_vars] == ["", "", ""]
                 assert self.destroyed is False
                 # Capture preview text right after clear
                 for lbl in self.labels:
@@ -184,13 +188,13 @@ class _FakeTkRoot:
             assert confirm_btn is not None and confirm_btn.command is not None
             confirm_btn.command()
         elif self.action_plan == "invalid_then_confirm":
-            # First enter invalid ratio -> popup must stay open with error message, then fix and confirm
+            # First enter invalid token limit -> popup must stay open with error message, then fix and confirm
             self.entry_vars[0].set("not-a-number")
             confirm_btn = self._find_button("确认出发")
             assert confirm_btn is not None and confirm_btn.command is not None
             confirm_btn.command()
             assert self.destroyed is False
-            self.entry_vars[0].set("0.50")
+            self.entry_vars[0].set("200000")
             confirm_btn.command()
             assert self.destroyed is True
 
@@ -394,19 +398,18 @@ def test_4_condition_intersection_effective_allowed_ratio_and_roundtrip() -> Non
 def test_headless_and_disabled_popup_return_combined_defaults_silently() -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
 
-    # Headless must not touch tkinter at all and must carry all 4 config defaults
+    # Headless must not touch tkinter at all and must carry all 3 config defaults
     exploding_tk = _FakeTkModule(fail_tcl=True)
     decision = prompt_startup_budget(cfg, headless=True, tk_module=exploding_tk)
-    assert decision.budget_ratio == pytest.approx(0.4)
-    assert decision.max_use_ratio == pytest.approx(0.4)
+    assert decision.max_run_tokens == 150_000
     assert decision.max_videos == 100
-    assert decision.reserve_ratio == pytest.approx(0.30)
     assert decision.max_minutes == 30
     assert decision.deadline_epoch is not None
     assert decision.source == "headless_default"
     assert decision.rest_today is False
     assert decision.mode == "combined"
     assert decision.budget_plan is not None
+    assert decision.budget_plan.max_run_tokens == 150_000
 
     # Disabled in config
     disabled_cfg = replace(
@@ -415,8 +418,9 @@ def test_headless_and_disabled_popup_return_combined_defaults_silently() -> None
     )
     decision2 = prompt_startup_budget(disabled_cfg, headless=False, tk_module=exploding_tk)
     assert decision2.source == "disabled_default"
-    assert decision2.budget_ratio == pytest.approx(0.4)
+    assert decision2.max_run_tokens == 150_000
     assert decision2.max_videos == 100
+    assert decision2.max_minutes == 30
 
 
 def test_tcl_error_session0_silently_falls_back_to_default() -> None:
@@ -424,27 +428,26 @@ def test_tcl_error_session0_silently_falls_back_to_default() -> None:
     failing_tk = _FakeTkModule(fail_tcl=True)
 
     decision = prompt_startup_budget(cfg, headless=False, tk_module=failing_tk)
-    assert decision.budget_ratio == pytest.approx(0.4)
+    assert decision.max_run_tokens == 150_000
     assert decision.max_videos == 100
-    assert decision.reserve_ratio == pytest.approx(0.30)
     assert decision.max_minutes == 30
     assert decision.source == "tcl_error_fallback"
     assert decision.rest_today is False
 
 
-def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout() -> None:
+def test_gui_3_independent_inputs_clear_button_single_fill_all_blank_and_timeout() -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
     status = BudgetStatus(
         window_bucket="2026-11-21T00:00:00Z_5h",
-        used_tokens=280_000,
+        used_tokens=0,
         capacity_tokens=1_400_000,
-        used_ratio=0.20,
-        allowed_ratio=0.40,
-        remaining_tokens=280_000,
+        used_ratio=0.0,
+        allowed_ratio=1.0,
+        remaining_tokens=1_400_000,
         in_cooldown=False,
     )
 
-    # 1. Timeout via monotonic clock jump: verifies 4 independent inputs, NO radios, prefilled defaults,
+    # 1. Timeout via monotonic clock jump: verifies 3 independent inputs, NO radios, prefilled defaults,
     #    top live preview, and non-focus-stealing topmost behavior.
     clock_values = iter([1000.0, 1030.0, 1061.5, 1061.6])
     tk_timeout = _FakeTkModule(action_plan="timeout")
@@ -458,10 +461,8 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
         now_epoch_fn=lambda: 1_700_000_000.0,
     )
     assert dec_timeout.source == "timeout_default"
-    assert dec_timeout.budget_ratio == pytest.approx(0.40)
-    assert dec_timeout.max_use_ratio == pytest.approx(0.40)
+    assert dec_timeout.max_run_tokens == 150_000
     assert dec_timeout.max_videos == 100
-    assert dec_timeout.reserve_ratio == pytest.approx(0.30)
     assert dec_timeout.max_minutes == 30
     assert dec_timeout.deadline_epoch == 1_700_001_800.0
     assert dec_timeout.rest_today is False
@@ -472,12 +473,12 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
     assert tk_timeout.last_root.idletasks_updated >= 1
     assert tk_timeout.last_root.destroyed is True
     assert len(tk_timeout.last_root.radios) == 0
-    assert len(tk_timeout.last_root.entry_vars) == 4
-    assert tk_timeout.last_root.initial_entry_values == ["0.40", "100", "0.30", "30"]
+    assert len(tk_timeout.last_root.entry_vars) == 3
+    assert tk_timeout.last_root.initial_entry_values == ["150000", "100", "30"]
     assert any("清空条件" in btn.text for btn in tk_timeout.last_root.buttons)
     assert any("确认出发" in btn.text for btn in tk_timeout.last_root.buttons)
     assert any("今日休息" in btn.text for btn in tk_timeout.last_root.buttons)
-    assert any("20.0%" in str(lbl.kwargs.get("text", "")) for lbl in tk_timeout.last_root.labels)
+    assert any("150,000" in str(lbl.kwargs.get("text", "")) or "3 条件" in str(lbl.kwargs.get("text", "")) for lbl in tk_timeout.last_root.labels)
 
     # 2. Click "今日休息"
     tk_rest = _FakeTkModule(action_plan="rest")
@@ -489,10 +490,11 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
     )
     assert dec_rest.source == "user_rest"
     assert dec_rest.budget_ratio == 0.0
+    assert dec_rest.max_run_tokens is None
     assert dec_rest.rest_today is True
     assert dec_rest.mode == "rest"
 
-    # 3. Click "清空条件" then fill ONLY max_videos = "5" -> other 3 dimensions become None (unlimited)
+    # 3. Click "清空条件" then fill ONLY max_videos = "5" -> other 2 dimensions become None (unlimited)
     tk_only_one = _FakeTkModule(
         action_plan="confirm",
         clear_first=True,
@@ -506,17 +508,14 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
         monotonic_fn=lambda: 500.0,
     )
     assert dec_one.source == "user_custom"
-    assert dec_one.max_use_ratio is None
+    assert dec_one.max_run_tokens is None
     assert dec_one.max_videos == 5
-    assert dec_one.reserve_ratio is None
     assert dec_one.max_minutes is None
     assert dec_one.deadline_epoch is None
-    # No token limits set -> effective_allowed_ratio equals 5h window remaining (1 - 0.20 = 0.80)
-    assert dec_one.budget_ratio == pytest.approx(0.80)
     assert tk_only_one.last_root is not None
-    assert "4 项均留空" in tk_only_one.last_root.preview_after_clear
+    assert "3 项均留空" in tk_only_one.last_root.preview_after_clear
 
-    # 4. Click "清空条件" and confirm with ALL 4 blank -> all 4 None, safe window remaining ceiling (0.80)
+    # 4. Click "清空条件" and confirm with ALL 3 blank -> all 3 None (unlimited)
     tk_all_blank = _FakeTkModule(action_plan="confirm", clear_first=True)
     dec_blank = prompt_startup_budget(
         cfg,
@@ -527,18 +526,14 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
     )
     assert dec_blank.source == "user_custom"
     assert dec_blank.rest_today is False
-    assert dec_blank.max_use_ratio is None
+    assert dec_blank.max_run_tokens is None
     assert dec_blank.max_videos is None
-    assert dec_blank.reserve_ratio is None
     assert dec_blank.max_minutes is None
-    assert dec_blank.budget_ratio == pytest.approx(0.80)
-    assert dec_blank.budget_plan is not None and dec_blank.budget_plan.window_cap_ratio == 1.0
 
-    # 5. Combined multi-condition custom edit where reserve_ratio (55%) is stricter than max_use_ratio (50%)
-    #    With used=20%, reserve allows 1 - 0.55 - 0.20 = 0.25 < 0.50 -> effective = 0.25
+    # 5. Combined multi-condition custom edit across all 3 inputs
     tk_combo = _FakeTkModule(
         action_plan="confirm",
-        entry_overrides={0: "50%", 1: "12", 2: "55%", 3: "25"},
+        entry_overrides={0: "250000", 1: "12", 2: "25"},
     )
     dec_combo = prompt_startup_budget(
         cfg,
@@ -549,14 +544,10 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
         now_epoch_fn=lambda: 1_800_000_000.0,
     )
     assert dec_combo.source == "user_custom"
-    assert dec_combo.max_use_ratio == pytest.approx(0.50)
+    assert dec_combo.max_run_tokens == 250_000
     assert dec_combo.max_videos == 12
-    assert dec_combo.reserve_ratio == pytest.approx(0.55)
     assert dec_combo.max_minutes == 25
     assert dec_combo.deadline_epoch == 1_800_001_500.0
-    assert dec_combo.budget_ratio == pytest.approx(0.25)
-    assert dec_combo.budget_plan is not None
-    assert dec_combo.budget_plan.window_cap_ratio == pytest.approx(0.45)
 
     # 6. Invalid input blocks submission until corrected
     tk_invalid = _FakeTkModule(action_plan="invalid_then_confirm")
@@ -568,7 +559,7 @@ def test_gui_4_independent_inputs_clear_button_single_fill_all_blank_and_timeout
         monotonic_fn=lambda: 500.0,
     )
     assert dec_fixed.source == "user_custom"
-    assert dec_fixed.max_use_ratio == pytest.approx(0.50)
+    assert dec_fixed.max_run_tokens == 200_000
 
 
 def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
@@ -576,7 +567,7 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
 ) -> None:
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
 
-    # 1. Non-Default isolated desktop (e.g. Antigravity exebox-*) -> fast graceful fallback to 4 defaults
+    # 1. Non-Default isolated desktop (e.g. Antigravity exebox-*) -> fast graceful fallback to 3 defaults
     monkeypatch.setattr(budget_ui_mod.sys, "platform", "win32")
     monkeypatch.setattr(
         budget_ui_mod,
@@ -585,9 +576,8 @@ def test_windows_isolated_desktop_and_sw_hide_helper_subprocess(
     )
     dec_iso = prompt_startup_budget(cfg, headless=False, tk_module=None)
     assert dec_iso.source == "non_interactive_desktop_fallback"
-    assert dec_iso.budget_ratio == pytest.approx(0.4)
+    assert dec_iso.max_run_tokens == 150_000
     assert dec_iso.max_videos == 100
-    assert dec_iso.reserve_ratio == pytest.approx(0.30)
     assert dec_iso.max_minutes == 30
     assert dec_iso.rest_today is False
 
@@ -716,7 +706,7 @@ def test_toast_notifications_threshold_headless_and_safe_fallback() -> None:
     assert notify_auth_expired(cfg, notifier_factory=broken_factory) is False
 
 
-def test_open_budget_toplevel_reuses_4_condition_panel_without_second_tk(tmp_path: Path) -> None:
+def test_open_budget_toplevel_reuses_3_condition_panel_without_second_tk(tmp_path: Path) -> None:
     del tmp_path
     cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
     tk_mod = _FakeTkModule(action_plan="confirm", entry_overrides={1: "7"})
@@ -727,12 +717,15 @@ def test_open_budget_toplevel_reuses_4_condition_panel_without_second_tk(tmp_pat
         master_root,
         cfg,
         on_decision=captured.append,
+        override_defaults={"max_run_tokens": 80_000, "max_videos": 9, "max_minutes": 15},
         tk_module=tk_mod,
         monotonic_fn=lambda: 100.0,
     )
     assert getattr(win, "master", None) is master_root
     # Toplevel must NEVER trigger a nested mainloop
-    assert len(win.entry_vars) == 4
+    assert len(win.entry_vars) == 3
+    # Override defaults prefilled cleanly
+    assert [v.get() for v in win.entry_vars] == ["80000", "9", "15"]
     win.entry_vars[1].set("7")
     confirm_btn = win._find_button("确认出发")
     assert confirm_btn is not None and confirm_btn.command is not None
@@ -740,9 +733,122 @@ def test_open_budget_toplevel_reuses_4_condition_panel_without_second_tk(tmp_pat
 
     assert len(captured) == 1
     assert captured[0].source == "user_custom"
+    assert captured[0].max_run_tokens == 80_000
     assert captured[0].max_videos == 7
+    assert captured[0].max_minutes == 15
     assert win.destroyed is True
     assert master_root.destroyed is False
+
+
+def test_open_budget_settings_toplevel_save_defaults_one_time_and_cancel(tmp_path: Path) -> None:
+    cfg = load_config(config_path=REPO_CONFIG_PATH, local_config_path=None)
+    local_cfg_path = tmp_path / "config.local.json"
+    local_cfg_path.write_text(
+        json.dumps(
+            {
+                "project": {"pipeline_mode": "sanitized_video"},
+                "media_preprocess": {"ffmpeg_binary": "C:/safe/mock/ffmpeg.exe"},
+                "safety_alignment": {"extra_blacklist": {"tags": ["保留标签"]}},
+                "budget_and_runtime": {"cooldown_hours_on_429": 8},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ipc_dir = tmp_path / "budget_ipc"
+
+    # 1. Active settings popup ("设为默认值"): no countdown callbacks scheduled, 3 action buttons
+    tk_mod = _FakeTkModule()
+    master_root = _FakeTkRoot()
+    outcomes: list[tuple[str, dict[str, Any] | None]] = []
+
+    win_save = open_budget_settings_toplevel(
+        master_root,
+        cfg,
+        on_save_defaults=lambda t, v, m: outcomes.append(("save_default", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_one_time_override=lambda t, v, m: outcomes.append(("one_time", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_cancel=lambda: outcomes.append(("cancel", None)),
+        tk_module=tk_mod,
+    )
+    assert len(win_save.entry_vars) == 3
+    assert len(win_save.after_callbacks) == 0  # NO 60s countdown!
+    assert win_save._find_button("设为默认值") is not None
+    assert win_save._find_button("单次使用") is not None
+    assert win_save._find_button("取消") is not None
+
+    win_save.entry_vars[0].set("220000")
+    win_save.entry_vars[1].set("")  # null / unlimited videos
+    win_save.entry_vars[2].set("45")
+    btn_default = win_save._find_button("设为默认值")
+    assert btn_default is not None and btn_default.command is not None
+    btn_default.command()
+    assert win_save.destroyed is True
+    assert outcomes[-1][0] == "save_default"
+    assert outcomes[-1][1] == {"max_run_tokens": 220_000, "max_videos": None, "max_minutes": 45}
+
+    saved_path = save_budget_defaults_to_local_config(
+        local_cfg_path,
+        max_run_tokens=220_000,
+        max_videos=None,
+        max_minutes=45,
+    )
+    assert saved_path == local_cfg_path
+    saved = json.loads(local_cfg_path.read_text(encoding="utf-8"))
+    assert saved["project"]["pipeline_mode"] == "sanitized_video"
+    assert saved["media_preprocess"]["ffmpeg_binary"] == "C:/safe/mock/ffmpeg.exe"
+    assert saved["safety_alignment"]["extra_blacklist"]["tags"] == ["保留标签"]
+    assert saved["budget_and_runtime"]["cooldown_hours_on_429"] == 8
+    assert saved["budget_and_runtime"]["default_max_run_tokens"] == 220_000
+    assert saved["budget_and_runtime"]["default_max_videos"] is None
+    assert saved["budget_and_runtime"]["default_max_minutes"] == 45
+    assert not list(tmp_path.glob("*.tmp"))
+
+    # 2. Active settings popup ("单次使用") + atomic next_run_override.json write/consume
+    win_once = open_budget_settings_toplevel(
+        master_root,
+        cfg,
+        on_save_defaults=lambda t, v, m: outcomes.append(("save_default", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_one_time_override=lambda t, v, m: outcomes.append(("one_time", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_cancel=lambda: outcomes.append(("cancel", None)),
+        tk_module=tk_mod,
+    )
+    win_once.entry_vars[0].set("50000")
+    win_once.entry_vars[1].set("3")
+    win_once.entry_vars[2].set("10")
+    btn_once = win_once._find_button("单次使用")
+    assert btn_once is not None and btn_once.command is not None
+    btn_once.command()
+    assert win_once.destroyed is True
+    assert outcomes[-1] == ("one_time", {"max_run_tokens": 50_000, "max_videos": 3, "max_minutes": 10})
+
+    # 3. Cancel closes cleanly without emitting any save/override action
+    win_cancel = open_budget_settings_toplevel(
+        master_root,
+        cfg,
+        on_save_defaults=lambda t, v, m: outcomes.append(("save_default", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_one_time_override=lambda t, v, m: outcomes.append(("one_time", {"max_run_tokens": t, "max_videos": v, "max_minutes": m})),
+        on_cancel=lambda: outcomes.append(("cancel", None)),
+        tk_module=tk_mod,
+    )
+    btn_cancel = win_cancel._find_button("取消")
+    assert btn_cancel is not None and btn_cancel.command is not None
+    btn_cancel.command()
+    assert win_cancel.destroyed is True
+    assert outcomes[-1][0] == "cancel"
+    assert len(outcomes) == 3
+
+    # Verify next_run_override load + single-consume lifecycle
+    from gemininest.budget_ui import save_next_run_override
+
+    save_next_run_override(ipc_dir, max_run_tokens=50_000, max_videos=3, max_minutes=10)
+    loaded = load_next_run_override(ipc_dir)
+    assert loaded is not None
+    assert loaded["max_run_tokens"] == 50_000
+    assert loaded["max_videos"] == 3
+    assert loaded["max_minutes"] == 10
+    consumed = consume_next_run_override(ipc_dir)
+    assert consumed is not None and consumed["max_run_tokens"] == 50_000
+    assert load_next_run_override(ipc_dir) is None
 
 
 def test_atomic_ipc_probe_companion_lock_and_toast_forwarding(tmp_path: Path) -> None:

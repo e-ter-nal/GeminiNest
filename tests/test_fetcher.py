@@ -576,3 +576,128 @@ def test_fetch_batch_feed_curiosity_and_blackbox_snapshot_roundtrip(tmp_path: Pa
     parsed = json.loads(extra_path.read_text(encoding="utf-8"))
     assert parsed["run_id"] == "custom_snap"
     assert len(parsed["candidates"]) == 1
+
+
+def test_controlled_interactions_like_private_fav_rollover_dm_and_circuit_break(tmp_path: Path) -> None:
+    from urllib.parse import parse_qs
+
+    cfg = _load_app_cfg()
+    calls: list[tuple[str, str, dict[str, list[str]]]] = []
+    like_mode = {"code": 0}
+    dm_mode = {"code": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body_params = parse_qs(request.content.decode("utf-8")) if request.content else {}
+        calls.append((request.method, str(request.url), body_params))
+
+        # Every authenticated write must carry SESSDATA cookie and NEVER leak to third-party hosts
+        assert "SESSDATA=mock_sessdata_secret_xyz" in request.headers.get("cookie", "")
+
+        if request.url.path == "/x/web-interface/nav":
+            return httpx.Response(200, json=NAV_OK_BODY)
+        if request.url.path == "/x/web-interface/archive/like":
+            assert body_params.get("csrf") == ["mock_jct_secret_abc"]
+            return httpx.Response(200, json={"code": like_mode["code"], "message": "like_resp"})
+        if request.url.path == "/x/v3/fav/folder/created/list-all":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {"id": 11101, "title": "GeminiNest精选", "media_count": 960},
+                        ]
+                    },
+                },
+            )
+        if request.url.path == "/x/v3/fav/folder/add":
+            assert body_params.get("privacy") == ["1"]
+            assert body_params.get("title") == ["GeminiNest精选_2"]
+            assert body_params.get("csrf") == ["mock_jct_secret_abc"]
+            return httpx.Response(200, json={"code": 0, "data": {"id": 22202}})
+        if request.url.path == "/x/v3/fav/resource/deal":
+            assert body_params.get("add_media_ids") == ["22202"]
+            assert body_params.get("rid") == ["998877"]
+            assert body_params.get("type") == ["2"]
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        if str(request.url).startswith("https://api.vc.bilibili.com/web_im/v1/web_im/send_msg"):
+            assert request.headers.get("origin") == "https://message.bilibili.com"
+            assert request.headers.get("referer") == "https://message.bilibili.com/"
+            assert body_params.get("msg[receiver_id]") == ["88776655"]
+            assert body_params.get("csrf") == ["mock_jct_secret_abc"]
+            assert body_params.get("csrf_token") == ["mock_jct_secret_abc"]
+            if dm_mode["code"] != 0:
+                return httpx.Response(200, json={"code": dm_mode["code"], "message": "risk_blocked"})
+            return httpx.Response(200, json={"code": 0, "data": {"msg_key": 999}})
+        return httpx.Response(404, text=f"Unhandled {request.url}")
+
+    with BilibiliFetcher(
+        cfg.fetcher,
+        _make_secrets(),
+        snapshots_dir=tmp_path,
+        transport=httpx.MockTransport(handler),
+        sleep_fn=lambda _: None,
+    ) as fetcher:
+        # 1. Like ok & idempotent 65006 both succeed
+        r_like_ok = fetcher.like_video(bv_id="BV1INTER01", aid=998877)
+        assert r_like_ok.status == "ok" and r_like_ok.risk_control is False
+        like_mode["code"] = 65006
+        r_like_dup = fetcher.like_video(bv_id="BV1INTER01", aid=998877)
+        assert r_like_dup.status == "ok" and r_like_dup.detail == "already_liked_65006"
+
+        # 2. Favorite lists folders -> sees count=960 -> creates private rollover folder -> deals resource
+        r_fav = fetcher.favorite_video(
+            bv_id="BV1INTER01",
+            aid=998877,
+            folder_name="GeminiNest精选",
+            private=True,
+        )
+        assert r_fav.status == "ok"
+        assert r_fav.folder_id == 22202
+        assert "favorited_folder:22202" in r_fav.detail
+
+        # 3. Hard UID whitelist guard raises ValueError for mismatched receiver BEFORE any HTTP call
+        before_cnt = len(calls)
+        with pytest.raises(ValueError, match="whitelist"):
+            fetcher.send_private_dm(
+                bv_id="BV1INTER01",
+                owner_bili_uid=88776655,
+                receiver_id=99999999,
+                message_text="hi",
+                sender_uid=12345678,
+            )
+        assert len(calls) == before_cnt
+
+        # 4. Matching UID sends DM with required Origin/Referer headers
+        r_dm_ok = fetcher.send_private_dm(
+            bv_id="BV1INTER01",
+            owner_bili_uid=88776655,
+            receiver_id=88776655,
+            message_text="推荐：https://www.bilibili.com/video/BV1INTER01",
+        )
+        assert r_dm_ok.status == "ok" and r_dm_ok.risk_control is False
+        assert fetcher.last_login_mid == 12345678
+
+        # 5. Risk-control error code (-412 / -101 / -111) aborts immediately with ZERO retries
+        dm_mode["code"] = -412
+        before_rc = len(calls)
+        r_dm_rc = fetcher.send_private_dm(
+            bv_id="BV1INTER02",
+            owner_bili_uid=88776655,
+            receiver_id=88776655,
+            message_text="test",
+            sender_uid=12345678,
+        )
+        assert r_dm_rc.status == "failed"
+        assert r_dm_rc.risk_control is True
+        assert len(calls) - before_rc == 1
+
+        like_mode["code"] = -101
+        before_like_rc = len(calls)
+        r_like_rc = fetcher.like_video(bv_id="BV1INTER02", aid=998878)
+        assert r_like_rc.status == "failed"
+        assert r_like_rc.risk_control is True
+        assert len(calls) - before_like_rc == 1
+
+        # Public client carries zero credentials
+        assert not fetcher._public_client.cookies

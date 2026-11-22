@@ -2,6 +2,19 @@
   "media_preprocess": {
     "ffmpeg_binary": "<YOUR_FFMPEG_PATH>"
   },
+  "budget_and_runtime": {
+    "default_max_run_tokens": 150000,
+    "default_max_videos": 100,
+    "default_max_minutes": 30
+  },
+  "interaction": {
+    "enabled": false,
+    "like_enabled": false,
+    "favorite_enabled": false,
+    "dm_enabled": false,
+    "owner_bili_uid": null,
+    "favorite_private": true
+  },
   "sync": {
     "cloud_nest_dir": "<YOUR_GOOGLE_DRIVE_NEST>"
   },

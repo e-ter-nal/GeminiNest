@@ -41,23 +41,29 @@ from gemininest.budget_ui import (
     COMPANION_HEARTBEAT_MAX_AGE_SEC,
     APP_ID,
     BudgetDecision,
+    _format_plan_short_label,
     atomic_write_json,
     budget_plan_from_dict,
     build_budget_plan,
+    consume_next_run_override,
     decision_from_plan,
     enable_windows_dpi_awareness,
     is_pid_alive,
+    load_next_run_override,
     normalize_workspace_path,
+    open_budget_settings_toplevel,
     open_budget_toplevel,
     probe_companion_lock,
     read_json_safe,
     resolve_companion_lock_path,
     resolve_ipc_dir,
     resolve_workspace_root,
+    save_budget_defaults_to_local_config,
+    save_next_run_override,
     send_toast_notification,
 )
 from gemininest.config import load_config
-from gemininest.contracts import AppConfig, BudgetAndRuntimeConfig, BudgetStatus
+from gemininest.contracts import AppConfig, BudgetAndRuntimeConfig, BudgetStatus, SurfingStats
 
 __all__ = [
     "CompanionAlreadyRunningError",
@@ -241,12 +247,24 @@ def _budget_cfg_from_request(
     raw = req_data.get("budget_cfg")
     if isinstance(raw, Mapping):
         try:
+            raw_min = raw.get("default_max_minutes", fallback_cfg.default_max_minutes)
+            if raw_min is None:
+                eff_min: int | float | None = None
+            else:
+                f_min = float(raw_min)
+                eff_min = int(f_min) if f_min.is_integer() else round(f_min, 2)
             return BudgetAndRuntimeConfig(
-                default_window_budget_ratio=(
+                default_max_run_tokens=(
                     None
-                    if raw.get("default_window_budget_ratio") is None
-                    else float(raw["default_window_budget_ratio"])
+                    if raw.get("default_max_run_tokens", fallback_cfg.default_max_run_tokens) is None
+                    else int(raw.get("default_max_run_tokens", fallback_cfg.default_max_run_tokens))
                 ),
+                default_max_videos=(
+                    None
+                    if raw.get("default_max_videos", fallback_cfg.default_max_videos) is None
+                    else int(raw.get("default_max_videos", fallback_cfg.default_max_videos))
+                ),
+                default_max_minutes=eff_min,
                 startup_popup_timeout_sec=int(
                     raw.get("startup_popup_timeout_sec", fallback_cfg.startup_popup_timeout_sec)
                 ),
@@ -259,34 +277,12 @@ def _budget_cfg_from_request(
                 toast_min_impression_score=int(
                     raw.get("toast_min_impression_score", fallback_cfg.toast_min_impression_score)
                 ),
-                est_5h_window_token_capacity=int(
-                    raw.get(
-                        "est_5h_window_token_capacity",
-                        fallback_cfg.est_5h_window_token_capacity,
-                    )
-                ),
                 token_calibration_k=float(
                     raw.get("token_calibration_k", fallback_cfg.token_calibration_k)
                 ),
                 lock_file_path=str(raw.get("lock_file_path", fallback_cfg.lock_file_path)),
                 cooldown_hours_on_429=int(
                     raw.get("cooldown_hours_on_429", fallback_cfg.cooldown_hours_on_429)
-                ),
-                default_budget_mode=raw.get("default_budget_mode", fallback_cfg.default_budget_mode),
-                default_max_videos=(
-                    None
-                    if raw.get("default_max_videos") is None
-                    else int(raw["default_max_videos"])
-                ),
-                default_reserve_ratio=(
-                    None
-                    if raw.get("default_reserve_ratio") is None
-                    else float(raw["default_reserve_ratio"])
-                ),
-                default_max_minutes=(
-                    None
-                    if raw.get("default_max_minutes") is None
-                    else int(raw["default_max_minutes"])
                 ),
                 companion_policy=raw.get("companion_policy", fallback_cfg.companion_policy),
                 ipc_dir=str(raw.get("ipc_dir", fallback_cfg.ipc_dir)),
@@ -297,6 +293,22 @@ def _budget_cfg_from_request(
                     raw.get(
                         "require_cloud_mount_on_start",
                         fallback_cfg.require_cloud_mount_on_start,
+                    )
+                ),
+                default_window_budget_ratio=(
+                    None
+                    if raw.get("default_window_budget_ratio") is None
+                    else float(raw["default_window_budget_ratio"])
+                ),
+                default_reserve_ratio=(
+                    None
+                    if raw.get("default_reserve_ratio") is None
+                    else float(raw["default_reserve_ratio"])
+                ),
+                est_5h_window_token_capacity=int(
+                    raw.get(
+                        "est_5h_window_token_capacity",
+                        fallback_cfg.est_5h_window_token_capacity,
                     )
                 ),
             )
@@ -323,21 +335,70 @@ def _budget_status_from_request(req_data: Mapping[str, Any]) -> BudgetStatus | N
         return None
 
 
+def _surfing_stats_from_request(req_data: Mapping[str, Any]) -> SurfingStats | None:
+    raw = req_data.get("surfing_stats")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return SurfingStats(
+            local_date=str(raw["local_date"]),
+            total_watched=int(raw["total_watched"]),
+            total_est_tokens=int(raw["total_est_tokens"]),
+            total_likes=int(raw["total_likes"]),
+            total_like_rate=float(raw["total_like_rate"]),
+            total_favorites=int(raw["total_favorites"]),
+            total_favorite_rate=float(raw["total_favorite_rate"]),
+            total_dms=int(raw["total_dms"]),
+            today_watched=int(raw["today_watched"]),
+            today_likes=int(raw["today_likes"]),
+            today_like_rate=float(raw["today_like_rate"]),
+            today_favorites=int(raw["today_favorites"]),
+            today_favorite_rate=float(raw["today_favorite_rate"]),
+            today_dms=int(raw["today_dms"]),
+            max_daily_likes=int(raw["max_daily_likes"]),
+            max_daily_favorites=int(raw["max_daily_favorites"]),
+            max_daily_dms=int(raw["max_daily_dms"]),
+            in_cooldown=bool(raw["in_cooldown"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _build_auto_default_decision(
     req_data: Mapping[str, Any],
     fallback_cfg: BudgetAndRuntimeConfig,
     *,
     now_epoch_fn: Callable[[], float],
+    override_defaults: Mapping[str, Any] | None = None,
 ) -> BudgetDecision:
     budget_cfg = _budget_cfg_from_request(req_data, fallback_cfg)
     status = _budget_status_from_request(req_data)
     used_ratio = max(0.0, min(1.0, float(status.used_ratio))) if status is not None else 0.0
+    if override_defaults is not None:
+        max_tok = (
+            None
+            if override_defaults.get("max_run_tokens") is None
+            else int(override_defaults["max_run_tokens"])
+        )
+        max_vid = (
+            None
+            if override_defaults.get("max_videos") is None
+            else int(override_defaults["max_videos"])
+        )
+        max_min = (
+            None
+            if override_defaults.get("max_minutes") is None
+            else float(override_defaults["max_minutes"])
+        )
+    else:
+        max_tok = budget_cfg.default_max_run_tokens
+        max_vid = budget_cfg.default_max_videos
+        max_min = budget_cfg.default_max_minutes
     plan = build_budget_plan(
         "combined",
-        max_use_ratio=budget_cfg.default_window_budget_ratio,
-        max_videos=budget_cfg.default_max_videos,
-        reserve_ratio=budget_cfg.default_reserve_ratio,
-        max_minutes=budget_cfg.default_max_minutes,
+        max_run_tokens=max_tok,
+        max_videos=max_vid,
+        max_minutes=max_min,
         current_window_used_ratio=used_ratio,
         now_epoch=float(now_epoch_fn()),
     )
@@ -421,6 +482,55 @@ class CompanionController:
     @property
     def mode(self) -> CompanionMode:
         return self._mode
+
+    @property
+    def config(self) -> AppConfig:
+        return self._config
+
+    def update_config(self, new_config: AppConfig) -> None:
+        self._config = new_config
+
+    def save_budget_defaults(
+        self,
+        *,
+        max_run_tokens: int | None,
+        max_videos: int | None,
+        max_minutes: int | float | None,
+    ) -> AppConfig:
+        """Atomically persist the 3 budget defaults into `config.local.json` and refresh `self._config`."""
+        target_local = (
+            Path(self._local_config_path)
+            if self._local_config_path is not None and str(self._local_config_path).strip()
+            else self._workspace_root / "config.local.json"
+        )
+        save_budget_defaults_to_local_config(
+            target_local,
+            max_run_tokens=max_run_tokens,
+            max_videos=max_videos,
+            max_minutes=max_minutes,
+        )
+        refreshed = load_config(
+            config_path=self._config_path,
+            local_config_path=target_local,
+        )
+        self._config = refreshed
+        return refreshed
+
+    def schedule_one_time_override(
+        self,
+        *,
+        max_run_tokens: int | None,
+        max_videos: int | None,
+        max_minutes: int | float | None,
+    ) -> Path:
+        """Atomically write `data/budget_ipc/next_run_override.json` for the next patrol run."""
+        return save_next_run_override(
+            self._ipc_dir,
+            max_run_tokens=max_run_tokens,
+            max_videos=max_videos,
+            max_minutes=max_minutes,
+            now_epoch_fn=self._now_epoch_fn,
+        )
 
     def set_mode(self, new_mode: CompanionMode) -> None:
         if new_mode not in ("ask", "auto_default"):
@@ -532,20 +642,29 @@ class CompanionController:
             handled += 1
 
             if self._mode == "auto_default":
+                override = consume_next_run_override(self._ipc_dir)
                 decision = _build_auto_default_decision(
                     data,
                     self._config.budget_and_runtime,
                     now_epoch_fn=self._now_epoch_fn,
+                    override_defaults=override,
                 )
                 self._write_res(run_id, decision)
                 if self.on_activity_change is not None:
                     self.on_activity_change()
                 continue
 
+            override = load_next_run_override(self._ipc_dir)
+            req_payload_for_ui = dict(data)
+            if override is not None:
+                req_payload_for_ui["override_defaults"] = override
+
             if self._popup_launcher is not None:
-                def _make_callback(rid: str) -> Callable[[BudgetDecision], None]:
+                def _make_callback(rid: str, had_override: bool) -> Callable[[BudgetDecision], None]:
                     def _on_done(decision: BudgetDecision) -> None:
                         self._in_flight_popups.pop(rid, None)
+                        if had_override or (self._ipc_dir / "next_run_override.json").exists():
+                            consume_next_run_override(self._ipc_dir)
                         try:
                             self._write_res(rid, decision)
                         except OSError as exc:
@@ -555,22 +674,31 @@ class CompanionController:
 
                     return _on_done
 
-                handle = self._popup_launcher(data, _make_callback(run_id))
+                handle = self._popup_launcher(
+                    req_payload_for_ui,
+                    _make_callback(run_id, override is not None),
+                )
                 if handle is not None:
                     self._in_flight_popups[run_id] = handle
                 else:
                     # Fallback if launcher could not open window
+                    consumed_ovr = consume_next_run_override(self._ipc_dir)
                     decision = _build_auto_default_decision(
                         data,
                         self._config.budget_and_runtime,
                         now_epoch_fn=self._now_epoch_fn,
+                        override_defaults=consumed_ovr or override,
                     )
                     self._write_res(run_id, decision)
+                    if self.on_activity_change is not None:
+                        self.on_activity_change()
             else:
+                consumed_ovr = consume_next_run_override(self._ipc_dir)
                 decision = _build_auto_default_decision(
                     data,
                     self._config.budget_and_runtime,
                     now_epoch_fn=self._now_epoch_fn,
+                    override_defaults=consumed_ovr or override,
                 )
                 self._write_res(run_id, decision)
                 if self.on_activity_change is not None:
@@ -745,6 +873,7 @@ class Win32TrayIcon:
     _ID_TRAY_REFRESH = 1002
     _ID_TRAY_TOGGLE_MODE = 1003
     _ID_TRAY_EXIT = 1004
+    _ID_TRAY_SETTINGS = 1005
 
     def __init__(
         self,
@@ -828,6 +957,7 @@ class Win32TrayIcon:
         try:
             user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_SHOW, "打开主面板")
             user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_REFRESH, "立即刷新状态")
+            user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_SETTINGS, "限额设置")
             user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_TOGGLE_MODE, "切换运行模式")
             user32.AppendMenuW(menu, self._MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, self._MF_STRING, self._ID_TRAY_EXIT, "退出")
@@ -1007,6 +1137,7 @@ class Win32TrayIcon:
         cmd_map = {
             self._ID_TRAY_SHOW: "show",
             self._ID_TRAY_REFRESH: "refresh",
+            self._ID_TRAY_SETTINGS: "settings",
             self._ID_TRAY_TOGGLE_MODE: "toggle_mode",
             self._ID_TRAY_EXIT: "exit",
         }
@@ -1129,25 +1260,44 @@ def _format_status_snapshot(data: Mapping[str, Any]) -> dict[str, str]:
         err = str(data.get("error") or data.get("message") or "状态暂不可用")
         return {
             "mode_line": "当前管线模式：未知",
-            "window_line": f"5h 窗口状态：刷新失败（{err[:60]}）",
+            "window_line": f"冲浪与互动统计：刷新失败（{err[:60]}）",
             "cloud_line": "云盘挂载状态：未知",
             "diary_line": "手账统计：--",
         }
 
     pipeline_mode = str(data.get("pipeline_mode") or "audio_only")
-    mode_desc = "v2 净版视频 (sanitized_video)" if pipeline_mode == "sanitized_video" else "v1 纯音频 (audio_only)"
+    mode_desc = (
+        "v2 净版视频 (sanitized_video)"
+        if pipeline_mode == "sanitized_video"
+        else "v1 纯音频 (audio_only)"
+    )
 
-    used_tok = int(data.get("used_tokens") or 0)
-    cap_tok = max(1, int(data.get("capacity_tokens") or 1_400_000))
-    rem_tok = int(data.get("remaining_tokens") or 0)
-    used_pct = float(data.get("used_ratio") or 0.0) * 100.0
+    total_watched = int(data.get("total_watched") or 0)
+    total_est_tokens = int(data.get("total_est_tokens") or 0)
+    total_likes = int(data.get("total_likes") or 0)
+    total_like_rate = float(data.get("total_like_rate") or 0.0) * 100.0
+    total_favorites = int(data.get("total_favorites") or 0)
+    total_favorite_rate = float(data.get("total_favorite_rate") or 0.0) * 100.0
+    total_dms = int(data.get("total_dms") or 0)
+
+    local_date = str(data.get("local_date") or datetime.now().astimezone().strftime("%Y-%m-%d"))
+    today_watched = int(data.get("today_watched") or 0)
+    today_likes = int(data.get("today_likes") or 0)
+    today_like_rate = float(data.get("today_like_rate") or 0.0) * 100.0
+    today_favorites = int(data.get("today_favorites") or 0)
+    today_favorite_rate = float(data.get("today_favorite_rate") or 0.0) * 100.0
+    today_dms = int(data.get("today_dms") or 0)
+    max_daily_dms = int(data.get("max_daily_dms") or 0)
+
     in_cooldown = bool(data.get("in_cooldown", False))
     cooldown_tag = " [429 冷却中]" if in_cooldown else ""
-    bucket_local = _format_bucket_start_local(str(data.get("window_bucket") or ""))
-    window_prefix = f"本 5h 窗口（{bucket_local} 起）" if bucket_local else "5h 窗口算力"
     window_line = (
-        f"{window_prefix}：已用 {used_pct:.1f}%（{used_tok:,} / {cap_tok:,}）"
-        f"｜ 剩余 {rem_tok:,}{cooldown_tag}"
+        f"累计冲浪：已看 {total_watched} 片 ｜ 估耗 {total_est_tokens:,} Tokens ｜ "
+        f"赞 {total_likes} ({total_like_rate:.1f}%) ｜ "
+        f"藏 {total_favorites} ({total_favorite_rate:.1f}%) ｜ 私信 {total_dms}{cooldown_tag}\n"
+        f"今日 ({local_date})：已看 {today_watched} 片 ｜ "
+        f"赞 {today_likes} ({today_like_rate:.1f}%) ｜ "
+        f"藏 {today_favorites} ({today_favorite_rate:.1f}%) ｜ 私信 {today_dms}/{max_daily_dms}"
     )
 
     cloud_mounted = bool(data.get("cloud_mounted", False))
@@ -1288,8 +1438,13 @@ def run_companion_app(
             req_data: dict[str, Any],
             on_done: Callable[[BudgetDecision], None],
         ) -> Any:
-            req_cfg = _budget_cfg_from_request(req_data, cfg.budget_and_runtime)
+            active_cfg = controller.config if controller is not None else cfg
+            req_cfg = _budget_cfg_from_request(req_data, active_cfg.budget_and_runtime)
             req_status = _budget_status_from_request(req_data)
+            req_stats = _surfing_stats_from_request(req_data)
+            req_override = req_data.get("override_defaults")
+            if not isinstance(req_override, Mapping):
+                req_override = load_next_run_override(eff_ipc_dir)
             timeout_sec = int(req_data.get("timeout_sec", req_cfg.startup_popup_timeout_sec))
             return open_budget_toplevel(
                 root,
@@ -1297,6 +1452,8 @@ def run_companion_app(
                 on_decision=on_done,
                 timeout_sec=timeout_sec,
                 budget_status=req_status,
+                override_defaults=req_override,
+                surfing_stats=req_stats,
                 tk_module=tk,
                 monotonic_fn=monotonic_fn,
                 now_epoch_fn=now_epoch_fn,
@@ -1326,11 +1483,11 @@ def run_companion_app(
             text="GeminiNest 桌面常驻助手（WinSta0\\Default）",
             font=("Microsoft YaHei UI", 10, "bold"),
             anchor="w",
-            wraplength=540,
+            wraplength=600,
         ).pack(fill="x", pady=(0, 6))
 
         mode_var = tk.StringVar(value="当前管线模式：正在读取状态...")
-        window_var = tk.StringVar(value="5h 窗口算力：正在读取...")
+        window_var = tk.StringVar(value="冲浪与互动统计：正在读取...")
         cloud_var = tk.StringVar(value="云盘与后端：正在读取...")
         diary_var = tk.StringVar(value="手账统计：正在读取...")
         ipc_var = tk.StringVar(value=f"IPC 监听中（{eff_ipc_dir}）")
@@ -1348,7 +1505,7 @@ def run_companion_app(
                 justify="left",
                 anchor="w",
                 fg=color,
-                wraplength=540,
+                wraplength=600,
             ).pack(fill="x", pady=2)
 
         sep = tk.Frame(frame, height=1, bg="#d0d0d0")
@@ -1388,18 +1545,36 @@ def run_companion_app(
             command=_on_mode_change,
         ).pack(side="left")
 
+        settings_win_holder: dict[str, Any] = {"win": None}
+
         def _update_ipc_banner() -> None:
             if controller is None:
                 return
             active = controller.active_request_ids
+            pending_ovr = load_next_run_override(eff_ipc_dir)
+            ovr_note = ""
+            if pending_ovr is not None:
+                ovr_plan = build_budget_plan(
+                    "combined",
+                    max_run_tokens=pending_ovr.get("max_run_tokens"),
+                    max_videos=pending_ovr.get("max_videos"),
+                    max_minutes=pending_ovr.get("max_minutes"),
+                )
+                ovr_note = f" ｜ 已预约单次限额：{_format_plan_short_label(ovr_plan)}"
             if active:
-                ipc_var.set(f"正在等待预算弹窗确认：{', '.join(active)}")
+                ipc_var.set(f"正在等待预算弹窗确认：{', '.join(active)}{ovr_note}")
             elif controller.mode == "auto_default":
-                ipc_var.set("运行模式：自动默认值执行（收到巡逻请求将秒回默认 4 条件）")
+                ipc_var.set(
+                    f"运行模式：自动默认值执行（收到巡逻请求将秒回默认 3 条件）{ovr_note}"
+                )
             elif tray_ready:
-                ipc_var.set("运行模式：每次弹窗询问（IPC 监听就绪，可最小化到系统托盘）")
+                ipc_var.set(
+                    f"运行模式：每次弹窗询问（IPC 监听就绪，可最小化到系统托盘）{ovr_note}"
+                )
             else:
-                ipc_var.set("运行模式：每次弹窗询问（IPC 监听就绪，可最小化到任务栏）")
+                ipc_var.set(
+                    f"运行模式：每次弹窗询问（IPC 监听就绪，可最小化到任务栏）{ovr_note}"
+                )
 
         controller.on_activity_change = lambda: (
             _update_ipc_banner(),
@@ -1410,6 +1585,72 @@ def run_companion_app(
             if controller is not None:
                 ipc_var.set("正在后台刷新状态...")
                 controller.trigger_status_refresh_async()
+
+        def _open_settings_modal() -> None:
+            if controller is None or shutting_down["flag"] or root is None:
+                return
+            existing_win = settings_win_holder.get("win")
+            if existing_win is not None:
+                winfo_exists = getattr(existing_win, "winfo_exists", None)
+                if callable(winfo_exists):
+                    try:
+                        if bool(winfo_exists()):
+                            lift_fn = getattr(existing_win, "lift", None)
+                            if callable(lift_fn):
+                                lift_fn()
+                            return
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            def _on_save_defaults(
+                max_run_tokens: int | None,
+                max_videos: int | None,
+                max_minutes: int | float | None,
+            ) -> None:
+                settings_win_holder["win"] = None
+                new_cfg = controller.save_budget_defaults(
+                    max_run_tokens=max_run_tokens,
+                    max_videos=max_videos,
+                    max_minutes=max_minutes,
+                )
+                nonlocal cfg
+                cfg = new_cfg
+                saved_plan = build_budget_plan(
+                    "combined",
+                    max_run_tokens=max_run_tokens,
+                    max_videos=max_videos,
+                    max_minutes=max_minutes,
+                )
+                _update_ipc_banner()
+                ipc_var.set(
+                    f"已保存默认限额（config.local.json）：{_format_plan_short_label(saved_plan)}"
+                )
+
+            def _on_one_time_override(
+                max_run_tokens: int | None,
+                max_videos: int | None,
+                max_minutes: int | float | None,
+            ) -> None:
+                settings_win_holder["win"] = None
+                controller.schedule_one_time_override(
+                    max_run_tokens=max_run_tokens,
+                    max_videos=max_videos,
+                    max_minutes=max_minutes,
+                )
+                _update_ipc_banner()
+
+            def _on_cancel_settings() -> None:
+                settings_win_holder["win"] = None
+
+            settings_win_holder["win"] = open_budget_settings_toplevel(
+                root,
+                controller.config,
+                on_save_defaults=_on_save_defaults,
+                on_one_time_override=_on_one_time_override,
+                on_cancel=_on_cancel_settings,
+                override_defaults=load_next_run_override(eff_ipc_dir),
+                tk_module=tk,
+            )
 
         def _hide_to_tray() -> None:
             if shutting_down["flag"] or root is None:
@@ -1478,6 +1719,9 @@ def run_companion_app(
             btn_row, text="立即刷新", padx=12, pady=3, command=_on_manual_refresh
         ).pack(side="left", padx=(0, 8))
         tk.Button(
+            btn_row, text="限额设置", padx=12, pady=3, command=_open_settings_modal
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
             btn_row,
             text="收进托盘" if tray_ready else "最小化",
             padx=12,
@@ -1510,8 +1754,8 @@ def run_companion_app(
             req_h = int(req_h_fn()) if callable(req_h_fn) else 0
         except Exception:  # noqa: BLE001
             req_w, req_h = 0, 0
-        width = max(580, req_w + 24)
-        height = max(320, req_h + 24)
+        width = max(640, req_w + 28)
+        height = max(360, req_h + 28)
         minsize_fn = getattr(root, "minsize", None)
         if callable(minsize_fn):
             try:
@@ -1546,6 +1790,8 @@ def run_companion_app(
                         _restore_from_tray()
                     elif tray_cmd == "refresh":
                         _on_manual_refresh()
+                    elif tray_cmd == "settings":
+                        _open_settings_modal()
                     elif tray_cmd == "toggle_mode":
                         next_mode: CompanionMode = (
                             "ask" if controller.mode == "auto_default" else "auto_default"
